@@ -675,7 +675,7 @@ type MapView_BlobId_Blob_9f0b41f3 {
 }
 
 """
-An message to be sent and possibly executed in the receiver's block.
+A message to be sent and possibly executed in the receiver's block.
 """
 scalar Message
 
@@ -865,7 +865,7 @@ The state of an outbox
 Messages are contained in blocks, together with destination information, so currently
 we just send the certified blocks over and let the receivers figure out what were the
 messages for them.
-* When marking block heights as received, messages at lower heights are also marked (ie. dequeued).
+* When marking block heights as received, messages at lower heights are also marked (i.e. dequeued).
 """
 type OutboxStateView {
 	"""
