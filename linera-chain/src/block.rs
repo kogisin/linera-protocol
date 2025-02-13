@@ -7,7 +7,7 @@ use std::{collections::BTreeSet, fmt::Debug};
 use async_graphql::SimpleObject;
 use linera_base::{
     crypto::{BcsHashable, CryptoHash},
-    data_types::{BlockHeight, OracleResponse, Timestamp},
+    data_types::{BlockHeight, Event, OracleResponse, Timestamp},
     hashed::Hashed,
     identifiers::{BlobId, BlobType, ChainId, MessageId, Owner},
 };
@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::{
     data_types::{
-        BlockExecutionOutcome, EventRecord, ExecutedBlock, IncomingBundle, Medium, MessageBundle,
+        BlockExecutionOutcome, ExecutedBlock, IncomingBundle, Medium, MessageBundle,
         OutgoingMessage, ProposedBlock,
     },
     types::CertificateValue,
@@ -359,7 +359,7 @@ pub struct BlockBody {
     /// The record of oracle responses for each transaction.
     pub oracle_responses: Vec<Vec<OracleResponse>>,
     /// The list of events produced by each transaction.
-    pub events: Vec<Vec<EventRecord>>,
+    pub events: Vec<Vec<Event>>,
 }
 
 impl Block {
