@@ -4,16 +4,14 @@
 use std::{num::NonZeroU16, str::FromStr};
 
 use colored::Colorize as _;
-use linera_base::{data_types::Amount, identifiers::ChainId, time::Duration};
+use linera_base::{
+    data_types::Amount, identifiers::ChainId, listen_for_shutdown_signals, time::Duration,
+};
 use linera_client::storage::{StorageConfig, StorageConfigNamespace};
 use linera_execution::ResourceControlPolicy;
-use linera_service::{
-    cli_wrappers::{
-        local_net::{Database, LocalNetConfig, PathProvider, StorageConfigBuilder},
-        ClientWrapper, FaucetOption, FaucetService, LineraNet, LineraNetConfig, Network,
-        NetworkConfig,
-    },
-    util::listen_for_shutdown_signals,
+use linera_service::cli_wrappers::{
+    local_net::{Database, LocalNetConfig, PathProvider, StorageConfigBuilder},
+    ClientWrapper, FaucetOption, FaucetService, LineraNet, LineraNetConfig, Network, NetworkConfig,
 };
 #[cfg(feature = "storage-service")]
 use linera_storage_service::{
@@ -29,7 +27,7 @@ use {
 };
 
 struct StorageConfigProvider {
-    /// The StorageConfig and the namespace
+    /// The `StorageConfig` and the namespace
     pub storage: StorageConfigNamespace,
     #[cfg(feature = "storage-service")]
     _service_guard: Option<StorageServiceGuard>,
