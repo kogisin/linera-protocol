@@ -164,9 +164,10 @@ impl Runnable for Job {
                     time_total.as_millis()
                 );
                 debug!("{:?}", certificate);
-                // Print the new chain ID and message ID on stdout for scripting purposes.
+                // Print the new chain ID, message ID, and owner on stdout for scripting purposes.
                 println!("{}", message_id);
                 println!("{}", ChainId::child(message_id));
+                println!("{}", new_owner);
             }
 
             OpenMultiOwnerChain {
@@ -523,6 +524,7 @@ impl Runnable for Job {
                 let mut context = context.lock().await;
                 if let SetValidator {
                     public_key,
+                    account_key: _,
                     address,
                     votes: _,
                     skip_online_check: false,
@@ -576,6 +578,7 @@ impl Runnable for Job {
                             match command {
                                 SetValidator {
                                     public_key,
+                                    account_key,
                                     address,
                                     votes,
                                     skip_online_check: _,
@@ -585,6 +588,7 @@ impl Runnable for Job {
                                         ValidatorState {
                                             network_address: address,
                                             votes,
+                                            account_public_key: account_key,
                                         },
                                     );
                                 }
@@ -749,87 +753,32 @@ impl Runnable for Job {
                 );
                 if let Some(bps) = bps {
                     assert!(bps > 0, "BPS must be greater than 0");
-                }
-
-                let start = Instant::now();
-                // Below all block proposals are supposed to succeed without retries, we
-                // must make sure that all incoming payments have been accepted on-chain
-                // and that no validator is missing user certificates.
-                context.process_inboxes_and_force_validator_updates().await;
-                info!(
-                    "Processed inboxes and forced validator updates in {} ms",
-                    start.elapsed().as_millis()
-                );
-
-                let start = Instant::now();
-                let (key_pairs, chain_clients) = context
-                    .make_benchmark_chains(num_chains, tokens_per_chain)
-                    .await?;
-                info!(
-                    "Got {} chains in {} ms",
-                    key_pairs.len(),
-                    start.elapsed().as_millis()
-                );
-
-                if let Some(id) = fungible_application_id {
-                    let start = Instant::now();
-                    context
-                        .supply_fungible_tokens(&key_pairs, id, &chain_clients)
-                        .await?;
-                    info!(
-                        "Supplied fungible tokens in {} ms",
-                        start.elapsed().as_millis()
+                    assert!(
+                        bps >= num_chains,
+                        "BPS must be greater than or equal to the number of chains"
                     );
                 }
 
-                let default_chain_id = context
-                    .wallet
-                    .default_chain()
-                    .expect("should have default chain");
-                let default_chain_client = context.make_chain_client(default_chain_id)?;
-                let (epoch, committees) = default_chain_client
-                    .epoch_and_committees(default_chain_id)
+                let (chain_clients, epoch, blocks_infos, committee) = context
+                    .prepare_for_benchmark(
+                        num_chains,
+                        transactions_per_block,
+                        tokens_per_chain,
+                        fungible_application_id,
+                    )
                     .await?;
-                let epoch = epoch.expect("default chain should have an epoch");
-                let committee = committees
-                    .get(&epoch)
-                    .expect("current epoch should have a committee");
-                let blocks_infos = context.make_benchmark_block_info(
-                    key_pairs,
-                    transactions_per_block,
-                    fungible_application_id,
-                );
 
-                let clients = context
-                    .make_node_provider()
-                    .make_nodes(committee)?
-                    .map(|(_, node)| node)
-                    .collect::<Vec<_>>();
-                let blocks_infos_iter = blocks_infos.iter();
-                if bps.is_some() {
-                    let blocks_infos_iter = blocks_infos_iter.cycle();
-                    context
-                        .run_benchmark(
-                            bps,
-                            blocks_infos_iter,
-                            clients,
-                            transactions_per_block,
-                            epoch,
-                            chain_clients,
-                        )
-                        .await?;
-                } else {
-                    context
-                        .run_benchmark(
-                            bps,
-                            blocks_infos_iter,
-                            clients,
-                            transactions_per_block,
-                            epoch,
-                            chain_clients,
-                        )
-                        .await?;
-                }
+                linera_client::benchmark::Benchmark::<S>::run_benchmark(
+                    num_chains,
+                    transactions_per_block,
+                    bps,
+                    chain_clients,
+                    epoch,
+                    blocks_infos,
+                    committee,
+                    context.client.local_node().clone(),
+                )
+                .await?;
             }
 
             Watch { chain_id, raw } => {
@@ -1173,6 +1122,7 @@ impl Runnable for Job {
                 println!("{}", outcome.chain_id);
                 println!("{}", outcome.message_id);
                 println!("{}", outcome.certificate_hash);
+                println!("{}", owner);
                 Self::assign_new_chain_to_key(
                     outcome.chain_id,
                     outcome.message_id,
@@ -1192,6 +1142,48 @@ impl Runnable for Job {
                     .await??;
                 info!(
                     "Wallet initialized in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+            }
+
+            Wallet(WalletCommand::RequestChain {
+                faucet: faucet_url,
+                set_default,
+            }) => {
+                let start_time = Instant::now();
+                let key_pair = context.wallet.generate_key_pair();
+                let owner = key_pair.public().into();
+                info!(
+                    "Requesting a new chain for owner {owner} using the faucet at address \
+                    {faucet_url}",
+                );
+                context
+                    .wallet_mut()
+                    .mutate(|w| w.add_unassigned_key_pair(key_pair))
+                    .await?;
+                let faucet = cli_wrappers::Faucet::new(faucet_url);
+                let outcome = faucet.claim(&owner).await?;
+                let validators = faucet.current_validators().await?;
+                println!("{}", outcome.chain_id);
+                println!("{}", outcome.message_id);
+                println!("{}", outcome.certificate_hash);
+                println!("{}", owner);
+                Self::assign_new_chain_to_key(
+                    outcome.chain_id,
+                    outcome.message_id,
+                    owner,
+                    Some(validators),
+                    &mut context,
+                )
+                .await?;
+                if set_default {
+                    context
+                        .wallet_mut()
+                        .mutate(|w| w.set_default_chain(outcome.chain_id))
+                        .await??;
+                }
+                info!(
+                    "New chain requested and added in {} ms",
                     start_time.elapsed().as_millis()
                 );
             }
@@ -1364,7 +1356,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let span = tracing::info_span!("linera::main");
-    if let Some(wallet_id) = options.with_wallet {
+    if let Some(wallet_id) = &options.with_wallet {
         span.record("wallet_id", wallet_id);
     }
 
@@ -1606,7 +1598,6 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
         ClientCommand::Net(net_command) => match net_command {
             #[cfg(feature = "kubernetes")]
             NetCommand::Up {
-                extra_wallets,
                 other_initial_chains,
                 initial_amount,
                 validators,
@@ -1626,7 +1617,6 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                 faucet_amount,
             } => {
                 net_up_utils::handle_net_up_kubernetes(
-                    *extra_wallets,
                     *other_initial_chains,
                     *initial_amount,
                     *validators,
@@ -1647,7 +1637,6 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
             }
 
             NetCommand::Up {
-                extra_wallets,
                 other_initial_chains,
                 initial_amount,
                 validators,
@@ -1664,7 +1653,6 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                 ..
             } => {
                 net_up_utils::handle_net_up_service(
-                    *extra_wallets,
                     *other_initial_chains,
                     *initial_amount,
                     *validators,
@@ -1687,7 +1675,7 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
             NetCommand::Helper => {
                 info!("You may append the following script to your `~/.bash_profile` or `source` it when needed.");
                 info!(
-                    "This will install a function `linera_spawn_and_read_wallet_variables` to facilitate \
+                    "This will install several functions to facilitate \
                        testing with a local Linera network"
                 );
                 println!("{}", include_str!("../../template/linera_net_helper.sh"));
@@ -1829,6 +1817,22 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                 Ok(0)
             }
 
+            WalletCommand::FollowChain { chain_id } => {
+                let start_time = Instant::now();
+                options
+                    .wallet()
+                    .await?
+                    .mutate(|wallet| {
+                        wallet.extend([UserChain::make_other(*chain_id, Timestamp::now())])
+                    })
+                    .await?;
+                info!(
+                    "Chain followed and added in {} ms",
+                    start_time.elapsed().as_millis()
+                );
+                Ok(0)
+            }
+
             WalletCommand::ForgetChain { chain_id } => {
                 let start_time = Instant::now();
                 options
@@ -1837,6 +1841,11 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
                     .mutate(|w| w.forget_chain(chain_id))
                     .await??;
                 info!("Chain forgotten in {} ms", start_time.elapsed().as_millis());
+                Ok(0)
+            }
+
+            WalletCommand::RequestChain { .. } => {
+                options.run_with_storage(Job(options.clone())).await??;
                 Ok(0)
             }
 

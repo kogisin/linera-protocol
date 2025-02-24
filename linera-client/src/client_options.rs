@@ -10,7 +10,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use linera_base::{
-    crypto::{CryptoHash, ValidatorPublicKey},
+    crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
     data_types::{Amount, ApplicationPermissions, TimeDelta},
     identifiers::{
         Account, ApplicationId, BytecodeId, ChainId, MessageId, Owner, UserApplicationId,
@@ -78,11 +78,12 @@ pub struct ClientOptions {
     #[arg(long = "storage")]
     pub storage_config: Option<String>,
 
-    /// Given an integer value `N`, read the wallet state and the wallet storage config from the
-    /// environment variables `LINERA_WALLET_{N}` and `LINERA_STORAGE_{N}` instead of
-    /// `LINERA_WALLET` and `LINERA_STORAGE`.
-    #[arg(long, short = 'w')]
-    pub with_wallet: Option<u32>,
+    /// Given an ASCII alphanumeric parameter `X`, read the wallet state and the wallet
+    /// storage config from the environment variables `LINERA_WALLET_{X}` and
+    /// `LINERA_STORAGE_{X}` instead of `LINERA_WALLET` and
+    /// `LINERA_STORAGE`.
+    #[arg(long, short = 'w', value_parser = util::parse_ascii_alphanumeric_string)]
+    pub with_wallet: Option<String>,
 
     /// Timeout for sending queries (milliseconds)
     #[arg(long = "send-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
@@ -174,7 +175,8 @@ impl ClientOptions {
         let mut options = <ClientOptions as clap::Parser>::parse();
         let suffix = options
             .with_wallet
-            .map(|n| format!("_{}", n))
+            .as_ref()
+            .map(|x| format!("_{}", x))
             .unwrap_or_default();
         let wallet_env_var = env::var(format!("LINERA_WALLET{suffix}")).ok();
         let storage_env_var = env::var(format!("LINERA_STORAGE{suffix}")).ok();
@@ -476,6 +478,10 @@ pub enum ClientCommand {
         /// The public key of the validator.
         #[arg(long)]
         public_key: ValidatorPublicKey,
+
+        /// The public key of the account controlled by the validator.
+        #[arg(long)]
+        account_key: AccountPublicKey,
 
         /// Network address
         #[arg(long)]
@@ -1028,13 +1034,10 @@ impl DatabaseToolCommand {
 pub enum NetCommand {
     /// Start a Local Linera Network
     Up {
-        /// The number of extra wallets and user chains to initialize. Default is 0.
-        #[arg(long)]
-        extra_wallets: Option<usize>,
-
         /// The number of initial "root" chains created in the genesis config on top of
         /// the default "admin" chain. All initial chains belong to the first "admin"
-        /// wallet.
+        /// wallet. It is recommended to use at least one other initial chain for the
+        /// faucet.
         #[arg(long, default_value = "2")]
         other_initial_chains: u32,
 
@@ -1199,7 +1202,25 @@ pub enum WalletCommand {
         testing_prng_seed: Option<u64>,
     },
 
-    /// Forgets the specified chain's keys.
+    /// Request a new chain from a faucet and add it to the wallet.
+    RequestChain {
+        /// The address of a faucet.
+        #[arg(long)]
+        faucet: String,
+
+        /// Whether this chain should become the default chain.
+        #[arg(long)]
+        set_default: bool,
+    },
+
+    /// Add a new followed chain (i.e. a chain without keypair) to the wallet.
+    FollowChain {
+        /// The chain ID.
+        chain_id: ChainId,
+    },
+
+    /// Forgets the specified chain's keys. The chain will still be followed by the
+    /// wallet.
     ForgetKeys { chain_id: ChainId },
 
     /// Forgets the specified chain, including the associated key pair.

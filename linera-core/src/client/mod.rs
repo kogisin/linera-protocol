@@ -28,7 +28,7 @@ use linera_base::data_types::Bytecode;
 use linera_base::prometheus_util::MeasureLatency as _;
 use linera_base::{
     abi::Abi,
-    crypto::{CryptoHash, ValidatorPublicKey, ValidatorSecretKey},
+    crypto::{AccountPublicKey, AccountSecretKey, CryptoHash, ValidatorPublicKey},
     data_types::{
         Amount, ApplicationPermissions, ArithmeticError, Blob, BlockHeight, Round, Timestamp,
     },
@@ -285,7 +285,7 @@ impl<P, S: Storage + Clone> Client<P, S> {
     pub fn create_chain_client(
         self: &Arc<Self>,
         chain_id: ChainId,
-        known_key_pairs: Vec<ValidatorSecretKey>,
+        known_key_pairs: Vec<AccountSecretKey>,
         admin_id: ChainId,
         block_hash: Option<CryptoHash>,
         timestamp: Timestamp,
@@ -684,10 +684,16 @@ impl<P: 'static, S: Storage> ChainClient<P, S> {
         )
     }
 
-    /// Gets the per-`ChainClient` options.
+    /// Gets a mutable reference to the per-`ChainClient` options.
     #[instrument(level = "trace", skip(self))]
     pub fn options_mut(&mut self) -> &mut ChainClientOptions {
         &mut self.options
+    }
+
+    /// Gets a reference to the per-`ChainClient` options.
+    #[instrument(level = "trace", skip(self))]
+    pub fn options(&self) -> &ChainClientOptions {
+        &self.options
     }
 
     /// Gets the ID of the associated chain.
@@ -976,7 +982,7 @@ where
 
     /// Obtains the key pair associated to the current identity.
     #[instrument(level = "trace")]
-    pub async fn key_pair(&self) -> Result<ValidatorSecretKey, ChainClientError> {
+    pub async fn key_pair(&self) -> Result<AccountSecretKey, ChainClientError> {
         let id = self.identity().await?;
         Ok(self
             .state()
@@ -988,7 +994,7 @@ where
 
     /// Obtains the public key associated to the current identity.
     #[instrument(level = "trace")]
-    pub async fn public_key(&self) -> Result<ValidatorPublicKey, ChainClientError> {
+    pub async fn public_key(&self) -> Result<AccountPublicKey, ChainClientError> {
         Ok(self.key_pair().await?.public())
     }
 
@@ -1070,7 +1076,7 @@ where
 
     /// Submits a block proposal to the validators.
     #[instrument(level = "trace", skip(committee, proposal, value))]
-    async fn submit_block_proposal<T: ProcessableCertificate>(
+    pub async fn submit_block_proposal<T: ProcessableCertificate>(
         &self,
         committee: &Committee,
         proposal: Box<BlockProposal>,
@@ -1123,7 +1129,7 @@ where
 
     /// Broadcasts certified blocks to validators.
     #[instrument(level = "trace", skip(committee, delivery))]
-    async fn communicate_chain_updates(
+    pub async fn communicate_chain_updates(
         &self,
         committee: &Committee,
         chain_id: ChainId,
@@ -2690,7 +2696,7 @@ where
     #[instrument(level = "trace", skip(key_pair))]
     pub async fn rotate_key_pair(
         &self,
-        key_pair: ValidatorSecretKey,
+        key_pair: AccountSecretKey,
     ) -> Result<ClientOutcome<ConfirmedBlockCertificate>, ChainClientError> {
         let new_public_key = self.state_mut().insert_known_key_pair(key_pair);
         self.transfer_ownership(new_public_key.into()).await

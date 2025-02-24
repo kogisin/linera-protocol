@@ -316,7 +316,7 @@ impl ClientWrapper {
         &self,
         chain_ids: &[ChainId],
         faucet: FaucetOption<'_>,
-    ) -> Result<Option<ClaimOutcome>> {
+    ) -> Result<Option<(ClaimOutcome, Owner)>> {
         let mut command = self.command().await?;
         command.args(["wallet", "init"]);
         match faucet {
@@ -350,10 +350,46 @@ impl ClientWrapper {
                     .parse()
                     .context("invalid certificate hash")?,
             };
-            Ok(Some(outcome))
+            let owner = lines
+                .next()
+                .context("missing chain owner")?
+                .parse()
+                .context("invalid chain owner")?;
+            Ok(Some((outcome, owner)))
         } else {
             Ok(None)
         }
+    }
+
+    /// Runs `linera wallet request-chain`.
+    pub async fn request_chain(
+        &self,
+        faucet: &Faucet,
+        set_default: bool,
+    ) -> Result<(ClaimOutcome, Owner)> {
+        let mut command = self.command().await?;
+        command.args(["wallet", "request-chain", "--faucet", faucet.url()]);
+        if set_default {
+            command.arg("--set-default");
+        }
+        let stdout = command.spawn_and_wait_for_stdout().await?;
+        let mut lines = stdout.split_whitespace();
+        let chain_id_str = lines.next().context("missing chain ID")?;
+        let message_id_str = lines.next().context("missing message ID")?;
+        let certificate_hash_str = lines.next().context("missing certificate hash")?;
+        let outcome = ClaimOutcome {
+            chain_id: chain_id_str.parse().context("invalid chain ID")?,
+            message_id: message_id_str.parse().context("invalid message ID")?,
+            certificate_hash: certificate_hash_str
+                .parse()
+                .context("invalid certificate hash")?,
+        };
+        let owner = lines
+            .next()
+            .context("missing chain owner")?
+            .parse()
+            .context("invalid chain owner")?;
+        Ok((outcome, owner))
     }
 
     /// Runs `linera wallet publish-and-create`.
@@ -707,7 +743,7 @@ impl ClientWrapper {
         from: ChainId,
         owner: Option<Owner>,
         initial_balance: Amount,
-    ) -> Result<(MessageId, ChainId)> {
+    ) -> Result<(MessageId, ChainId, Owner)> {
         let mut command = self.command().await?;
         command
             .arg("open-chain")
@@ -722,8 +758,11 @@ impl ClientWrapper {
         let mut split = stdout.split('\n');
         let message_id: MessageId = split.next().context("no message ID in output")?.parse()?;
         let chain_id = ChainId::from_str(split.next().context("no chain ID in output")?)?;
-
-        Ok((message_id, chain_id))
+        let new_owner = Owner::from_str(split.next().context("no owner in output")?)?;
+        if let Some(owner) = owner {
+            assert_eq!(owner, new_owner);
+        }
+        Ok((message_id, chain_id, new_owner))
     }
 
     /// Runs `linera open-chain` then `linera assign`.
@@ -737,7 +776,7 @@ impl ClientWrapper {
             .default_chain()
             .context("no default chain found")?;
         let owner = client.keygen().await?;
-        let (message_id, new_chain) = self
+        let (message_id, new_chain, _) = self
             .open_chain(our_chain, Some(owner), initial_balance)
             .await?;
         assert_eq!(new_chain, client.assign(owner, message_id).await?);
@@ -797,6 +836,16 @@ impl ClientWrapper {
                 .arg("--owners")
                 .args(owners.iter().map(Owner::to_string));
         }
+        command.spawn_and_wait_for_stdout().await?;
+        Ok(())
+    }
+
+    /// Runs `linera wallet follow-chain CHAIN_ID`.
+    pub async fn follow_chain(&self, chain_id: ChainId) -> Result<()> {
+        let mut command = self.command().await?;
+        command
+            .args(["wallet", "follow-chain"])
+            .arg(chain_id.to_string());
         command.spawn_and_wait_for_stdout().await?;
         Ok(())
     }
@@ -881,12 +930,18 @@ impl ClientWrapper {
             .is_some_and(|wallet| wallet.get(chain).is_some())
     }
 
-    pub async fn set_validator(&self, public_key: &str, port: usize, votes: usize) -> Result<()> {
+    pub async fn set_validator(
+        &self,
+        validator_key: &(String, String),
+        port: usize,
+        votes: usize,
+    ) -> Result<()> {
         let address = format!("{}:127.0.0.1:{}", self.network.short(), port);
         self.command()
             .await?
             .arg("set-validator")
-            .args(["--public-key", public_key])
+            .args(["--public-key", &validator_key.0])
+            .args(["--account-key", &validator_key.1])
             .args(["--address", &address])
             .args(["--votes", &votes.to_string()])
             .spawn_and_wait_for_stdout()
@@ -894,11 +949,11 @@ impl ClientWrapper {
         Ok(())
     }
 
-    pub async fn remove_validator(&self, public_key: &str) -> Result<()> {
+    pub async fn remove_validator(&self, validator_key: &str) -> Result<()> {
         self.command()
             .await?
             .arg("remove-validator")
-            .args(["--public-key", public_key])
+            .args(["--public-key", validator_key])
             .spawn_and_wait_for_stdout()
             .await?;
         Ok(())

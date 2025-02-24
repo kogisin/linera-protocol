@@ -40,6 +40,8 @@ This document contains the help content for the `linera` command-line program.
 * [`linera wallet show`↴](#linera-wallet-show)
 * [`linera wallet set-default`↴](#linera-wallet-set-default)
 * [`linera wallet init`↴](#linera-wallet-init)
+* [`linera wallet request-chain`↴](#linera-wallet-request-chain)
+* [`linera wallet follow-chain`↴](#linera-wallet-follow-chain)
 * [`linera wallet forget-keys`↴](#linera-wallet-forget-keys)
 * [`linera wallet forget-chain`↴](#linera-wallet-forget-chain)
 * [`linera project`↴](#linera-project)
@@ -107,7 +109,7 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 
 * `--wallet <WALLET_STATE_PATH>` — Sets the file storing the private state of user chains (an empty one will be created if missing)
 * `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
-* `-w`, `--with-wallet <WITH_WALLET>` — Given an integer value `N`, read the wallet state and the wallet storage config from the environment variables `LINERA_WALLET_{N}` and `LINERA_STORAGE_{N}` instead of `LINERA_WALLET` and `LINERA_STORAGE`
+* `-w`, `--with-wallet <WITH_WALLET>` — Given an ASCII alphanumeric parameter `X`, read the wallet state and the wallet storage config from the environment variables `LINERA_WALLET_{X}` and `LINERA_STORAGE_{X}` instead of `LINERA_WALLET` and `LINERA_STORAGE`
 * `--send-timeout-ms <SEND_TIMEOUT>` — Timeout for sending queries (milliseconds)
 
   Default value: `4000`
@@ -404,11 +406,12 @@ Synchronizes a validator with the local state of chains
 
 Add or modify a validator (admin only)
 
-**Usage:** `linera set-validator [OPTIONS] --public-key <PUBLIC_KEY> --address <ADDRESS>`
+**Usage:** `linera set-validator [OPTIONS] --public-key <PUBLIC_KEY> --account-key <ACCOUNT_KEY> --address <ADDRESS>`
 
 ###### **Options:**
 
 * `--public-key <PUBLIC_KEY>` — The public key of the validator
+* `--account-key <ACCOUNT_KEY>` — The public key of the account controlled by the validator
 * `--address <ADDRESS>` — Network address
 * `--votes <VOTES>` — Voting power
 
@@ -744,7 +747,9 @@ Show the contents of the wallet
 * `show` — Show the contents of the wallet
 * `set-default` — Change the wallet default chain
 * `init` — Initialize a wallet from the genesis configuration
-* `forget-keys` — Forgets the specified chain's keys
+* `request-chain` — Request a new chain from a faucet and add it to the wallet
+* `follow-chain` — Add a new followed chain (i.e. a chain without keypair) to the wallet
+* `forget-keys` — Forgets the specified chain's keys. The chain will still be followed by the wallet
 * `forget-chain` — Forgets the specified chain, including the associated key pair
 
 
@@ -794,9 +799,34 @@ Initialize a wallet from the genesis configuration
 
 
 
+## `linera wallet request-chain`
+
+Request a new chain from a faucet and add it to the wallet
+
+**Usage:** `linera wallet request-chain [OPTIONS] --faucet <FAUCET>`
+
+###### **Options:**
+
+* `--faucet <FAUCET>` — The address of a faucet
+* `--set-default` — Whether this chain should become the default chain
+
+
+
+## `linera wallet follow-chain`
+
+Add a new followed chain (i.e. a chain without keypair) to the wallet
+
+**Usage:** `linera wallet follow-chain <CHAIN_ID>`
+
+###### **Arguments:**
+
+* `<CHAIN_ID>` — The chain ID
+
+
+
 ## `linera wallet forget-keys`
 
-Forgets the specified chain's keys
+Forgets the specified chain's keys. The chain will still be followed by the wallet
 
 **Usage:** `linera wallet forget-keys <CHAIN_ID>`
 
@@ -907,8 +937,7 @@ Start a Local Linera Network
 
 ###### **Options:**
 
-* `--extra-wallets <EXTRA_WALLETS>` — The number of extra wallets and user chains to initialize. Default is 0
-* `--other-initial-chains <OTHER_INITIAL_CHAINS>` — The number of initial "root" chains created in the genesis config on top of the default "admin" chain. All initial chains belong to the first "admin" wallet
+* `--other-initial-chains <OTHER_INITIAL_CHAINS>` — The number of initial "root" chains created in the genesis config on top of the default "admin" chain. All initial chains belong to the first "admin" wallet. It is recommended to use at least one other initial chain for the faucet
 
   Default value: `2`
 * `--initial-amount <INITIAL_AMOUNT>` — The initial amount of native tokens credited in the initial "root" chains, including the default "admin" chain
