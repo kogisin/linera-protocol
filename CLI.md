@@ -491,47 +491,31 @@ Create genesis configuration for a Linera deployment. Create initial user chains
 
   Default value: `0`
 * `--start-timestamp <START_TIMESTAMP>` — The start timestamp: no blocks can be created before this time
-* `--block-price <BLOCK_PRICE>` — Set the base price for creating a block
+* `--policy-config <POLICY_CONFIG>` — Configure the resource control policy (notably fees) according to pre-defined settings
 
-  Default value: `0`
-* `--fuel-unit-price <FUEL_UNIT_PRICE>` — Set the price per unit of fuel
+  Default value: `no-fees`
 
-  Default value: `0`
-* `--read-operation-price <READ_OPERATION_PRICE>` — Set the price per read operation
+  Possible values: `no-fees`, `testnet`
 
-  Default value: `0`
-* `--write-operation-price <WRITE_OPERATION_PRICE>` — Set the price per write operation
-
-  Default value: `0`
-* `--byte-read-price <BYTE_READ_PRICE>` — Set the price per byte read
-
-  Default value: `0`
-* `--byte-written-price <BYTE_WRITTEN_PRICE>` — Set the price per byte written
-
-  Default value: `0`
-* `--byte-stored-price <BYTE_STORED_PRICE>` — Set the price per byte stored
-
-  Default value: `0`
-* `--operation-price <OPERATION_PRICE>` — Set the base price of sending an operation from a block..
-
-  Default value: `0`
-* `--operation-byte-price <OPERATION_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user operation
-
-  Default value: `0`
-* `--message-price <MESSAGE_PRICE>` — Set the base price of sending a message from a block..
-
-  Default value: `0`
-* `--message-byte-price <MESSAGE_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user message
-
-  Default value: `0`
-* `--maximum-fuel-per-block <MAXIMUM_FUEL_PER_BLOCK>` — Set the maximum amount of fuel per block
-* `--maximum-executed-block-size <MAXIMUM_EXECUTED_BLOCK_SIZE>` — Set the maximum size of an executed block
-* `--maximum-bytecode-size <MAXIMUM_BYTECODE_SIZE>` — Set the maximum size of decompressed contract or service bytecode, in bytes
-* `--maximum-blob-size <MAXIMUM_BLOB_SIZE>` — Set the maximum size of data blobs, compressed bytecode and other binary blobs, in bytes
-* `--maximum-published-blobs <MAXIMUM_PUBLISHED_BLOBS>` — Set the maximum number of published blobs per block
-* `--maximum-block-proposal-size <MAXIMUM_BLOCK_PROPOSAL_SIZE>` — Set the maximum size of a block proposal, in bytes
-* `--maximum-bytes-read-per-block <MAXIMUM_BYTES_READ_PER_BLOCK>` — Set the maximum read data per block
-* `--maximum-bytes-written-per-block <MAXIMUM_BYTES_WRITTEN_PER_BLOCK>` — Set the maximum write data per block
+* `--block-price <BLOCK_PRICE>` — Set the base price for creating a block. (This will overwrite value from `--policy-config`)
+* `--fuel-unit-price <FUEL_UNIT_PRICE>` — Set the price per unit of fuel. (This will overwrite value from `--policy-config`)
+* `--read-operation-price <READ_OPERATION_PRICE>` — Set the price per read operation. (This will overwrite value from `--policy-config`)
+* `--write-operation-price <WRITE_OPERATION_PRICE>` — Set the price per write operation. (This will overwrite value from `--policy-config`)
+* `--byte-read-price <BYTE_READ_PRICE>` — Set the price per byte read. (This will overwrite value from `--policy-config`)
+* `--byte-written-price <BYTE_WRITTEN_PRICE>` — Set the price per byte written. (This will overwrite value from `--policy-config`)
+* `--byte-stored-price <BYTE_STORED_PRICE>` — Set the price per byte stored. (This will overwrite value from `--policy-config`)
+* `--operation-price <OPERATION_PRICE>` — Set the base price of sending an operation from a block.. (This will overwrite value from `--policy-config`)
+* `--operation-byte-price <OPERATION_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user operation. (This will overwrite value from `--policy-config`)
+* `--message-price <MESSAGE_PRICE>` — Set the base price of sending a message from a block.. (This will overwrite value from `--policy-config`)
+* `--message-byte-price <MESSAGE_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user message. (This will overwrite value from `--policy-config`)
+* `--maximum-fuel-per-block <MAXIMUM_FUEL_PER_BLOCK>` — Set the maximum amount of fuel per block. (This will overwrite value from `--policy-config`)
+* `--maximum-executed-block-size <MAXIMUM_EXECUTED_BLOCK_SIZE>` — Set the maximum size of an executed block. (This will overwrite value from `--policy-config`)
+* `--maximum-bytecode-size <MAXIMUM_BYTECODE_SIZE>` — Set the maximum size of decompressed contract or service bytecode, in bytes. (This will overwrite value from `--policy-config`)
+* `--maximum-blob-size <MAXIMUM_BLOB_SIZE>` — Set the maximum size of data blobs, compressed bytecode and other binary blobs, in bytes. (This will overwrite value from `--policy-config`)
+* `--maximum-published-blobs <MAXIMUM_PUBLISHED_BLOBS>` — Set the maximum number of published blobs per block. (This will overwrite value from `--policy-config`)
+* `--maximum-block-proposal-size <MAXIMUM_BLOCK_PROPOSAL_SIZE>` — Set the maximum size of a block proposal, in bytes. (This will overwrite value from `--policy-config`)
+* `--maximum-bytes-read-per-block <MAXIMUM_BYTES_READ_PER_BLOCK>` — Set the maximum read data per block. (This will overwrite value from `--policy-config`)
+* `--maximum-bytes-written-per-block <MAXIMUM_BYTES_WRITTEN_PER_BLOCK>` — Set the maximum write data per block. (This will overwrite value from `--policy-config`)
 * `--testing-prng-seed <TESTING_PRNG_SEED>` — Force this wallet to generate keys using a PRNG and a given seed. USE FOR TESTING ONLY
 * `--network-name <NETWORK_NAME>` — A unique name to identify this network
 
@@ -605,13 +589,19 @@ Run a GraphQL service that exposes a faucet where users can claim tokens. This g
 
 Publish bytecode
 
-**Usage:** `linera publish-bytecode <CONTRACT> <SERVICE> [PUBLISHER]`
+**Usage:** `linera publish-bytecode [OPTIONS] <CONTRACT> <SERVICE> [PUBLISHER]`
 
 ###### **Arguments:**
 
 * `<CONTRACT>` — Path to the Wasm file for the application "contract" bytecode
 * `<SERVICE>` — Path to the Wasm file for the application "service" bytecode
 * `<PUBLISHER>` — An optional chain ID to publish the bytecode. The default chain of the wallet is used otherwise
+
+###### **Options:**
+
+* `--vm-runtime <VM_RUNTIME>` — The virtual machine runtime to use
+
+  Default value: `wasm`
 
 
 
@@ -676,6 +666,9 @@ Create an application, and publish the required bytecode
 
 ###### **Options:**
 
+* `--vm-runtime <VM_RUNTIME>` — The virtual machine runtime to use
+
+  Default value: `wasm`
 * `--json-parameters <JSON_PARAMETERS>` — The shared parameters as JSON string
 * `--json-parameters-path <JSON_PARAMETERS_PATH>` — Path to a JSON file containing the shared parameters
 * `--json-argument <JSON_ARGUMENT>` — The instantiation argument as a JSON string
@@ -908,6 +901,9 @@ Build and publish a Linera project
 
 ###### **Options:**
 
+* `--vm-runtime <VM_RUNTIME>` — The virtual machine runtime to use
+
+  Default value: `wasm`
 * `--json-parameters <JSON_PARAMETERS>` — The shared parameters as JSON string
 * `--json-parameters-path <JSON_PARAMETERS_PATH>` — Path to a JSON file containing the shared parameters
 * `--json-argument <JSON_ARGUMENT>` — The instantiation argument as a JSON string
@@ -951,9 +947,9 @@ Start a Local Linera Network
   Default value: `1`
 * `--policy-config <POLICY_CONFIG>` — Configure the resource control policy (notably fees) according to pre-defined settings
 
-  Default value: `default`
+  Default value: `no-fees`
 
-  Possible values: `default`, `only-fuel`, `fuel-and-block`, `all-categories`, `devnet`
+  Possible values: `no-fees`, `testnet`
 
 * `--testing-prng-seed <TESTING_PRNG_SEED>` — Force this wallet to generate keys using a PRNG and a given seed. USE FOR TESTING ONLY
 * `--path <PATH>` — Run with a specific path where the wallet and validator input files are. If none, then a temporary directory is created

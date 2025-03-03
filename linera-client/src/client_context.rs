@@ -8,20 +8,22 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use futures::Future;
 use linera_base::{
-    crypto::{AccountSecretKey, CryptoHash},
+    crypto::{AccountSecretKey, CryptoHash, ValidatorPublicKey},
     data_types::{BlockHeight, Timestamp},
-    identifiers::{Account, ChainId},
+    identifiers::{Account, ChainId, MessageId, Owner},
     ownership::ChainOwnership,
     time::{Duration, Instant},
 };
 use linera_chain::types::ConfirmedBlockCertificate;
 use linera_core::{
     client::{BlanketMessagePolicy, ChainClient, Client, MessagePolicy, PendingProposal},
-    data_types::ClientOutcome,
+    data_types::{ChainInfoQuery, ClientOutcome},
     join_set_ext::JoinSet,
-    node::CrossChainMessageDelivery,
+    node::{CrossChainMessageDelivery, ValidatorNodeProvider},
+    remote_node::RemoteNode,
     JoinSetExt,
 };
+use linera_execution::{Message, SystemMessage};
 use linera_rpc::node_provider::{NodeOptions, NodeProvider};
 use linera_storage::Storage;
 use thiserror_context::Context;
@@ -43,6 +45,7 @@ use {
     linera_base::{
         data_types::{BlobContent, Bytecode},
         identifiers::BytecodeId,
+        vm::VmRuntime,
     },
     linera_core::client::create_bytecode_blobs,
     std::{fs, path::PathBuf},
@@ -238,23 +241,22 @@ where
     }
 
     fn make_chain_client(&self, chain_id: ChainId) -> Result<ChainClient<NodeProvider, S>, Error> {
-        let chain = self
-            .wallet
-            .get(chain_id)
-            .ok_or_else(|| error::Inner::NonexistentChain(chain_id))?;
-        let known_key_pairs = chain
-            .key_pair
-            .as_ref()
-            .map(|kp| kp.copy())
-            .into_iter()
-            .collect();
+        // We only create clients for chains we have in the wallet, or for the admin chain.
+        let chain = match self.wallet.get(chain_id) {
+            Some(chain) => chain.clone(),
+            None if chain_id == self.wallet.genesis_admin_chain() => {
+                UserChain::make_other(self.wallet.genesis_admin_chain(), Timestamp::from(0))
+            }
+            None => return Err(error::Inner::NonexistentChain(chain_id).into()),
+        };
+        let known_key_pairs = chain.key_pair.into_iter().collect();
         Ok(self.make_chain_client_internal(
             chain_id,
             known_key_pairs,
             chain.block_hash,
             chain.timestamp,
             chain.next_block_height,
-            chain.pending_proposal.clone(),
+            chain.pending_proposal,
         ))
     }
 
@@ -398,6 +400,86 @@ where
         }
     }
 
+    pub async fn assign_new_chain_to_key(
+        &mut self,
+        chain_id: ChainId,
+        message_id: MessageId,
+        owner: Owner,
+        validators: Option<Vec<(ValidatorPublicKey, String)>>,
+    ) -> Result<(), Error>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        let node_provider = self.make_node_provider();
+        let client = self.client.clone_with(
+            node_provider.clone(),
+            "Temporary client for fetching the parent chain",
+            vec![message_id.chain_id, chain_id],
+            false,
+        );
+
+        // Take the latest committee we know of.
+        let admin_chain_id = self.wallet.genesis_admin_chain();
+        let query = ChainInfoQuery::new(admin_chain_id).with_committees();
+        let nodes: Vec<_> = if let Some(validators) = validators {
+            node_provider
+                .make_nodes_from_list(validators)?
+                .map(|(public_key, node)| RemoteNode { public_key, node })
+                .collect()
+        } else {
+            let info = client.local_node().handle_chain_info_query(query).await?;
+            let committee = info
+                .latest_committee()
+                .ok_or(error::Inner::ChainInfoResponseMissingCommittee)?;
+            node_provider
+                .make_nodes(committee)?
+                .map(|(public_key, node)| RemoteNode { public_key, node })
+                .collect()
+        };
+
+        // Download the parent chain.
+        let target_height = message_id.height.try_add_one()?;
+        client
+            .download_certificates(&nodes, message_id.chain_id, target_height)
+            .await
+            .context("downloading parent chain")?;
+
+        // The initial timestamp for the new chain is taken from the block with the message.
+        let certificate = client
+            .local_node()
+            .certificate_for(&message_id)
+            .await
+            .context("looking for `OpenChain` message")?;
+        let executed_block = certificate.block();
+        let message = executed_block
+            .message_by_id(&message_id)
+            .map(|msg| &msg.message);
+        let Some(Message::System(SystemMessage::OpenChain(config))) = message else {
+            tracing::error!(
+                "The message with the ID returned by the faucet is not OpenChain. \
+                Please make sure you are connecting to a genuine faucet."
+            );
+            return Err(error::Inner::InvalidOpenMessage(message.cloned()).into());
+        };
+
+        if !config.ownership.verify_owner(&owner) {
+            tracing::error!(
+                "The chain with the ID returned by the faucet is not owned by you. \
+                Please make sure you are connecting to a genuine faucet."
+            );
+            return Err(error::Inner::ChainOwnership.into());
+        }
+
+        self.wallet_mut()
+            .mutate(|w| {
+                w.assign_new_chain_to_owner(owner, chain_id, executed_block.header.timestamp)
+            })
+            .await
+            .map_err(|e| error::Inner::Persistence(Box::new(e)))?
+            .context("assigning new chain")?;
+        Ok(())
+    }
+
     /// Applies the given function to the chain client.
     ///
     /// Updates the wallet regardless of the outcome. As long as the function returns a round
@@ -480,6 +562,7 @@ where
         chain_client: &ChainClient<NodeProvider, S>,
         contract: PathBuf,
         service: PathBuf,
+        vm_runtime: VmRuntime,
     ) -> Result<BytecodeId, Error> {
         info!("Loading bytecode files");
         let contract_bytecode = Bytecode::load_from_file(&contract)
@@ -491,7 +574,7 @@ where
 
         info!("Publishing bytecode");
         let (contract_blob, service_blob, bytecode_id) =
-            create_bytecode_blobs(contract_bytecode, service_bytecode).await;
+            create_bytecode_blobs(contract_bytecode, service_bytecode, vm_runtime).await;
         let (bytecode_id, _) = self
             .apply_client_command(chain_client, |chain_client| {
                 let contract_blob = contract_blob.clone();
@@ -620,12 +703,12 @@ where
             .default_chain()
             .expect("should have default chain");
         let default_chain_client = self.make_chain_client(default_chain_id)?;
-        let (epoch, committees) = default_chain_client
+        let (epoch, mut committees) = default_chain_client
             .epoch_and_committees(default_chain_id)
             .await?;
         let epoch = epoch.expect("default chain should have an epoch");
         let committee = committees
-            .get(&epoch)
+            .remove(&epoch)
             .expect("current epoch should have a committee");
         let blocks_infos = Benchmark::<S>::make_benchmark_block_info(
             key_pairs,
@@ -633,7 +716,7 @@ where
             fungible_application_id,
         );
 
-        Ok((chain_clients, epoch, blocks_infos, committee.clone()))
+        Ok((chain_clients, epoch, blocks_infos, committee))
     }
 
     async fn process_inboxes_and_force_validator_updates(&mut self) {

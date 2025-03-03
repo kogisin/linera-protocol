@@ -620,7 +620,7 @@ impl TryFrom<api::ChainId> for ChainId {
 impl From<AccountPublicKey> for api::AccountPublicKey {
     fn from(public_key: AccountPublicKey) -> Self {
         Self {
-            bytes: public_key.0.to_vec(),
+            bytes: public_key.to_bytes(),
         }
     }
 }
@@ -628,7 +628,7 @@ impl From<AccountPublicKey> for api::AccountPublicKey {
 impl From<ValidatorPublicKey> for api::ValidatorPublicKey {
     fn from(public_key: ValidatorPublicKey) -> Self {
         Self {
-            bytes: public_key.0.serialize().to_vec(),
+            bytes: public_key.as_bytes().to_vec(),
         }
     }
 }
@@ -637,7 +637,7 @@ impl TryFrom<api::ValidatorPublicKey> for ValidatorPublicKey {
     type Error = GrpcProtoConversionError;
 
     fn try_from(public_key: api::ValidatorPublicKey) -> Result<Self, Self::Error> {
-        Ok(ValidatorPublicKey::try_from(public_key.bytes.as_slice())?)
+        Ok(Self::from_bytes(public_key.bytes.as_slice())?)
     }
 }
 
@@ -645,14 +645,14 @@ impl TryFrom<api::AccountPublicKey> for AccountPublicKey {
     type Error = GrpcProtoConversionError;
 
     fn try_from(public_key: api::AccountPublicKey) -> Result<Self, Self::Error> {
-        Ok(AccountPublicKey::try_from(public_key.bytes.as_slice())?)
+        Ok(Self::from_slice(public_key.bytes.as_slice())?)
     }
 }
 
 impl From<AccountSignature> for api::AccountSignature {
     fn from(signature: AccountSignature) -> Self {
         Self {
-            bytes: signature.0.to_vec(),
+            bytes: signature.to_bytes(),
         }
     }
 }
@@ -660,7 +660,7 @@ impl From<AccountSignature> for api::AccountSignature {
 impl From<ValidatorSignature> for api::ValidatorSignature {
     fn from(signature: ValidatorSignature) -> Self {
         Self {
-            bytes: signature.0.serialize_compact().to_vec(),
+            bytes: signature.as_bytes().to_vec(),
         }
     }
 }
@@ -677,7 +677,7 @@ impl TryFrom<api::AccountSignature> for AccountSignature {
     type Error = GrpcProtoConversionError;
 
     fn try_from(signature: api::AccountSignature) -> Result<Self, Self::Error> {
-        Ok(Self(signature.bytes.as_slice().try_into()?))
+        Ok(Self::from_slice(signature.bytes.as_slice())?)
     }
 }
 

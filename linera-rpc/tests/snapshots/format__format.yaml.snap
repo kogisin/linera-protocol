@@ -19,6 +19,12 @@ AccountOwner:
       Application:
         NEWTYPE:
           TYPENAME: ApplicationId
+AccountPublicKey:
+  NEWTYPESTRUCT:
+    TYPENAME: Ed25519PublicKey
+AccountSignature:
+  NEWTYPESTRUCT:
+    TYPENAME: Ed25519Signature
 AdminOperation:
   ENUM:
     0:
@@ -148,9 +154,9 @@ BlockProposal:
     - content:
         TYPENAME: ProposalContent
     - public_key:
-        TYPENAME: Ed25519PublicKey
+        TYPENAME: AccountPublicKey
     - signature:
-        TYPENAME: Ed25519Signature
+        TYPENAME: AccountSignature
     - validated_block_certificate:
         OPTION:
           TYPENAME: LiteCertificate
@@ -160,6 +166,8 @@ BytecodeId:
         TYPENAME: CryptoHash
     - service_blob_hash:
         TYPENAME: CryptoHash
+    - vm_runtime:
+        TYPENAME: VmRuntime
 Certificate:
   ENUM:
     0:
@@ -1196,7 +1204,7 @@ ValidatorState:
     - network_address: STR
     - votes: U64
     - account_public_key:
-        TYPENAME: Ed25519PublicKey
+        TYPENAME: AccountPublicKey
 VersionInfo:
   STRUCT:
     - crate_version:
@@ -1206,3 +1214,9 @@ VersionInfo:
     - rpc_hash: STR
     - graphql_hash: STR
     - wit_hash: STR
+VmRuntime:
+  ENUM:
+    0:
+      Wasm: UNIT
+    1:
+      Evm: UNIT

@@ -19,6 +19,9 @@ use super::{
 };
 use crate::{doc_scalar, identifiers::Owner};
 
+/// The label for the Ed25519 scheme.
+const ED25519_SCHEME_LABEL: &str = "Ed25519";
+
 /// An Ed25519 secret key.
 pub struct Ed25519SecretKey(pub(crate) dalek::SigningKey);
 
@@ -32,7 +35,9 @@ pub struct Ed25519Signature(pub dalek::Signature);
 
 impl Ed25519SecretKey {
     #[cfg(all(with_getrandom, with_testing))]
-    /// Generates a new key pair.
+    /// Generates a new key pair using the operating system's RNG.
+    ///
+    /// If you want control over the RNG, use `generate_from`[Ed25519SecretKey::generate_from].
     pub fn generate() -> Self {
         let mut rng = rand::rngs::OsRng;
         Self::generate_from(&mut rng)
@@ -65,6 +70,25 @@ impl Ed25519PublicKey {
     pub fn test_key(name: u8) -> Ed25519PublicKey {
         let addr = [name; dalek::PUBLIC_KEY_LENGTH];
         Ed25519PublicKey(addr)
+    }
+
+    /// Returns bytes of the public key.
+    pub fn as_bytes(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
+    /// Parses bytes to a public key.
+    ///
+    /// Returns error if input bytes are not of the correct length.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let key = bytes
+            .try_into()
+            .map_err(|_| CryptoError::IncorrectPublicKeySize {
+                scheme: ED25519_SCHEME_LABEL,
+                len: bytes.len(),
+                expected: dalek::PUBLIC_KEY_LENGTH,
+            })?;
+        Ok(Ed25519PublicKey(key))
     }
 }
 
@@ -141,7 +165,11 @@ impl TryFrom<&[u8]> for Ed25519PublicKey {
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() != dalek::PUBLIC_KEY_LENGTH {
-            return Err(CryptoError::IncorrectPublicKeySize(value.len()));
+            return Err(CryptoError::IncorrectPublicKeySize {
+                scheme: ED25519_SCHEME_LABEL,
+                len: value.len(),
+                expected: dalek::PUBLIC_KEY_LENGTH,
+            });
         }
         let mut pubkey = [0u8; dalek::PUBLIC_KEY_LENGTH];
         pubkey.copy_from_slice(value);
@@ -262,6 +290,20 @@ impl Ed25519Signature {
         Ed25519Signature(signature)
     }
 
+    /// Parses bytes to a signature.
+    ///
+    /// Returns error if input slice is not 64 bytes.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let sig = dalek::Signature::from_slice(bytes).map_err(|_| {
+            CryptoError::IncorrectSignatureBytes {
+                scheme: ED25519_SCHEME_LABEL,
+                len: bytes.len(),
+                expected: dalek::SIGNATURE_LENGTH,
+            }
+        })?;
+        Ok(Ed25519Signature(sig))
+    }
+
     fn check_internal<'de, T>(
         &self,
         value: &T,
@@ -310,6 +352,8 @@ impl Ed25519Signature {
     }
 
     /// Verifies a batch of signatures.
+    // NOTE: This is unused now since we don't use ed25519 in consensus layer.
+    #[allow(unused)]
     pub fn verify_batch<'a, 'de, T, I>(value: &'a T, votes: I) -> Result<(), CryptoError>
     where
         T: BcsSignable<'de>,

@@ -42,7 +42,7 @@ use linera_rpc::{
         GRPC_MAX_MESSAGE_SIZE,
     },
 };
-use linera_sdk::{base::Blob, views::ViewError};
+use linera_sdk::{linera_base_types::Blob, views::ViewError};
 use linera_storage::Storage;
 use prost::Message;
 use tokio::{select, task::JoinSet};
@@ -57,7 +57,7 @@ use tracing::{debug, info, instrument, Instrument as _, Level};
 #[cfg(with_metrics)]
 use {
     linera_base::prometheus_util::{
-        bucket_interval, register_histogram_vec, register_int_counter_vec,
+        linear_bucket_interval, register_histogram_vec, register_int_counter_vec,
     },
     prometheus::{HistogramVec, IntCounterVec},
 };
@@ -71,7 +71,7 @@ static PROXY_REQUEST_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         "proxy_request_latency",
         "Proxy request latency",
         &[],
-        bucket_interval(1.0, 500.0),
+        linear_bucket_interval(1.0, 50.0, 500.0),
     )
 });
 
@@ -352,6 +352,7 @@ where
             }
             ViewError::NotFound(_)
             | ViewError::BlobsNotFound(_)
+            | ViewError::EventsNotFound(_)
             | ViewError::CannotAcquireCollectionEntry
             | ViewError::MissingEntries => Status::not_found(err.to_string()),
         };
@@ -478,7 +479,8 @@ where
 
     #[instrument(skip_all, err(Display))]
     async fn upload_blob(&self, request: Request<BlobContent>) -> Result<Response<BlobId>, Status> {
-        let content: linera_sdk::base::BlobContent = request.into_inner().try_into()?;
+        let content: linera_sdk::linera_base_types::BlobContent =
+            request.into_inner().try_into()?;
         let blob = Blob::new(content);
         let id = blob.id();
         let result = self.0.storage.maybe_write_blobs(&[blob]).await;
@@ -698,7 +700,9 @@ mod proto_message_cap {
         data_types::{BlockExecutionOutcome, ExecutedBlock},
         types::{Certificate, ConfirmedBlock, ConfirmedBlockCertificate},
     };
-    use linera_sdk::base::{ChainId, TestString, ValidatorKeypair, ValidatorSignature};
+    use linera_sdk::linera_base_types::{
+        ChainId, TestString, ValidatorKeypair, ValidatorSignature,
+    };
 
     use super::{CertificatesBatchResponse, GrpcMessageLimiter};
 

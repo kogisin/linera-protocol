@@ -24,6 +24,7 @@ use linera_execution::{
 use linera_rpc::node_provider::NodeProvider;
 use linera_sdk::abis::fungible;
 use linera_storage::Storage;
+use num_format::{Locale, ToFormattedString};
 use tokio::{runtime::Handle, task, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument as _};
@@ -51,6 +52,7 @@ where
         blocks_infos: Vec<(ChainId, Vec<Operation>, AccountSecretKey)>,
         committee: Committee,
         local_node: LocalNodeClient<S>,
+        keep_chains_open: bool,
     ) -> Result<(), Error> {
         let shutdown_notifier = CancellationToken::new();
         tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
@@ -74,11 +76,13 @@ where
                 if recv_count == num_chains {
                     let elapsed = start.elapsed();
                     if let Some(bps) = bps {
+                        let tps = (bps * transactions_per_block).to_formatted_string(&Locale::en);
+                        let bps = bps.to_formatted_string(&Locale::en);
                         if elapsed > time::Duration::from_secs(1) {
                             warn!(
                                 "Failed to achieve {} BPS/{} TPS in {} ms",
                                 bps,
-                                bps * transactions_per_block,
+                                tps,
                                 elapsed.as_millis(),
                             );
                         } else {
@@ -86,7 +90,7 @@ where
                             info!(
                                 "Achieved {} BPS/{} TPS in {} ms",
                                 bps,
-                                bps * transactions_per_block,
+                                tps,
                                 elapsed.as_millis(),
                             );
                         }
@@ -140,6 +144,7 @@ where
                             sender,
                             committee,
                             local_node,
+                            keep_chains_open,
                         )
                         .await?;
 
@@ -176,6 +181,7 @@ where
         sender: crossbeam_channel::Sender<()>,
         committee: Committee,
         local_node: LocalNodeClient<S>,
+        keep_chains_open: bool,
     ) -> Result<(), Error> {
         let chain_id = chain_client.chain_id();
         info!(
@@ -234,7 +240,9 @@ where
             }
         }
 
-        Self::close_benchmark_chain(chain_client).await?;
+        if !keep_chains_open {
+            Self::close_benchmark_chain(chain_client).await?;
+        }
         info!("Exiting task...");
         Ok(())
     }

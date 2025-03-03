@@ -3,7 +3,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     marker::PhantomData,
     mem,
@@ -17,16 +17,21 @@ use anyhow::{bail, ensure, Context, Result};
 use async_graphql::InputType;
 use async_tungstenite::tungstenite::{client::IntoClientRequest as _, http::HeaderValue};
 use futures::{SinkExt as _, Stream, StreamExt as _, TryStreamExt as _};
+use heck::ToKebabCase;
 use linera_base::{
     abi::ContractAbi,
     command::{resolve_binary, CommandExt},
     crypto::CryptoHash,
     data_types::{Amount, Bytecode},
     identifiers::{Account, ApplicationId, BytecodeId, ChainId, MessageId, Owner},
+    vm::VmRuntime,
 };
-use linera_client::wallet::Wallet;
+use linera_client::{client_options::ResourceControlPolicyConfig, wallet::Wallet};
 use linera_core::worker::Notification;
-use linera_execution::{system::SystemChannel, ResourceControlPolicy};
+use linera_execution::{
+    committee::{Committee, Epoch},
+    system::SystemChannel,
+};
 use linera_faucet::ClaimOutcome;
 use linera_faucet_client::Faucet;
 use serde::{de::DeserializeOwned, ser::Serialize};
@@ -232,29 +237,8 @@ impl ClientWrapper {
         &self,
         num_other_initial_chains: u32,
         initial_funding: Amount,
-        policy: ResourceControlPolicy,
+        policy_config: ResourceControlPolicyConfig,
     ) -> Result<()> {
-        let ResourceControlPolicy {
-            block,
-            fuel_unit,
-            read_operation,
-            write_operation,
-            byte_read,
-            byte_written,
-            byte_stored,
-            operation,
-            operation_byte,
-            message,
-            message_byte,
-            maximum_fuel_per_block,
-            maximum_executed_block_size,
-            maximum_blob_size,
-            maximum_published_blobs,
-            maximum_bytecode_size,
-            maximum_block_proposal_size,
-            maximum_bytes_read_per_block,
-            maximum_bytes_written_per_block,
-        } = policy;
         let mut command = self.command().await?;
         command
             .args([
@@ -264,46 +248,11 @@ impl ClientWrapper {
             .args(["--initial-funding", &initial_funding.to_string()])
             .args(["--committee", "committee.json"])
             .args(["--genesis", "genesis.json"])
-            .args(["--block-price", &block.to_string()])
-            .args(["--fuel-unit-price", &fuel_unit.to_string()])
-            .args(["--read-operation-price", &read_operation.to_string()])
-            .args(["--byte-read-price", &byte_read.to_string()])
-            .args(["--byte-written-price", &byte_written.to_string()])
-            .args(["--byte-stored-price", &byte_stored.to_string()])
-            .args(["--message-byte-price", &message_byte.to_string()])
-            .args(["--write-operation-price", &write_operation.to_string()])
-            .args(["--operation-price", &operation.to_string()])
-            .args(["--operation-byte-price", &operation_byte.to_string()])
-            .args(["--message-price", &message.to_string()])
             .args([
-                "--maximum-fuel-per-block",
-                &maximum_fuel_per_block.to_string(),
-            ])
-            .args([
-                "--maximum-executed-block-size",
-                &maximum_executed_block_size.to_string(),
-            ])
-            .args(["--maximum-blob-size", &maximum_blob_size.to_string()])
-            .args([
-                "--maximum-published-blobs",
-                &maximum_published_blobs.to_string(),
-            ])
-            .args([
-                "--maximum-bytecode-size",
-                &maximum_bytecode_size.to_string(),
-            ])
-            .args([
-                "--maximum-block-proposal-size",
-                &maximum_block_proposal_size.to_string(),
-            ])
-            .args([
-                "--maximum-bytes-read-per-block",
-                &maximum_bytes_read_per_block.to_string(),
-            ])
-            .args([
-                "--maximum-bytes-written-per-block",
-                &maximum_bytes_written_per_block.to_string(),
+                "--policy-config",
+                &policy_config.to_string().to_kebab_case(),
             ]);
+
         if let Some(seed) = self.testing_prng_seed {
             command.arg("--testing-prng-seed").arg(seed.to_string());
         }
@@ -1220,14 +1169,16 @@ impl NodeService {
         chain_id: &ChainId,
         contract: PathBuf,
         service: PathBuf,
+        vm_runtime: VmRuntime,
     ) -> Result<BytecodeId<Abi, Parameters, InstantiationArgument>> {
         let contract_code = Bytecode::load_from_file(&contract).await?;
         let service_code = Bytecode::load_from_file(&service).await?;
         let query = format!(
-            "mutation {{ publishBytecode(chainId: {}, contract: {}, service: {}) }}",
+            "mutation {{ publishBytecode(chainId: {}, contract: {}, service: {}, vmRuntime: {}) }}",
             chain_id.to_value(),
             contract_code.to_value(),
             service_code.to_value(),
+            vm_runtime.to_value(),
         );
         let data = self.query_node(query).await?;
         let bytecode_str = data["publishBytecode"]
@@ -1237,6 +1188,17 @@ impl NodeService {
             .parse()
             .context("could not parse bytecode ID")?;
         Ok(bytecode_id.with_abi())
+    }
+
+    pub async fn query_committees(&self, chain_id: &ChainId) -> Result<BTreeMap<Epoch, Committee>> {
+        let query = format!(
+            "query {{ chain(chainId:\"{chain_id}\") {{
+                executionState {{ system {{ committees }} }}
+            }} }}"
+        );
+        let mut response = self.query_node(query).await?;
+        let committees = response["chain"]["executionState"]["system"]["committees"].take();
+        Ok(serde_json::from_value(committees)?)
     }
 
     pub async fn query_node(&self, query: impl AsRef<str>) -> Result<Value> {
