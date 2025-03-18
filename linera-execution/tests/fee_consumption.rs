@@ -5,17 +5,20 @@
 
 #![allow(clippy::items_after_test_module)]
 
-use std::{sync::Arc, vec};
+use std::{collections::BTreeSet, sync::Arc, vec};
 
 use linera_base::{
     crypto::{AccountPublicKey, CryptoHash},
-    data_types::{Amount, BlockHeight, Timestamp},
+    data_types::{Amount, BlockHeight, OracleResponse, Timestamp},
+    http,
     identifiers::{Account, AccountOwner, ChainDescription, ChainId, MessageId, Owner},
 };
 use linera_execution::{
-    test_utils::{ExpectedCall, RegisterMockApplication, SystemExecutionState},
-    ContractRuntime, ExecutionError, ExecutionOutcome, Message, MessageContext,
-    RawExecutionOutcome, ResourceControlPolicy, ResourceController, TransactionTracker,
+    test_utils::{
+        blob_oracle_responses, ExpectedCall, RegisterMockApplication, SystemExecutionState,
+    },
+    ContractRuntime, ExecutionError, Message, MessageContext, ResourceControlPolicy,
+    ResourceController, TransactionTracker,
 };
 use test_case::test_case;
 
@@ -109,6 +112,72 @@ use test_case::test_case;
     Some(Amount::from_tokens(1_000));
     "with execution and an empty read and with owner account and grant"
 )]
+#[cfg_attr(feature = "unstable-oracles", test_case(
+    vec![
+        FeeSpend::QueryServiceOracle,
+    ],
+    Amount::from_tokens(2),
+    Some(Amount::from_tokens(1)),
+    Some(Amount::from_tokens(1_000));
+    "with only a service oracle call"
+))]
+#[cfg_attr(feature = "unstable-oracles", test_case(
+    vec![
+        FeeSpend::QueryServiceOracle,
+        FeeSpend::QueryServiceOracle,
+        FeeSpend::QueryServiceOracle,
+    ],
+    Amount::from_tokens(2),
+    Some(Amount::from_tokens(1)),
+    Some(Amount::from_tokens(1_000));
+    "with three service oracle calls"
+))]
+#[cfg_attr(feature = "unstable-oracles", test_case(
+    vec![
+        FeeSpend::Fuel(91),
+        FeeSpend::QueryServiceOracle,
+        FeeSpend::Fuel(11),
+        FeeSpend::Read(vec![0, 1, 2], None),
+        FeeSpend::QueryServiceOracle,
+        FeeSpend::Fuel(57),
+        FeeSpend::QueryServiceOracle,
+    ],
+    Amount::from_tokens(2),
+    Some(Amount::from_tokens(1_000)),
+    None;
+    "with service oracle calls, fuel consumption and a read operation"
+))]
+#[test_case(
+    vec![FeeSpend::HttpRequest],
+    Amount::from_tokens(2),
+    Some(Amount::from_tokens(1)),
+    Some(Amount::from_tokens(1_000));
+    "with one HTTP request"
+)]
+#[test_case(
+    vec![
+        FeeSpend::HttpRequest,
+        FeeSpend::HttpRequest,
+        FeeSpend::HttpRequest,
+    ],
+    Amount::from_tokens(2),
+    Some(Amount::from_tokens(1)),
+    Some(Amount::from_tokens(1_000));
+    "with three HTTP requests"
+)]
+#[test_case(
+    vec![
+        FeeSpend::Fuel(11),
+        FeeSpend::HttpRequest,
+        FeeSpend::Read(vec![0, 1], None),
+        FeeSpend::Fuel(23),
+        FeeSpend::HttpRequest,
+    ],
+    Amount::from_tokens(2),
+    Some(Amount::from_tokens(1)),
+    Some(Amount::from_tokens(1_000));
+    "with all fee spend operations"
+)]
 // TODO(#1601): Add more test cases
 #[tokio::test]
 async fn test_fee_consumption(
@@ -121,8 +190,10 @@ async fn test_fee_consumption(
         description: Some(ChainDescription::Root(0)),
         ..SystemExecutionState::default()
     };
-    let (application_id, application) = state.register_mock_application().await?;
+    let (application_id, application, blobs) = state.register_mock_application(0).await?;
     let mut view = state.into_view().await;
+
+    let mut oracle_responses = blob_oracle_responses(blobs.iter());
 
     let signer = Owner::from(AccountPublicKey::test_key(0));
     let owner = AccountOwner::User(signer);
@@ -143,14 +214,20 @@ async fn test_fee_consumption(
         operation_byte: Amount::from_tokens(23),
         message: Amount::from_tokens(29),
         message_byte: Amount::from_tokens(31),
+        service_as_oracle_query: Amount::from_millis(37),
+        http_request: Amount::from_tokens(41),
         maximum_fuel_per_block: 4_868_145_137,
-        maximum_executed_block_size: 37,
-        maximum_blob_size: 41,
-        maximum_published_blobs: 43,
-        maximum_bytecode_size: 47,
-        maximum_block_proposal_size: 53,
-        maximum_bytes_read_per_block: 59,
-        maximum_bytes_written_per_block: 61,
+        maximum_executed_block_size: 43,
+        maximum_service_oracle_execution_ms: 47,
+        maximum_blob_size: 53,
+        maximum_published_blobs: 59,
+        maximum_bytecode_size: 61,
+        maximum_block_proposal_size: 67,
+        maximum_bytes_read_per_block: 71,
+        maximum_bytes_written_per_block: 73,
+        maximum_http_response_bytes: 79,
+        http_request_timeout_ms: 83,
+        http_request_allow_list: BTreeSet::new(),
     };
 
     let consumed_fees = spends
@@ -171,6 +248,10 @@ async fn test_fee_consumption(
         ..ResourceController::default()
     };
 
+    for spend in &spends {
+        oracle_responses.extend(spend.expected_oracle_responses());
+    }
+
     application.expect_call(ExpectedCall::execute_message(
         move |runtime, _context, _operation| {
             for spend in spends {
@@ -181,10 +262,12 @@ async fn test_fee_consumption(
     ));
     application.expect_call(ExpectedCall::default_finalize());
 
-    let refund_grant_to = Some(Account {
-        chain_id: ChainId::root(0),
-        owner: authenticated_signer.map(AccountOwner::User),
-    });
+    let refund_grant_to = authenticated_signer
+        .map(|owner| Account {
+            chain_id: ChainId::root(0),
+            owner: AccountOwner::User(owner),
+        })
+        .or(None);
     let context = MessageContext {
         chain_id: ChainId::root(0),
         is_bouncing: false,
@@ -196,7 +279,7 @@ async fn test_fee_consumption(
         message_id: MessageId::default(),
     };
     let mut grant = initial_grant.unwrap_or_default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(0, 0, Some(oracle_responses));
     view.execute_message(
         context,
         Timestamp::from(0),
@@ -215,27 +298,7 @@ async fn test_fee_consumption(
     .await?;
 
     let txn_outcome = txn_tracker.into_outcome()?;
-    assert_eq!(
-        txn_outcome.outcomes,
-        vec![
-            ExecutionOutcome::User(
-                application_id,
-                RawExecutionOutcome {
-                    refund_grant_to,
-                    authenticated_signer,
-                    ..Default::default()
-                }
-            ),
-            ExecutionOutcome::User(
-                application_id,
-                RawExecutionOutcome {
-                    refund_grant_to,
-                    authenticated_signer,
-                    ..Default::default()
-                }
-            )
-        ]
-    );
+    assert!(txn_outcome.outgoing_messages.is_empty());
 
     match initial_grant {
         None => {
@@ -296,9 +359,24 @@ pub enum FeeSpend {
     Fuel(u64),
     /// Reads from storage.
     Read(Vec<u8>, Option<Vec<u8>>),
+    /// Queries a service as an oracle.
+    QueryServiceOracle,
+    /// Performs an HTTP request.
+    HttpRequest,
 }
 
 impl FeeSpend {
+    /// Returns the [`OracleResponse`]s necessary for executing this runtime operation.
+    pub fn expected_oracle_responses(&self) -> Vec<OracleResponse> {
+        match self {
+            FeeSpend::Fuel(_) | FeeSpend::Read(_, _) => vec![],
+            FeeSpend::QueryServiceOracle => {
+                vec![OracleResponse::Service(vec![])]
+            }
+            FeeSpend::HttpRequest => vec![OracleResponse::Http(http::Response::ok([]))],
+        }
+    }
+
     /// The fee amount required for this runtime operation.
     pub fn amount(&self, policy: &ResourceControlPolicy) -> Amount {
         match self {
@@ -311,6 +389,8 @@ impl FeeSpend {
 
                 policy.read_operation.saturating_add(value_read_fee)
             }
+            FeeSpend::QueryServiceOracle => policy.service_as_oracle_query,
+            FeeSpend::HttpRequest => policy.http_request,
         }
     }
 
@@ -322,6 +402,15 @@ impl FeeSpend {
                 let promise = runtime.read_value_bytes_new(key)?;
                 let response = runtime.read_value_bytes_wait(&promise)?;
                 assert_eq!(response, value);
+                Ok(())
+            }
+            FeeSpend::QueryServiceOracle => {
+                let application_id = runtime.application_id()?;
+                runtime.query_service(application_id, vec![])?;
+                Ok(())
+            }
+            FeeSpend::HttpRequest => {
+                runtime.perform_http_request(http::Request::get("http://dummy.url"))?;
                 Ok(())
             }
         }

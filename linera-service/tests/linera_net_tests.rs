@@ -88,47 +88,6 @@ fn get_fungible_account_owner(client: &ClientWrapper) -> AccountOwner {
     AccountOwner::User(owner)
 }
 
-#[cfg(feature = "ethereum")]
-struct EthereumTrackerApp(ApplicationWrapper<ethereum_tracker::EthereumTrackerAbi>);
-
-#[cfg(feature = "ethereum")]
-use alloy::primitives::U256;
-
-#[cfg(feature = "ethereum")]
-impl EthereumTrackerApp {
-    async fn get_amount(&self, account_owner: &str) -> U256 {
-        use ethereum_tracker::U256Cont;
-        let query = format!(
-            "accounts {{ entry(key: \"{}\") {{ value }} }}",
-            account_owner
-        );
-        let response_body = self.0.query(&query).await.unwrap();
-        let amount_option = serde_json::from_value::<Option<U256Cont>>(
-            response_body["accounts"]["entry"]["value"].clone(),
-        )
-        .unwrap();
-        match amount_option {
-            None => U256::from(0),
-            Some(value) => {
-                let U256Cont { value } = value;
-                value
-            }
-        }
-    }
-
-    async fn assert_balances(&self, accounts: impl IntoIterator<Item = (String, U256)>) {
-        for (account_owner, amount) in accounts {
-            let value = self.get_amount(&account_owner).await;
-            assert_eq!(value, amount);
-        }
-    }
-
-    async fn update(&self, to_block: u64) {
-        let mutation = format!("update(toBlock: {})", to_block);
-        self.0.mutate(mutation).await.unwrap();
-    }
-}
-
 struct FungibleApp(ApplicationWrapper<fungible::FungibleTokenAbi>);
 
 impl FungibleApp {
@@ -373,102 +332,104 @@ impl AmmApp {
     }
 }
 
-#[cfg(feature = "ethereum")]
+#[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
-async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> Result<()> {
-    use ethereum_tracker::{EthereumTrackerAbi, InstantiationArgument};
-    use linera_ethereum::{
-        client::EthereumQueries,
-        test_utils::{get_anvil, SimpleTokenContractFunction},
-    };
+async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
+    use alloy::primitives::U256;
+    use alloy_sol_types::{sol, SolCall, SolValue};
+    use linera_execution::test_utils::solidity::get_example_counter;
+    use linera_sdk::abis::evm::EvmAbi;
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
-    // Setting up the Ethereum smart contract
-    let anvil_test = get_anvil().await?;
-    let address0 = anvil_test.get_address(0);
-    let address1 = anvil_test.get_address(1);
-    let ethereum_endpoint = anvil_test.endpoint.clone();
-    let ethereum_client = anvil_test.ethereum_client.clone();
-
-    let simple_token = SimpleTokenContractFunction::new(anvil_test).await?;
-    let contract_address = simple_token.contract_address.clone();
-    let event_name_expanded = "Initial(address,uint256)";
-    let events = ethereum_client
-        .read_events(&contract_address, event_name_expanded, 0, 2)
-        .await?;
-    let start_block = events.first().unwrap().block_number;
-    let argument = InstantiationArgument {
-        ethereum_endpoint,
-        contract_address,
-        start_block,
-    };
-
-    // Setting up the validators
     let (mut net, client) = config.instantiate().await?;
-    let chain = client.load_wallet()?.default_chain().unwrap();
 
-    // Change the ownership so that the blocks inserted are not
-    // fast blocks. Fast blocks are not allowed for the oracles.
-    let owner1 = {
-        let wallet = client.load_wallet()?;
-        let user_chain = wallet.get(chain).unwrap();
-        user_chain.key_pair.as_ref().unwrap().public().into()
+    sol! {
+        struct ConstructorArgs {
+            uint256 initial_value;
+        }
+        function increment(uint256 input);
+        function get_value();
+    }
+
+    let original_counter_value = U256::from(35);
+    let instantiation_argument = ConstructorArgs {
+        initial_value: original_counter_value,
     };
-    client.change_ownership(chain, vec![], vec![owner1]).await?;
+    let instantiation_argument = instantiation_argument.abi_encode();
 
-    let (contract, service) = client.build_example("ethereum-tracker").await?;
+    let increment = U256::from(5);
+
+    let chain = client.load_wallet()?.default_chain().unwrap();
+    let module = get_example_counter()?;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path();
+    let app_file = "app.json";
+    let app_path = path.join(app_file);
+    {
+        std::fs::write(app_path.clone(), &module)?;
+    }
+
+    let contract = app_path.to_path_buf();
+    let service = app_path.to_path_buf();
+    type Parameter = ();
+    type InstantiationArgument = Vec<u8>;
 
     let application_id = client
-        .publish_and_create::<EthereumTrackerAbi, (), InstantiationArgument>(
+        .publish_and_create::<EvmAbi, Parameter, InstantiationArgument>(
             contract,
             service,
+            VmRuntime::Evm,
             &(),
-            &argument,
+            &instantiation_argument,
             &[],
             None,
         )
         .await?;
+
     let port = get_node_port().await;
-    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+    let node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
 
-    let app = EthereumTrackerApp(
-        node_service
-            .make_application(&chain, &application_id)
-            .await?,
-    );
+    let application = node_service
+        .make_application(&chain, &application_id)
+        .await?;
 
-    // Check after the initialization
+    let query = get_valueCall {};
+    let query = query.abi_encode();
+    let query = hex::encode(&query);
+    let query = format!("query {{ v{} }}", query);
 
-    app.assert_balances([
-        (address0.clone(), U256::from(1000)),
-        (address1.clone(), U256::from(0)),
-    ])
-    .await;
+    let result = application.raw_query(query).await?;
+    let result = result.to_string();
+    let result = hex::decode(&result[1..result.len() - 1])?;
 
-    // Doing a transfer and updating the smart contract
-    // First await gets you the pending transaction, second gets it mined.
+    let counter_value = U256::from_be_slice(&result);
+    assert_eq!(counter_value, original_counter_value);
 
-    let value = U256::from(10);
-    simple_token.transfer(&address0, &address1, value).await?;
-    let last_block = ethereum_client.get_block_number().await?;
-    // increment by 1 since the read_events is exclusive in the last block.
-    app.update(last_block + 1).await;
+    let mutation = incrementCall { input: increment };
+    let mutation = mutation.abi_encode();
+    let mutation = hex::encode(&mutation);
+    let mutation = format!("mutation {{ v{} }}", mutation);
 
-    // Now checking the balances after the operations.
+    application.raw_query(mutation).await?;
 
-    app.assert_balances([
-        (address0.clone(), U256::from(990)),
-        (address1.clone(), U256::from(10)),
-    ])
-    .await;
+    let query = get_valueCall {};
+    let query = query.abi_encode();
+    let query = hex::encode(&query);
+    let query = format!("query {{ v{} }}", query);
 
-    node_service.ensure_is_running()?;
+    let result = application.raw_query(query).await?;
+    let result = result.to_string();
+    let result = hex::decode(&result[1..result.len() - 1])?;
+
+    let counter_value = U256::from_be_slice(&result);
+    assert_eq!(counter_value, original_counter_value + increment);
 
     net.ensure_is_running().await?;
     net.terminate().await?;
@@ -499,6 +460,7 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
         .publish_and_create::<CounterAbi, (), u64>(
             contract,
             service,
+            VmRuntime::Wasm,
             &(),
             &original_counter_value,
             &[],
@@ -549,11 +511,11 @@ async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfi
     let chain = client.load_wallet()?.default_chain().unwrap();
     let (contract, service) = client.build_example("counter").await?;
 
-    let bytecode_id = client
-        .publish_bytecode::<CounterAbi, (), u64>(contract, service, None)
+    let module_id = client
+        .publish_module::<CounterAbi, (), u64>(contract, service, None)
         .await?;
     let application_id = client
-        .create_application(&bytecode_id, &(), &original_counter_value, &[], None)
+        .create_application(&module_id, &(), &original_counter_value, &[], None)
         .await?;
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
@@ -599,11 +561,11 @@ async fn test_wasm_end_to_end_social_user_pub_sub(config: impl LineraNetConfig) 
     let chain1 = client1.load_wallet()?.default_chain().unwrap();
     let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
     let (contract, service) = client1.build_example("social").await?;
-    let bytecode_id = client1
-        .publish_bytecode::<SocialAbi, (), ()>(contract, service, None)
+    let module_id = client1
+        .publish_module::<SocialAbi, (), ()>(contract, service, None)
         .await?;
     let application_id = client1
-        .create_application(&bytecode_id, &(), &(), &[], None)
+        .create_application(&module_id, &(), &(), &[], None)
         .await?;
 
     let port1 = get_node_port().await;
@@ -614,16 +576,6 @@ async fn test_wasm_end_to_end_social_user_pub_sub(config: impl LineraNetConfig) 
     let mut node_service2 = client2
         .run_node_service(port2, ProcessInbox::Automatic)
         .await?;
-
-    // Request the application so chain 2 has it, too.
-    node_service2
-        .request_application(&chain2, &application_id)
-        .await?;
-
-    // First chain1 receives the request for application and then
-    // chain2 receives the requested application
-    node_service1.process_inbox(&chain1).await?;
-    node_service2.process_inbox(&chain2).await?;
 
     let app2 = node_service2
         .make_application(&chain2, &application_id)
@@ -733,6 +685,7 @@ async fn test_wasm_end_to_end_fungible(
         .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
             contract,
             service,
+            VmRuntime::Wasm,
             &params,
             &state,
             &[],
@@ -752,7 +705,14 @@ async fn test_wasm_end_to_end_fungible(
     );
 
     // Needed synchronization though removing it does not get error in 100% of cases.
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert_eq!(
+        node_service1.process_inbox(&chain1).await?.len(),
+        if example_name == "native-fungible" {
+            1
+        } else {
+            0
+        }
+    );
 
     let expected_balances = [
         (account_owner1, Amount::from_tokens(5)),
@@ -905,6 +865,7 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
         .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
             contract,
             service,
+            VmRuntime::Wasm,
             &params,
             &state,
             &[],
@@ -922,7 +883,14 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
     );
 
     // Needed synchronization though removing it does not get error in 100% of cases.
-    assert_eq!(node_service.process_inbox(&chain1).await?.len(), 1);
+    assert_eq!(
+        node_service.process_inbox(&chain1).await?.len(),
+        if example_name == "native-fungible" {
+            1
+        } else {
+            0
+        }
+    );
 
     let expected_balances = [
         (account_owner1, Amount::from_tokens(5)),
@@ -999,7 +967,15 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     // Setting up the application and verifying
     let (contract, service) = client1.build_example("non-fungible").await?;
     let application_id = client1
-        .publish_and_create::<NonFungibleTokenAbi, (), ()>(contract, service, &(), &(), &[], None)
+        .publish_and_create::<NonFungibleTokenAbi, (), ()>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &(),
+            &[],
+            None,
+        )
         .await?;
 
     let port1 = get_node_port().await;
@@ -1290,6 +1266,7 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
         .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
             contract_fungible,
             service_fungible,
+            VmRuntime::Wasm,
             &params,
             &state_fungible,
             &[],
@@ -1310,7 +1287,7 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
         .publish_and_create::<CrowdFundingAbi, ApplicationId<FungibleTokenAbi>, InstantiationArgument>(
             contract_crowd,
             service_crowd,
-            // TODO(#723): This hack will disappear soon.
+            VmRuntime::Wasm,
             &application_id_fungible,
             &state_crowd,
             &[application_id_fungible.forget_abi()],
@@ -1345,15 +1322,8 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
         )
         .await;
 
-    // Register the campaign on chain2.
-    node_service2
-        .request_application(&chain2, &application_id_crowd)
-        .await?;
-
-    // Chain2 requests the application from chain1, so chain1 has
-    // to receive the request and then chain2 receive the answer.
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
-    assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
+    // Make sure that the transfer is received before we try to pledge.
+    node_service2.process_inbox(&chain2).await?;
 
     let app_crowd2 = node_service2
         .make_application(&chain2, &application_id_crowd)
@@ -1401,7 +1371,6 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
-    let vm_runtime = VmRuntime::Wasm;
     let (mut net, client_admin) = config.instantiate().await?;
 
     let client_a = net.make_client().await;
@@ -1440,6 +1409,7 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
         .publish_and_create::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>(
             contract_fungible_a,
             service_fungible_a,
+            VmRuntime::Wasm,
             &params0,
             &state_fungible0,
             &[],
@@ -1451,6 +1421,7 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
         .publish_and_create::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>(
             contract_fungible_b,
             service_fungible_b,
+            VmRuntime::Wasm,
             &params1,
             &state_fungible1,
             &[],
@@ -1467,27 +1438,6 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
         .await?;
     let mut node_service_a = client_a.run_node_service(port2, ProcessInbox::Skip).await?;
     let mut node_service_b = client_b.run_node_service(port3, ProcessInbox::Skip).await?;
-
-    node_service_a
-        .request_application(&chain_a, &token1)
-        .await?;
-    node_service_b
-        .request_application(&chain_b, &token0)
-        .await?;
-    node_service_admin
-        .request_application(&chain_admin, &token0)
-        .await?;
-    node_service_admin
-        .request_application(&chain_admin, &token1)
-        .await?;
-
-    // In an operation node_service_a.request_application(&chain_a, app_b)
-    // chain_b needs to process the request first and then chain_a
-    // the answer.
-    node_service_a.process_inbox(&chain_a).await?;
-    node_service_b.process_inbox(&chain_b).await?;
-    node_service_a.process_inbox(&chain_a).await?;
-    node_service_admin.process_inbox(&chain_admin).await?;
 
     let app_fungible0_a = FungibleApp(node_service_a.make_application(&chain_a, &token0).await?);
     let app_fungible1_a = FungibleApp(node_service_a.make_application(&chain_a, &token1).await?);
@@ -1536,18 +1486,18 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
     let parameter = Parameters {
         tokens: [token0, token1],
     };
-    let bytecode_id = node_service_admin
-        .publish_bytecode::<MatchingEngineAbi, Parameters, ()>(
+    let module_id = node_service_admin
+        .publish_module::<MatchingEngineAbi, Parameters, ()>(
             &chain_admin,
             contract_matching,
             service_matching,
-            vm_runtime,
+            VmRuntime::Wasm,
         )
         .await?;
     let application_id_matching = node_service_admin
         .create_application(
             &chain_admin,
-            &bytecode_id,
+            &module_id,
             &parameter,
             &(),
             &[token0.forget_abi(), token1.forget_abi()],
@@ -1558,21 +1508,6 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
             .make_application(&chain_admin, &application_id_matching)
             .await?,
     );
-    node_service_a
-        .request_application(&chain_a, &application_id_matching)
-        .await?;
-    node_service_b
-        .request_application(&chain_b, &application_id_matching)
-        .await?;
-
-    // First chain_admin needs to process the two requests and
-    // then chain_a / chain_b the answers.
-    assert_eq!(
-        node_service_admin.process_inbox(&chain_admin).await?.len(),
-        1
-    );
-    assert_eq!(node_service_a.process_inbox(&chain_a).await?.len(), 1);
-    assert_eq!(node_service_b.process_inbox(&chain_b).await?.len(), 1);
 
     let app_matching_a = MatchingEngineApp(
         node_service_a
@@ -1694,7 +1629,6 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
-    let vm_runtime = VmRuntime::Wasm;
     let (mut net, client_amm) = config.instantiate().await?;
 
     let client0 = net.make_client().await;
@@ -1740,18 +1674,20 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
 
     // Create fungible applications on the AMM chain, which will hold
     // the token0 and token1 amounts
-    let fungible_bytecode_id = node_service_amm
-        .publish_bytecode::<
-            fungible::FungibleTokenAbi,
-            fungible::Parameters,
-            fungible::InitialState
-        >(&chain_amm, contract_fungible, service_fungible, vm_runtime).await?;
+    let fungible_module_id = node_service_amm
+        .publish_module::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>(
+            &chain_amm,
+            contract_fungible,
+            service_fungible,
+            VmRuntime::Wasm,
+        )
+        .await?;
 
     let params0 = fungible::Parameters::new("ZERO");
     let token0 = node_service_amm
         .create_application(
             &chain_amm,
-            &fungible_bytecode_id,
+            &fungible_module_id,
             &params0,
             &state_fungible0,
             &[],
@@ -1761,7 +1697,7 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     let token1 = node_service_amm
         .create_application(
             &chain_amm,
-            &fungible_bytecode_id,
+            &fungible_module_id,
             &params1,
             &state_fungible1,
             &[],
@@ -1883,18 +1819,18 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     };
 
     // Create AMM application on Admin chain
-    let bytecode_id = node_service_amm
-        .publish_bytecode::<AmmAbi, Parameters, ()>(
+    let module_id = node_service_amm
+        .publish_module::<AmmAbi, Parameters, ()>(
             &chain_amm,
             contract_amm,
             service_amm,
-            vm_runtime,
+            VmRuntime::Wasm,
         )
         .await?;
     let application_id_amm = node_service_amm
         .create_application(
             &chain_amm,
-            &bytecode_id,
+            &module_id,
             &parameters,
             &(),
             &[token0.forget_abi(), token1.forget_abi()],
@@ -1909,18 +1845,6 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
             .make_application(&chain_amm, &application_id_amm)
             .await?,
     );
-    node_service0
-        .request_application(&chain0, &application_id_amm)
-        .await?;
-    node_service1
-        .request_application(&chain1, &application_id_amm)
-        .await?;
-
-    // The chain_amm must first requests those two requests
-    // and then chain0 / chain1 must handle the answers.
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service0.process_inbox(&chain0).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
 
     let app_amm0 = AmmApp(
         node_service0
@@ -2465,6 +2389,7 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
         .publish_and_create::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>(
             contract,
             service,
+            VmRuntime::Wasm,
             &params,
             &state,
             &[],

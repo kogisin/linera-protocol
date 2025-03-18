@@ -19,15 +19,12 @@ use assert_matches::assert_matches;
 use async_graphql::Request;
 use counter::CounterAbi;
 use linera_base::{
-    data_types::{Amount, Bytecode, Event, OracleResponse, UserApplicationDescription},
-    identifiers::{AccountOwner, ApplicationId, Destination, Owner, StreamId, StreamName},
+    data_types::{Amount, Bytecode, Event, OracleResponse},
+    identifiers::{AccountOwner, ApplicationId, Owner, StreamId, StreamName},
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
 };
-use linera_chain::{
-    data_types::{MessageAction, OutgoingMessage},
-    ChainError, ChainExecutionContext,
-};
+use linera_chain::{data_types::MessageAction, ChainError, ChainExecutionContext};
 use linera_execution::{
     ExecutionError, Message, MessageKind, Operation, QueryOutcome, ResourceControlPolicy,
     SystemMessage, WasmRuntime,
@@ -115,12 +112,12 @@ where
     let publisher = builder.add_root_chain(0, Amount::from_tokens(3)).await?;
     let creator = builder.add_root_chain(1, Amount::ONE).await?;
 
-    let (bytecode_id, _cert) = publisher
-        .publish_bytecode(contract_bytecode, service_bytecode, vm_runtime)
+    let (module_id, _cert) = publisher
+        .publish_module(contract_bytecode, service_bytecode, vm_runtime)
         .await
         .unwrap()
         .unwrap();
-    let bytecode_id = bytecode_id.with_abi::<counter::CounterAbi, (), u64>();
+    let module_id = module_id.with_abi::<counter::CounterAbi, (), u64>();
 
     creator.synchronize_from_validators().await.unwrap();
     creator.process_inbox().await.unwrap();
@@ -131,7 +128,7 @@ where
 
     let initial_value = 10_u64;
     let (application_id, _) = creator
-        .create_application(bytecode_id, &(), &initial_value, vec![])
+        .create_application(module_id, &(), &initial_value, vec![])
         .await
         .unwrap()
         .unwrap();
@@ -164,7 +161,7 @@ where
     let small_bytecode = Bytecode::new(vec![]);
     // Publishing bytecode that exceeds the limit fails.
     let result = publisher
-        .publish_bytecode(large_bytecode.clone(), small_bytecode.clone(), vm_runtime)
+        .publish_module(large_bytecode.clone(), small_bytecode.clone(), vm_runtime)
         .await;
     assert_matches!(
         result,
@@ -173,7 +170,7 @@ where
         ))) if matches!(*error, ExecutionError::BytecodeTooLarge)
     );
     let result = publisher
-        .publish_bytecode(small_bytecode, large_bytecode, vm_runtime)
+        .publish_module(small_bytecode, large_bytecode, vm_runtime)
         .await;
     assert_matches!(
         result,
@@ -259,7 +256,7 @@ where
     let mut builder = TestBuilder::new(storage_builder, 4, 1)
         .await?
         .with_policy(ResourceControlPolicy::all_categories());
-    // Will publish the bytecodes.
+    // Will publish the module.
     let publisher = builder.add_root_chain(0, Amount::from_tokens(3)).await?;
     // Will create the apps and use them to send a message.
     let creator = builder.add_root_chain(1, Amount::ONE).await?;
@@ -288,11 +285,11 @@ where
         .await
         .unwrap();
 
-    let (bytecode_id1, _cert1) = {
+    let (module_id1, _cert1) = {
         let (contract_path, service_path) =
             linera_execution::wasm_test::get_example_bytecode_paths("counter")?;
         publisher
-            .publish_bytecode(
+            .publish_module(
                 Bytecode::load_from_file(contract_path).await?,
                 Bytecode::load_from_file(service_path).await?,
                 vm_runtime,
@@ -301,12 +298,12 @@ where
             .unwrap()
             .unwrap()
     };
-    let bytecode_id1 = bytecode_id1.with_abi::<counter::CounterAbi, (), u64>();
-    let (bytecode_id2, _cert2) = {
+    let module_id1 = module_id1.with_abi::<counter::CounterAbi, (), u64>();
+    let (module_id2, _cert2) = {
         let (contract_path, service_path) =
             linera_execution::wasm_test::get_example_bytecode_paths("meta_counter")?;
         publisher
-            .publish_bytecode(
+            .publish_module(
                 Bytecode::load_from_file(contract_path).await?,
                 Bytecode::load_from_file(service_path).await?,
                 vm_runtime,
@@ -315,20 +312,20 @@ where
             .unwrap()
             .unwrap()
     };
-    let bytecode_id2 =
-        bytecode_id2.with_abi::<meta_counter::MetaCounterAbi, ApplicationId<CounterAbi>, ()>();
+    let module_id2 =
+        module_id2.with_abi::<meta_counter::MetaCounterAbi, ApplicationId<CounterAbi>, ()>();
 
-    // Creator receives the bytecodes then creates the app.
+    // Creator receives the bytecode files then creates the app.
     creator.synchronize_from_validators().await.unwrap();
     let initial_value = 10_u64;
     let (application_id1, _) = creator
-        .create_application(bytecode_id1, &(), &initial_value, vec![])
+        .create_application(module_id1, &(), &initial_value, vec![])
         .await
         .unwrap()
         .unwrap();
     let (application_id2, certificate) = creator
         .create_application(
-            bytecode_id2,
+            module_id2,
             &application_id1,
             &(),
             vec![application_id1.forget_abi()],
@@ -338,17 +335,14 @@ where
         .unwrap();
     assert_eq!(
         certificate.block().body.events,
-        vec![
-            Vec::new(),
-            vec![Event {
-                stream_id: StreamId {
-                    application_id: application_id2.forget_abi().into(),
-                    stream_name: StreamName(b"announcements".to_vec()),
-                },
-                key: b"updates".to_vec(),
-                value: b"instantiated".to_vec(),
-            }]
-        ]
+        vec![vec![Event {
+            stream_id: StreamId {
+                application_id: application_id2.forget_abi().into(),
+                stream_name: StreamName(b"announcements".to_vec()),
+            },
+            key: b"updates".to_vec(),
+            value: b"instantiated".to_vec(),
+        }]]
     );
 
     let query_service = cfg!(feature = "unstable-oracles");
@@ -444,10 +438,6 @@ where
     assert_eq!(incoming_bundles[0].action, MessageAction::Reject);
     assert_eq!(
         incoming_bundles[0].bundle.messages[0].kind,
-        MessageKind::Simple
-    );
-    assert_eq!(
-        incoming_bundles[0].bundle.messages[1].kind,
         MessageKind::Tracked
     );
     let messages = cert.block().messages();
@@ -476,11 +466,11 @@ where
     // Second message is the bounced message.
     assert_eq!(incoming_bundles[1].action, MessageAction::Accept);
     assert_eq!(
-        incoming_bundles[1].bundle.messages[1].kind,
+        incoming_bundles[1].bundle.messages[0].kind,
         MessageKind::Bouncing
     );
     assert_matches!(
-        incoming_bundles[1].bundle.messages[1].message,
+        incoming_bundles[1].bundle.messages[0].message,
         Message::User { .. }
     );
 
@@ -543,12 +533,12 @@ where
     let receiver = builder.add_root_chain(2, Amount::ONE).await?;
     let receiver2 = builder.add_root_chain(3, Amount::ONE).await?;
 
-    let (bytecode_id, _pub_cert) = {
+    let (module_id, _pub_cert) = {
         let bytecode_name = "fungible";
         let (contract_path, service_path) =
             linera_execution::wasm_test::get_example_bytecode_paths(bytecode_name)?;
         sender
-            .publish_bytecode(
+            .publish_module(
                 Bytecode::load_from_file(contract_path).await?,
                 Bytecode::load_from_file(service_path).await?,
                 vm_runtime,
@@ -557,7 +547,7 @@ where
             .unwrap()
             .unwrap()
     };
-    let bytecode_id = bytecode_id
+    let module_id = module_id
         .with_abi::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>();
 
     let sender_owner = AccountOwner::User(Owner::from(sender.key_pair().await?.public()));
@@ -568,7 +558,7 @@ where
     let state = fungible::InitialState { accounts };
     let params = fungible::Parameters::new("FUN");
     let (application_id, _cert) = sender
-        .create_application(bytecode_id, &params, &state, vec![])
+        .create_application(module_id, &params, &state, vec![])
         .await
         .unwrap()
         .unwrap();
@@ -588,36 +578,14 @@ where
         .unwrap()
         .unwrap();
 
-    let messages = cert.block().messages();
-    {
-        let OutgoingMessage {
-            destination,
-            message,
-            ..
-        } = &messages[1][0];
-        assert_matches!(
-            message, Message::System(SystemMessage::RegisterApplications { applications })
-            if applications.len() == 1 && matches!(
-                applications[0], UserApplicationDescription{ bytecode_id: b_id, .. }
-                if b_id == bytecode_id.forget_abi()
-            ),
-            "Unexpected message"
-        );
-        assert_eq!(*destination, Destination::Recipient(receiver.chain_id()));
-    }
     receiver.synchronize_from_validators().await.unwrap();
     receiver
-        .receive_certificate_and_update_validators(cert)
+        .receive_certificate_and_update_validators(cert.clone())
         .await
         .unwrap();
     let certs = receiver.process_inbox().await.unwrap().0;
     assert_eq!(certs.len(), 1);
     let messages = &certs[0].block().body.incoming_bundles;
-    assert!(messages.iter().any(|msg| matches!(
-        &msg.bundle.messages[0].message,
-        Message::System(SystemMessage::RegisterApplications { applications })
-        if applications.iter().any(|app| app.bytecode_id == bytecode_id.forget_abi())
-    )));
     assert!(messages
         .iter()
         .flat_map(|msg| &msg.bundle.messages)
@@ -744,11 +712,11 @@ where
     let sender = builder.add_root_chain(0, Amount::ONE).await?;
     let receiver = builder.add_root_chain(1, Amount::ONE).await?;
 
-    let (bytecode_id, _pub_cert) = {
+    let (module_id, _pub_cert) = {
         let (contract_path, service_path) =
             linera_execution::wasm_test::get_example_bytecode_paths("social")?;
         receiver
-            .publish_bytecode(
+            .publish_module(
                 Bytecode::load_from_file(contract_path).await?,
                 Bytecode::load_from_file(service_path).await?,
                 vm_runtime,
@@ -757,10 +725,10 @@ where
             .unwrap()
             .unwrap()
     };
-    let bytecode_id = bytecode_id.with_abi::<social::SocialAbi, (), ()>();
+    let module_id = module_id.with_abi::<social::SocialAbi, (), ()>();
 
     let (application_id, _cert) = receiver
-        .create_application(bytecode_id, &(), &(), vec![])
+        .create_application(module_id, &(), &(), vec![])
         .await
         .unwrap()
         .unwrap();
@@ -906,8 +874,8 @@ async fn test_memory_fuel_limit(wasm_runtime: WasmRuntime) -> anyhow::Result<()>
     let (contract_path, service_path) =
         linera_execution::wasm_test::get_example_bytecode_paths("counter")?;
 
-    let (bytecode_id, _cert) = publisher
-        .publish_bytecode(
+    let (module_id, _cert) = publisher
+        .publish_module(
             Bytecode::load_from_file(contract_path).await?,
             Bytecode::load_from_file(service_path).await?,
             vm_runtime,
@@ -915,11 +883,11 @@ async fn test_memory_fuel_limit(wasm_runtime: WasmRuntime) -> anyhow::Result<()>
         .await
         .unwrap()
         .unwrap();
-    let bytecode_id = bytecode_id.with_abi::<counter::CounterAbi, (), u64>();
+    let module_id = module_id.with_abi::<counter::CounterAbi, (), u64>();
 
     let initial_value = 10_u64;
     let (application_id, _) = publisher
-        .create_application(bytecode_id, &(), &initial_value, vec![])
+        .create_application(module_id, &(), &initial_value, vec![])
         .await
         .unwrap()
         .unwrap();

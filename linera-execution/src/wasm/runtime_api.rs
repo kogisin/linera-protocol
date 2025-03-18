@@ -17,7 +17,7 @@ use linera_witty::{wit_export, Instance, RuntimeError};
 use tracing::log;
 
 use super::WasmExecutionError;
-use crate::{BaseRuntime, BytecodeId, ContractRuntime, ExecutionError, ServiceRuntime};
+use crate::{BaseRuntime, ContractRuntime, ExecutionError, ModuleId, ServiceRuntime};
 
 /// Common host data used as the `UserData` of the system API implementations.
 pub struct RuntimeApiData<Runtime> {
@@ -471,7 +471,7 @@ where
     /// balance) to `destination`.
     fn transfer(
         caller: &mut Caller,
-        source: Option<AccountOwner>,
+        source: AccountOwner,
         destination: Account,
         amount: Amount,
     ) -> Result<(), RuntimeError> {
@@ -546,7 +546,7 @@ where
     /// parameters.
     fn create_application(
         caller: &mut Caller,
-        bytecode_id: BytecodeId,
+        module_id: ModuleId,
         parameters: Vec<u8>,
         argument: Vec<u8>,
         required_application_ids: Vec<ApplicationId>,
@@ -554,7 +554,7 @@ where
         caller
             .user_data_mut()
             .runtime
-            .create_application(bytecode_id, parameters, argument, required_application_ids)
+            .create_application(module_id, parameters, argument, required_application_ids)
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
@@ -665,12 +665,15 @@ where
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
-    /// Fetches a blob of bytes from a given URL.
-    fn fetch_url(caller: &mut Caller, url: String) -> Result<Vec<u8>, RuntimeError> {
+    /// Checks if the service has exceeded its execution time limit.
+    ///
+    /// This is called by the metering instrumentation, but the fuel consumed argument is
+    /// ignored.
+    fn check_execution_time(caller: &mut Caller, _fuel_consumed: u64) -> Result<(), RuntimeError> {
         caller
             .user_data_mut()
-            .runtime
-            .fetch_url(&url)
+            .runtime_mut()
+            .check_execution_time()
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 }

@@ -28,9 +28,8 @@ use linera_chain::{
 };
 use linera_execution::{
     committee::{Committee, Epoch},
-    system::SystemChannel,
-    BlobState, ChannelSubscription, ExecutionError, ExecutionRuntimeConfig,
-    ExecutionRuntimeContext, UserContractCode, UserServiceCode, WasmRuntime,
+    BlobState, ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext, UserContractCode,
+    UserServiceCode, WasmRuntime,
 };
 #[cfg(with_revm)]
 use linera_execution::{
@@ -242,21 +241,6 @@ pub trait Storage: Sized {
         system_state.balance.set(balance);
         system_state.timestamp.set(timestamp);
 
-        if id != admin_id {
-            // Add the new subscriber to the admin chain.
-            system_state.subscriptions.insert(&ChannelSubscription {
-                chain_id: admin_id,
-                name: SystemChannel::Admin.name(),
-            })?;
-            let mut admin_chain = self.load_chain(admin_id).await?;
-            let full_name = SystemChannel::Admin.full_name();
-            {
-                let mut channel = admin_chain.channels.try_load_entry_mut(&full_name).await?;
-                channel.subscribers.insert(&id)?;
-            } // Make channel go out of scope, so we can call save.
-            admin_chain.save().await?;
-        }
-
         let state_hash = chain.execution_state.crypto_hash().await?;
         chain.execution_state_hash.set(Some(state_hash));
         chain.save().await?;
@@ -273,7 +257,7 @@ pub trait Storage: Sized {
         application_description: &UserApplicationDescription,
     ) -> Result<UserContractCode, ExecutionError> {
         let contract_bytecode_blob_id = BlobId::new(
-            application_description.bytecode_id.contract_blob_hash,
+            application_description.module_id.contract_blob_hash,
             BlobType::ContractBytecode,
         );
         let contract_blob = self.read_blob(contract_bytecode_blob_id).await?;
@@ -288,7 +272,7 @@ pub trait Storage: Sized {
             .await
             .join()
             .await?;
-        match application_description.bytecode_id.vm_runtime {
+        match application_description.module_id.vm_runtime {
             VmRuntime::Wasm => {
                 cfg_if::cfg_if! {
                     if #[cfg(with_wasm_runtime)] {
@@ -333,7 +317,7 @@ pub trait Storage: Sized {
         application_description: &UserApplicationDescription,
     ) -> Result<UserServiceCode, ExecutionError> {
         let service_bytecode_blob_id = BlobId::new(
-            application_description.bytecode_id.service_blob_hash,
+            application_description.module_id.service_blob_hash,
             BlobType::ServiceBytecode,
         );
         let service_blob = self.read_blob(service_bytecode_blob_id).await?;
@@ -347,7 +331,7 @@ pub trait Storage: Sized {
         .await
         .join()
         .await?;
-        match application_description.bytecode_id.vm_runtime {
+        match application_description.module_id.vm_runtime {
             VmRuntime::Wasm => {
                 cfg_if::cfg_if! {
                     if #[cfg(with_wasm_runtime)] {

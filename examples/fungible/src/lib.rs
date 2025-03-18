@@ -11,7 +11,7 @@ use {
     async_graphql::InputType,
     futures::{stream, StreamExt},
     linera_sdk::{
-        linera_base_types::{ApplicationId, BytecodeId},
+        linera_base_types::{ApplicationId, ModuleId},
         test::{ActiveChain, QueryOutcome, TestValidator},
     },
 };
@@ -46,7 +46,7 @@ pub enum Message {
 #[cfg(all(any(test, feature = "test"), not(target_arch = "wasm32")))]
 pub async fn create_with_accounts(
     validator: &TestValidator,
-    bytecode_id: BytecodeId<FungibleTokenAbi, Parameters, InitialState>,
+    module_id: ModuleId<FungibleTokenAbi, Parameters, InitialState>,
     initial_amounts: impl IntoIterator<Item = Amount>,
 ) -> (
     ApplicationId<FungibleTokenAbi>,
@@ -71,12 +71,10 @@ pub async fn create_with_accounts(
 
     let params = Parameters::new("FUN");
     let application_id = token_chain
-        .create_application(bytecode_id, params, initial_state.build(), vec![])
+        .create_application(module_id, params, initial_state.build(), vec![])
         .await;
 
     for (chain, account, initial_amount) in &accounts {
-        chain.register_application(application_id).await;
-
         let claim_certificate = chain
             .add_block(|block| {
                 block.with_operation(
@@ -96,7 +94,7 @@ pub async fn create_with_accounts(
             })
             .await;
 
-        assert_eq!(claim_certificate.outgoing_message_count(), 2);
+        assert_eq!(claim_certificate.outgoing_message_count(), 1);
 
         let transfer_certificate = token_chain
             .add_block(|block| {
@@ -104,7 +102,7 @@ pub async fn create_with_accounts(
             })
             .await;
 
-        assert_eq!(transfer_certificate.outgoing_message_count(), 2);
+        assert_eq!(transfer_certificate.outgoing_message_count(), 1);
 
         chain
             .add_block(|block| {

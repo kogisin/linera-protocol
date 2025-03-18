@@ -2,7 +2,10 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use linera_base::{crypto::ValidatorKeypair, data_types::Amount};
+use linera_base::{
+    crypto::{Ed25519SecretKey, Secp256k1SecretKey, ValidatorKeypair},
+    data_types::Amount,
+};
 
 use super::*;
 use crate::{
@@ -22,6 +25,8 @@ fn test_signed_values() {
         state_hash: CryptoHash::test_hash("state"),
         oracle_responses: vec![Vec::new()],
         events: vec![Vec::new()],
+        blobs: vec![Vec::new()],
+        operation_results: vec![OperationResult::default()],
     }
     .with(block);
     let confirmed_value = Hashed::new(ConfirmedBlock::new(executed_block.clone()));
@@ -82,6 +87,8 @@ fn test_hashes() {
         state_hash: CryptoHash::test_hash("state"),
         oracle_responses: vec![Vec::new()],
         events: vec![Vec::new()],
+        blobs: vec![Vec::new()],
+        operation_results: vec![OperationResult::default()],
     }
     .with(block);
     let confirmed_hashed = Hashed::new(ConfirmedBlock::new(executed_block.clone()));
@@ -93,9 +100,9 @@ fn test_hashes() {
 #[test]
 fn test_certificates() {
     let validator1_key_pair = ValidatorKeypair::generate();
-    let account1_secret = AccountSecretKey::generate();
+    let account1_secret = AccountSecretKey::Ed25519(Ed25519SecretKey::generate());
     let validator2_key_pair = ValidatorKeypair::generate();
-    let account2_secret = AccountSecretKey::generate();
+    let account2_secret = AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate());
     let validator3_key_pair = ValidatorKeypair::generate();
 
     let committee = Committee::make_simple(vec![
@@ -110,6 +117,8 @@ fn test_certificates() {
         state_hash: CryptoHash::test_hash("state"),
         oracle_responses: vec![Vec::new()],
         events: vec![Vec::new()],
+        blobs: vec![Vec::new()],
+        operation_results: vec![OperationResult::default()],
     }
     .with(block);
     let value = Hashed::new(ConfirmedBlock::new(executed_block));

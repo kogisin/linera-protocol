@@ -48,6 +48,7 @@ GIT_COMMIT=$(git rev-parse --short HEAD)
 # Variables
 PORT="19100"
 METRICS_PORT="21100"
+PYROSCOPE_PORT="4040"
 GENESIS_URL="https://storage.googleapis.com/linera-io-dev-public/$FORMATTED_BRANCH_NAME/genesis.json"
 VALIDATOR_CONFIG="docker/validator-config.toml"
 GENESIS_CONFIG="docker/genesis.json"
@@ -67,8 +68,9 @@ cat > $VALIDATOR_CONFIG <<EOL
 server_config_path = "server.json"
 host = "$HOST"
 port = $PORT
-metrics_host = "proxy"
 metrics_port = $METRICS_PORT
+pyroscope_host = "docker-pyroscope"
+pyroscope_port = $PYROSCOPE_PORT
 internal_host = "proxy"
 internal_port = 20100
 [external_protocol]
@@ -79,26 +81,30 @@ Grpc = "ClearText"
 [[shards]]
 host = "docker-shard-1"
 port = $PORT
-metrics_host = "docker-shard-1"
 metrics_port = $METRICS_PORT
+pyroscope_host = "docker-pyroscope"
+pyroscope_port = $PYROSCOPE_PORT
 
 [[shards]]
 host = "docker-shard-2"
 port = $PORT
-metrics_host = "docker-shard-2"
 metrics_port = $METRICS_PORT
+pyroscope_host = "docker-pyroscope"
+pyroscope_port = $PYROSCOPE_PORT
 
 [[shards]]
 host = "docker-shard-3"
 port = $PORT
-metrics_host = "docker-shard-3"
 metrics_port = $METRICS_PORT
+pyroscope_host = "docker-pyroscope"
+pyroscope_port = $PYROSCOPE_PORT
 
 [[shards]]
 host = "docker-shard-4"
 port = $PORT
-metrics_host = "docker-shard-4"
 metrics_port = $METRICS_PORT
+pyroscope_host = "docker-pyroscope"
+pyroscope_port = $PYROSCOPE_PORT
 EOL
 
 # Download genesis configuration

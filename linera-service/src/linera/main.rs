@@ -6,7 +6,13 @@
 #![deny(clippy::large_futures)]
 
 use std::{
-    borrow::Cow, collections::HashMap, env, path::PathBuf, process, sync::Arc, time::Instant,
+    borrow::Cow,
+    collections::{BTreeSet, HashMap},
+    env,
+    path::PathBuf,
+    process,
+    sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{anyhow, bail, ensure, Context};
@@ -15,7 +21,7 @@ use chrono::Utc;
 use colored::Colorize;
 use futures::{lock::Mutex, FutureExt as _, StreamExt};
 use linera_base::{
-    crypto::{CryptoHash, CryptoRng},
+    crypto::{AccountSecretKey, CryptoHash, CryptoRng, Ed25519SecretKey},
     data_types::{ApplicationPermissions, Timestamp},
     identifiers::{AccountOwner, ChainDescription, ChainId, Owner},
     ownership::ChainOwnership,
@@ -48,6 +54,12 @@ use linera_views::store::CommonStoreConfig;
 use serde_json::Value;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn, Instrument as _};
+#[cfg(feature = "benchmark")]
+use {
+    futures::{stream, TryStreamExt},
+    linera_client::benchmark::BenchmarkError,
+    linera_core::client::ChainClientError,
+};
 
 mod net_up_utils;
 
@@ -89,12 +101,8 @@ impl Runnable for Job {
                 amount,
             } => {
                 let chain_client = context.make_chain_client(sender.chain_id)?;
-                let owner = match sender.owner {
-                    Some(AccountOwner::User(owner)) => Some(owner),
-                    Some(AccountOwner::Application(_)) => {
-                        bail!("Can't transfer from an application account")
-                    }
-                    None => None,
+                if let AccountOwner::Application(_) = sender.owner {
+                    bail!("Can't transfer from an application account")
                 };
                 info!(
                     "Starting transfer of {} native tokens from {} to {}",
@@ -106,7 +114,7 @@ impl Runnable for Job {
                         let chain_client = chain_client.clone();
                         async move {
                             chain_client
-                                .transfer_to_account(owner, amount, recipient)
+                                .transfer_to_account(sender.owner, amount, recipient)
                                 .await
                         }
                     })
@@ -276,8 +284,10 @@ impl Runnable for Job {
                 info!("Reading the balance of {} from the local state", account);
                 let time_start = Instant::now();
                 let balance = match account.owner {
-                    Some(owner) => chain_client.local_owner_balance(owner).await?,
-                    None => chain_client.local_balance().await?,
+                    AccountOwner::User(_) | AccountOwner::Application(_) => {
+                        chain_client.local_owner_balance(account.owner).await?
+                    }
+                    AccountOwner::Chain => chain_client.local_balance().await?,
                 };
                 let time_total = time_start.elapsed();
                 info!("Local balance obtained after {} ms", time_total.as_millis());
@@ -293,8 +303,10 @@ impl Runnable for Job {
                 );
                 let time_start = Instant::now();
                 let balance = match account.owner {
-                    Some(owner) => chain_client.query_owner_balance(owner).await?,
-                    None => chain_client.query_balance().await?,
+                    AccountOwner::User(_) | AccountOwner::Application(_) => {
+                        chain_client.query_owner_balance(account.owner).await?
+                    }
+                    AccountOwner::Chain => chain_client.query_balance().await?,
                 };
                 let time_total = time_start.elapsed();
                 info!("Balance obtained after {} ms", time_total.as_millis());
@@ -309,10 +321,12 @@ impl Runnable for Job {
                 let time_start = Instant::now();
                 chain_client.synchronize_from_validators().await?;
                 let result = match account.owner {
-                    Some(owner) => chain_client.query_owner_balance(owner).await,
-                    None => chain_client.query_balance().await,
+                    AccountOwner::User(_) | AccountOwner::Application(_) => {
+                        chain_client.query_owner_balance(account.owner).await
+                    }
+                    AccountOwner::Chain => chain_client.query_balance().await,
                 };
-                context.update_and_save_wallet(&chain_client).await?;
+                context.update_wallet_from_client(&chain_client).await?;
                 let balance = result.context("Failed to synchronize from validators")?;
                 let time_total = time_start.elapsed();
                 info!(
@@ -328,7 +342,7 @@ impl Runnable for Job {
                 info!("Synchronizing chain information");
                 let time_start = Instant::now();
                 chain_client.synchronize_from_validators().await?;
-                context.update_and_save_wallet(&chain_client).await?;
+                context.update_wallet_from_client(&chain_client).await?;
                 let time_total = time_start.elapsed();
                 info!(
                     "Synchronized chain information in {} ms",
@@ -425,7 +439,7 @@ impl Runnable for Job {
                 let chain_client = context.make_chain_client(chain_id)?;
                 info!("Querying validators about chain {}", chain_id);
                 let result = chain_client.local_committee().await;
-                context.update_and_save_wallet(&chain_client).await?;
+                context.update_wallet_from_client(&chain_client).await?;
                 let committee = result.context("Failed to get local committee")?;
                 info!(
                     "Using the local set of validators: {:?}",
@@ -467,7 +481,7 @@ impl Runnable for Job {
                                 num_ok_validators += 1;
                             } else {
                                 error!("Signature for public key {name} is NOT OK.");
-                                faulty_validators.push((name, address, format!("{:?}", response)));
+                                faulty_validators.push((name, address, format!("{:#?}", response)));
                             }
                         }
                         Err(e) => {
@@ -737,7 +751,9 @@ impl Runnable for Job {
                 transactions_per_block,
                 fungible_application_id,
                 bps,
-                keep_chains_open,
+                close_chains,
+                health_check_endpoints,
+                wrap_up_max_in_flight,
             } => {
                 assert!(num_chains > 0, "Number of chains must be greater than 0");
                 assert!(
@@ -765,14 +781,49 @@ impl Runnable for Job {
                     num_chains,
                     transactions_per_block,
                     bps,
-                    chain_clients,
+                    chain_clients.clone(),
                     epoch,
                     blocks_infos,
                     committee,
                     context.client.local_node().clone(),
-                    keep_chains_open,
+                    health_check_endpoints,
                 )
                 .await?;
+
+                if close_chains {
+                    info!("Closing chains...");
+                    let stream = stream::iter(chain_clients.values().cloned())
+                        .map(|chain_client| async move {
+                            linera_client::benchmark::Benchmark::<S>::close_benchmark_chain(
+                                &chain_client,
+                            )
+                            .await?;
+                            info!("Closed chain {:?}", chain_client.chain_id());
+                            Ok::<(), BenchmarkError>(())
+                        })
+                        .buffer_unordered(wrap_up_max_in_flight);
+                    stream.try_collect::<Vec<_>>().await?;
+                } else {
+                    info!("Processing inbox for all chains...");
+                    let stream = stream::iter(chain_clients.values().cloned())
+                        .map(|chain_client| async move {
+                            chain_client.process_inbox().await?;
+                            info!("Processed inbox for chain {:?}", chain_client.chain_id());
+                            Ok::<(), ChainClientError>(())
+                        })
+                        .buffer_unordered(wrap_up_max_in_flight);
+                    stream.try_collect::<Vec<_>>().await?;
+
+                    info!("Updating wallet from chain clients...");
+                    for chain_client in chain_clients.values() {
+                        context
+                            .wallet
+                            .as_mut()
+                            .update_from_state(chain_client)
+                            .await;
+                    }
+                    context.save_wallet().await?;
+                }
             }
 
             Watch { chain_id, raw } => {
@@ -784,7 +835,7 @@ impl Runnable for Job {
                 join_set.spawn_task(listener);
                 while let Some(notification) = notifications.next().await {
                     if let Reason::NewBlock { .. } = notification.reason {
-                        context.update_and_save_wallet(&chain_client).await?;
+                        context.update_wallet_from_client(&chain_client).await?;
                     }
                     if raw {
                         println!("{}", serde_json::to_string(&notification)?);
@@ -830,7 +881,7 @@ impl Runnable for Job {
                 faucet.run().await?;
             }
 
-            PublishBytecode {
+            PublishModule {
                 contract,
                 service,
                 vm_runtime,
@@ -838,14 +889,14 @@ impl Runnable for Job {
             } => {
                 let start_time = Instant::now();
                 let publisher = publisher.unwrap_or_else(|| context.default_chain());
-                info!("Publishing bytecode on chain {}", publisher);
+                info!("Publishing module on chain {}", publisher);
                 let chain_client = context.make_chain_client(publisher)?;
-                let bytecode_id = context
-                    .publish_bytecode(&chain_client, contract, service, vm_runtime)
+                let module_id = context
+                    .publish_module(&chain_client, contract, service, vm_runtime)
                     .await?;
-                println!("{}", bytecode_id);
+                println!("{}", module_id);
                 info!(
-                    "Bytecode published in {} ms",
+                    "Module published in {} ms",
                     start_time.elapsed().as_millis()
                 );
             }
@@ -877,7 +928,7 @@ impl Runnable for Job {
             }
 
             CreateApplication {
-                bytecode_id,
+                module_id,
                 creator,
                 json_parameters,
                 json_parameters_path,
@@ -905,7 +956,7 @@ impl Runnable for Job {
                         async move {
                             chain_client
                                 .create_application_untyped(
-                                    bytecode_id,
+                                    module_id,
                                     parameters,
                                     argument,
                                     required_application_ids.unwrap_or_default(),
@@ -940,8 +991,8 @@ impl Runnable for Job {
                 let chain_client = context.make_chain_client(publisher)?;
                 let parameters = read_json(json_parameters, json_parameters_path)?;
                 let argument = read_json(json_argument, json_argument_path)?;
-                let bytecode_id = context
-                    .publish_bytecode(&chain_client, contract, service, vm_runtime)
+                let module_id = context
+                    .publish_module(&chain_client, contract, service, vm_runtime)
                     .await?;
 
                 let (application_id, _) = context
@@ -953,7 +1004,7 @@ impl Runnable for Job {
                         async move {
                             chain_client
                                 .create_application_untyped(
-                                    bytecode_id,
+                                    module_id,
                                     parameters,
                                     argument,
                                     required_application_ids.unwrap_or_default(),
@@ -969,34 +1020,6 @@ impl Runnable for Job {
                     start_time.elapsed().as_millis()
                 );
                 println!("{}", application_id);
-            }
-
-            RequestApplication {
-                application_id,
-                target_chain_id,
-                requester_chain_id,
-            } => {
-                let start_time = Instant::now();
-                let requester_chain_id =
-                    requester_chain_id.unwrap_or_else(|| context.default_chain());
-                info!("Requesting application for chain {}", requester_chain_id);
-                let chain_client = context.make_chain_client(requester_chain_id)?;
-                let certificate = context
-                    .apply_client_command(&chain_client, |chain_client| {
-                        let chain_client = chain_client.clone();
-                        async move {
-                            chain_client
-                                .request_application(application_id, target_chain_id)
-                                .await
-                        }
-                    })
-                    .await
-                    .context("Failed to request application")?;
-                info!(
-                    "Application requested in {} ms",
-                    start_time.elapsed().as_millis()
-                );
-                debug!("{:?}", certificate);
             }
 
             Assign { owner, message_id } => {
@@ -1041,8 +1064,8 @@ impl Runnable for Job {
                     let project = project::Project::from_existing_project(project_path)?;
                     let (contract_path, service_path) = project.build(name)?;
 
-                    let bytecode_id = context
-                        .publish_bytecode(&chain_client, contract_path, service_path, vm_runtime)
+                    let module_id = context
+                        .publish_module(&chain_client, contract_path, service_path, vm_runtime)
                         .await?;
 
                     let (application_id, _) = context
@@ -1054,7 +1077,7 @@ impl Runnable for Job {
                             async move {
                                 chain_client
                                     .create_application_untyped(
-                                        bytecode_id,
+                                        module_id,
                                         parameters,
                                         argument,
                                         required_application_ids.unwrap_or_default(),
@@ -1089,7 +1112,7 @@ impl Runnable for Job {
                         info!("Please try again at {}", timeout.timestamp)
                     }
                 }
-                context.update_and_save_wallet(&chain_client).await?;
+                context.update_wallet_from_client(&chain_client).await?;
                 info!(
                     "Pending block retried in {} ms",
                     start_time.elapsed().as_millis()
@@ -1320,12 +1343,11 @@ fn log_file_name_for(command: &ClientCommand) -> Cow<'static, str> {
         | ClientCommand::ResourceControlPolicy { .. }
         | ClientCommand::FinalizeCommittee
         | ClientCommand::CreateGenesisConfig { .. }
-        | ClientCommand::PublishBytecode { .. }
+        | ClientCommand::PublishModule { .. }
         | ClientCommand::PublishDataBlob { .. }
         | ClientCommand::ReadDataBlob { .. }
         | ClientCommand::CreateApplication { .. }
         | ClientCommand::PublishAndCreate { .. }
-        | ClientCommand::RequestApplication { .. }
         | ClientCommand::Keygen { .. }
         | ClientCommand::Assign { .. }
         | ClientCommand::Wallet { .. }
@@ -1398,6 +1420,7 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
             maximum_bytes_written_per_block,
             testing_prng_seed,
             network_name,
+            http_allow_list,
         } => {
             let start_time = Instant::now();
             let committee_config: CommitteeConfig = util::read_json(committee_config_path)
@@ -1460,6 +1483,9 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
             if let Some(maximum_bytes_written_per_block) = maximum_bytes_written_per_block {
                 policy.maximum_bytes_written_per_block = *maximum_bytes_written_per_block;
             }
+            if let Some(http_allow_list) = http_allow_list {
+                policy.http_request_allow_list = BTreeSet::from_iter(http_allow_list.clone());
+            }
             let timestamp = start_timestamp
                 .map(|st| {
                     let micros =
@@ -1481,7 +1507,8 @@ async fn run(options: &ClientOptions) -> Result<i32, anyhow::Error> {
             for i in 0..=*num_other_initial_chains {
                 let description = ChainDescription::Root(i);
                 // Create keys.
-                let chain = UserChain::make_initial(&mut rng, description, timestamp);
+                let key_pair = AccountSecretKey::Ed25519(Ed25519SecretKey::generate_from(&mut rng));
+                let chain = UserChain::make_initial(key_pair, description, timestamp);
                 // Public "genesis" state.
                 let key = chain.key_pair.as_ref().unwrap().public();
                 genesis_config.chains.push((key, *initial_funding));

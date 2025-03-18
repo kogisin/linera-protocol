@@ -15,7 +15,10 @@ use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use guard::INTEGRATION_TEST_GUARD;
+#[cfg(any(feature = "benchmark", feature = "ethereum"))]
+use linera_base::vm::VmRuntime;
 use linera_base::{
+    crypto::Secp256k1SecretKey,
     data_types::{Amount, BlockHeight},
     identifiers::{Account, AccountOwner, ChainId},
 };
@@ -31,6 +34,8 @@ use linera_service::{
     test_name,
 };
 use test_case::test_case;
+#[cfg(feature = "ethereum")]
+use {alloy::primitives::U256, linera_service::cli_wrappers::ApplicationWrapper};
 #[cfg(feature = "storage-service")]
 use {
     linera_base::port::get_free_port, linera_service::cli_wrappers::Faucet, std::process::Command,
@@ -172,7 +177,9 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         net.remove_validator(i)?;
     }
 
-    let recipient = AccountOwner::User(Owner::from(AccountSecretKey::generate().public()));
+    let recipient = AccountOwner::User(Owner::from(
+        AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate()).public(),
+    ));
     client
         .transfer_with_accounts(
             Amount::from_tokens(5),
@@ -565,15 +572,9 @@ async fn test_project_publish(database: Database, network: Network) -> Result<()
     client
         .project_publish(project_dir, vec![], None, &0)
         .await?;
-    let chain = client.load_wallet()?.default_chain().unwrap();
 
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
-
-    assert_eq!(
-        node_service.try_get_applications_uri(&chain).await?.len(),
-        1
-    );
 
     node_service.ensure_is_running()?;
 
@@ -602,15 +603,9 @@ async fn test_example_publish(database: Database, network: Network) -> Result<()
     client
         .project_publish(example_dir, vec![], None, &0)
         .await?;
-    let chain = client.load_wallet()?.default_chain().unwrap();
 
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
-
-    assert_eq!(
-        node_service.try_get_applications_uri(&chain).await?.len(),
-        1
-    );
 
     node_service.ensure_is_running()?;
 
@@ -745,9 +740,7 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
     assert_eq!(client.load_wallet()?.num_chains(), 3);
     // Launch local benchmark using some additional chains.
     client.benchmark(4, 10, None).await?;
-    // Number of chains should not change, as the chains created for the benchmark are not loaded
-    // in the wallet.
-    assert_eq!(client.load_wallet()?.num_chains(), 3);
+    assert_eq!(client.load_wallet()?.num_chains(), 7);
 
     // Now we run the benchmark again, with the fungible token application instead of the
     // native token.
@@ -760,6 +753,7 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
         .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
             contract,
             service,
+            VmRuntime::Wasm,
             &params,
             &state,
             &[],
@@ -839,4 +833,144 @@ async fn test_sync_validator(config: LocalNetConfig) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(feature = "ethereum")]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> Result<()> {
+    use ethereum_tracker::{EthereumTrackerAbi, InstantiationArgument};
+    use linera_ethereum::{
+        client::EthereumQueries,
+        test_utils::{get_anvil, SimpleTokenContractFunction},
+    };
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    // Setting up the Ethereum smart contract
+    let anvil_test = get_anvil().await?;
+    let address0 = anvil_test.get_address(0);
+    let address1 = anvil_test.get_address(1);
+    let ethereum_endpoint = anvil_test.endpoint.clone();
+    let ethereum_client = anvil_test.ethereum_client.clone();
+
+    let simple_token = SimpleTokenContractFunction::new(anvil_test).await?;
+    let contract_address = simple_token.contract_address.clone();
+    let event_name_expanded = "Initial(address,uint256)";
+    let events = ethereum_client
+        .read_events(&contract_address, event_name_expanded, 0, 2)
+        .await?;
+    let start_block = events.first().unwrap().block_number;
+    let argument = InstantiationArgument {
+        ethereum_endpoint,
+        contract_address,
+        start_block,
+    };
+
+    // Setting up the validators
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.load_wallet()?.default_chain().unwrap();
+
+    // Change the ownership so that the blocks inserted are not
+    // fast blocks. Fast blocks are not allowed for the oracles.
+    let owner1 = {
+        let wallet = client.load_wallet()?;
+        let user_chain = wallet.get(chain).unwrap();
+        user_chain.key_pair.as_ref().unwrap().public().into()
+    };
+    client.change_ownership(chain, vec![], vec![owner1]).await?;
+
+    let (contract, service) = client.build_example("ethereum-tracker").await?;
+
+    let application_id = client
+        .publish_and_create::<EthereumTrackerAbi, (), InstantiationArgument>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &argument,
+            &[],
+            None,
+        )
+        .await?;
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let app = EthereumTrackerApp(
+        node_service
+            .make_application(&chain, &application_id)
+            .await?,
+    );
+
+    // Check after the initialization
+
+    app.assert_balances([
+        (address0.clone(), U256::from(1000)),
+        (address1.clone(), U256::from(0)),
+    ])
+    .await;
+
+    // Doing a transfer and updating the smart contract
+    // First await gets you the pending transaction, second gets it mined.
+
+    let value = U256::from(10);
+    simple_token.transfer(&address0, &address1, value).await?;
+    let last_block = ethereum_client.get_block_number().await?;
+    // increment by 1 since the read_events is exclusive in the last block.
+    app.update(last_block + 1).await;
+
+    // Now checking the balances after the operations.
+
+    app.assert_balances([
+        (address0.clone(), U256::from(990)),
+        (address1.clone(), U256::from(10)),
+    ])
+    .await;
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "ethereum")]
+struct EthereumTrackerApp(ApplicationWrapper<ethereum_tracker::EthereumTrackerAbi>);
+
+#[cfg(feature = "ethereum")]
+impl EthereumTrackerApp {
+    async fn get_amount(&self, account_owner: &str) -> U256 {
+        use ethereum_tracker::U256Cont;
+        let query = format!(
+            "accounts {{ entry(key: \"{}\") {{ value }} }}",
+            account_owner
+        );
+        let response_body = self.0.query(&query).await.unwrap();
+        let amount_option = serde_json::from_value::<Option<U256Cont>>(
+            response_body["accounts"]["entry"]["value"].clone(),
+        )
+        .unwrap();
+        match amount_option {
+            None => U256::from(0),
+            Some(value) => {
+                let U256Cont { value } = value;
+                value
+            }
+        }
+    }
+
+    async fn assert_balances(&self, accounts: impl IntoIterator<Item = (String, U256)>) {
+        for (account_owner, amount) in accounts {
+            let value = self.get_amount(&account_owner).await;
+            assert_eq!(value, amount);
+        }
+    }
+
+    async fn update(&self, to_block: u64) {
+        let mutation = format!("update(toBlock: {})", to_block);
+        self.0.mutate(mutation).await.unwrap();
+    }
 }

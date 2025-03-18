@@ -16,14 +16,12 @@ use linera_base::{
 };
 use linera_views::{
     context::{Context, MemoryContext},
-    memory::TEST_MEMORY_MAX_STREAM_QUERIES,
     random::generate_test_namespace,
     views::{CryptoHashView, View, ViewError},
 };
 
 use super::{MockApplication, RegisterMockApplication};
 use crate::{
-    applications::ApplicationRegistry,
     committee::{Committee, Epoch},
     execution::UserAction,
     system::SystemChannel,
@@ -45,7 +43,6 @@ pub struct SystemExecutionState {
     #[debug(skip_if = BTreeMap::is_empty)]
     pub balances: BTreeMap<AccountOwner, Amount>,
     pub timestamp: Timestamp,
-    pub registry: ApplicationRegistry,
     pub used_blobs: BTreeSet<BlobId>,
     #[debug(skip_if = Not::not)]
     pub closed: bool,
@@ -58,20 +55,10 @@ pub struct SystemExecutionState {
 
 impl SystemExecutionState {
     pub fn new(epoch: Epoch, description: ChainDescription, admin_id: impl Into<ChainId>) -> Self {
-        let admin_id = admin_id.into();
-        let subscriptions = if ChainId::from(description) == admin_id {
-            BTreeSet::new()
-        } else {
-            BTreeSet::from([ChannelSubscription {
-                chain_id: admin_id,
-                name: SystemChannel::Admin.name(),
-            }])
-        };
         SystemExecutionState {
             epoch: Some(epoch),
             description: Some(description),
-            admin_id: Some(admin_id),
-            subscriptions,
+            admin_id: Some(admin_id.into()),
             ..SystemExecutionState::default()
         }
     }
@@ -108,7 +95,6 @@ impl SystemExecutionState {
             balance,
             balances,
             timestamp,
-            registry,
             used_blobs,
             closed,
             application_permissions,
@@ -128,14 +114,7 @@ impl SystemExecutionState {
             extra.user_services().insert(id, mock_application.into());
         }
 
-        let namespace = generate_test_namespace();
-        let root_key = &[];
-        let context = MemoryContext::new_for_testing(
-            TEST_MEMORY_MAX_STREAM_QUERIES,
-            &namespace,
-            root_key,
-            extra,
-        );
+        let context = MemoryContext::new_for_testing(extra);
         let mut view = ExecutionStateView::load(context)
             .await
             .expect("Loading from memory should work");
@@ -158,10 +137,6 @@ impl SystemExecutionState {
                 .expect("insertion of balances should not fail");
         }
         view.system.timestamp.set(timestamp);
-        view.system
-            .registry
-            .import(registry)
-            .expect("serialization of registry components should not fail");
         for blob_id in used_blobs {
             view.system
                 .used_blobs
@@ -183,10 +158,6 @@ impl RegisterMockApplication for SystemExecutionState {
         ).into()
     }
 
-    async fn registered_application_count(&self) -> anyhow::Result<usize> {
-        Ok(self.registry.known_applications.len())
-    }
-
     async fn register_mock_application_with(
         &mut self,
         description: UserApplicationDescription,
@@ -196,8 +167,11 @@ impl RegisterMockApplication for SystemExecutionState {
         let id = ApplicationId::from(&description);
         let application = MockApplication::default();
 
-        self.registry.known_applications.insert(id, description);
-        self.extra_blobs.extend([contract, service]);
+        self.extra_blobs.extend([
+            contract,
+            service,
+            Blob::new_application_description(&description),
+        ]);
         self.mock_applications.insert(id, application.clone());
 
         Ok((id, application))

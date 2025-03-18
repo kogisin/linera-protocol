@@ -5,13 +5,12 @@
 
 use std::{collections::BTreeMap, vec};
 
-use anyhow::Context as _;
 use assert_matches::assert_matches;
-use futures::{stream, StreamExt, TryStreamExt};
 use linera_base::{
     crypto::{AccountPublicKey, ValidatorPublicKey},
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, Timestamp,
+        Amount, ApplicationPermissions, Blob, BlockHeight, OracleResponse, Resources,
+        SendMessageRequest, Timestamp,
     },
     identifiers::{
         Account, AccountOwner, ChainDescription, ChainId, Destination, MessageId, Owner,
@@ -20,16 +19,16 @@ use linera_base::{
 };
 use linera_execution::{
     committee::{Committee, Epoch},
-    system::{SystemExecutionError, SystemMessage},
+    system::SystemMessage,
     test_utils::{
-        create_dummy_message_context, create_dummy_operation_context,
+        blob_oracle_responses, create_dummy_message_context, create_dummy_operation_context,
         create_dummy_user_application_registrations, ExpectedCall, RegisterMockApplication,
         SystemExecutionState,
     },
-    BaseRuntime, ContractRuntime, ExecutionError, ExecutionOutcome, ExecutionRuntimeContext,
-    Message, MessageKind, Operation, OperationContext, Query, QueryContext, QueryOutcome,
-    QueryResponse, RawExecutionOutcome, RawOutgoingMessage, ResourceControlPolicy,
-    ResourceController, SystemOperation, TransactionTracker,
+    BaseRuntime, ContractRuntime, ExecutionError, ExecutionRuntimeContext, Message, Operation,
+    OperationContext, OutgoingMessage, Query, QueryContext, QueryOutcome, QueryResponse,
+    RawExecutionOutcome, RawOutgoingMessage, ResourceControlPolicy, ResourceController,
+    SystemOperation, TransactionTracker,
 };
 use linera_views::{batch::Batch, context::Context, views::View};
 use test_case::test_case;
@@ -41,10 +40,14 @@ async fn test_missing_bytecode_for_user_application() -> anyhow::Result<()> {
     let mut view = state.into_view().await;
 
     let (app_id, app_desc, contract_blob, service_blob) =
-        &create_dummy_user_application_registrations(&mut view.system.registry, 1).await?[0];
+        &create_dummy_user_application_registrations(1).await?[0];
+    let app_desc_blob = Blob::new_application_description(app_desc);
+    let app_desc_blob_id = app_desc_blob.id();
+    let contract_blob_id = contract_blob.id();
+    let service_blob_id = service_blob.id();
     view.context()
         .extra()
-        .add_blobs([contract_blob.clone(), service_blob.clone()])
+        .add_blobs([contract_blob.clone(), service_blob.clone(), app_desc_blob])
         .await?;
 
     let context = create_dummy_operation_context();
@@ -57,7 +60,15 @@ async fn test_missing_bytecode_for_user_application() -> anyhow::Result<()> {
                 application_id: *app_id,
                 bytes: vec![],
             },
-            &mut TransactionTracker::new(0, Some(Vec::new())),
+            &mut TransactionTracker::new(
+                0,
+                0,
+                Some(vec![
+                    OracleResponse::Blob(app_desc_blob_id),
+                    OracleResponse::Blob(contract_blob_id),
+                    OracleResponse::Blob(service_blob_id),
+                ]),
+            ),
             &mut controller,
         )
         .await;
@@ -76,8 +87,8 @@ async fn test_simple_user_operation() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (target_id, target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
 
     let owner = Owner::from(AccountPublicKey::test_key(0));
     let state_key = vec![];
@@ -140,7 +151,13 @@ async fn test_simple_user_operation() -> anyhow::Result<()> {
         ..create_dummy_operation_context()
     };
     let mut controller = ResourceController::default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(
+        0,
+        0,
+        Some(blob_oracle_responses(
+            caller_blobs.iter().chain(target_blobs.iter()),
+        )),
+    );
     view.execute_operation(
         context,
         Timestamp::from(0),
@@ -153,44 +170,8 @@ async fn test_simple_user_operation() -> anyhow::Result<()> {
     )
     .await
     .unwrap();
-    let account = Account {
-        chain_id: ChainId::root(0),
-        owner: Some(AccountOwner::User(owner)),
-    };
     let txn_outcome = txn_tracker.into_outcome().unwrap();
-    assert_eq!(
-        txn_outcome.outcomes,
-        vec![
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default()
-                    .with_authenticated_signer(Some(owner))
-                    .with_refund_grant_to(Some(account)),
-            ),
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default()
-                    .with_authenticated_signer(Some(owner))
-                    .with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default()
-                    .with_refund_grant_to(Some(account))
-                    .with_authenticated_signer(Some(owner))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default()
-                    .with_authenticated_signer(Some(owner))
-                    .with_refund_grant_to(Some(account))
-            ),
-        ]
-    );
+    assert!(txn_outcome.outgoing_messages.is_empty());
 
     {
         let state_key = state_key.clone();
@@ -264,8 +245,8 @@ async fn test_simulated_session() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (target_id, target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
 
     caller_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -320,7 +301,13 @@ async fn test_simulated_session() -> anyhow::Result<()> {
 
     let context = create_dummy_operation_context();
     let mut controller = ResourceController::default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(
+        0,
+        0,
+        Some(blob_oracle_responses(
+            caller_blobs.iter().chain(target_blobs.iter()),
+        )),
+    );
     view.execute_operation(
         context,
         Timestamp::from(0),
@@ -332,36 +319,8 @@ async fn test_simulated_session() -> anyhow::Result<()> {
         &mut controller,
     )
     .await?;
-    let account = Account {
-        chain_id: ChainId::root(0),
-        owner: None,
-    };
     let txn_outcome = txn_tracker.into_outcome().unwrap();
-    assert_eq!(
-        txn_outcome.outcomes,
-        vec![
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-        ]
-    );
+    assert!(txn_outcome.outgoing_messages.is_empty());
     Ok(())
 }
 
@@ -372,8 +331,8 @@ async fn test_simulated_session_leak() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (target_id, target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
 
     caller_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -425,7 +384,13 @@ async fn test_simulated_session_leak() -> anyhow::Result<()> {
                 application_id: caller_id,
                 bytes: vec![],
             },
-            &mut TransactionTracker::new(0, Some(Vec::new())),
+            &mut TransactionTracker::new(
+                0,
+                0,
+                Some(blob_oracle_responses(
+                    caller_blobs.iter().chain(target_blobs.iter()),
+                )),
+            ),
             &mut controller,
         )
         .await;
@@ -441,7 +406,7 @@ async fn test_rejecting_block_from_finalize() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (id, application) = view.register_mock_application().await?;
+    let (id, application, blobs) = view.register_mock_application(0).await?;
 
     application.expect_call(ExpectedCall::execute_operation(
         move |_runtime, _context, _operation| Ok(vec![]),
@@ -463,7 +428,7 @@ async fn test_rejecting_block_from_finalize() -> anyhow::Result<()> {
                 application_id: id,
                 bytes: vec![],
             },
-            &mut TransactionTracker::new(0, Some(Vec::new())),
+            &mut TransactionTracker::new(0, 0, Some(blob_oracle_responses(blobs.iter()))),
             &mut controller,
         )
         .await;
@@ -479,10 +444,12 @@ async fn test_rejecting_block_from_called_applications_finalize() -> anyhow::Res
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (first_id, first_application) = view.register_mock_application().await?;
-    let (second_id, second_application) = view.register_mock_application().await?;
-    let (third_id, third_application) = view.register_mock_application().await?;
-    let (fourth_id, fourth_application) = view.register_mock_application().await?;
+    let (first_id, first_application, first_app_blobs) = view.register_mock_application(0).await?;
+    let (second_id, second_application, second_app_blobs) =
+        view.register_mock_application(1).await?;
+    let (third_id, third_application, third_app_blobs) = view.register_mock_application(2).await?;
+    let (fourth_id, fourth_application, fourth_app_blobs) =
+        view.register_mock_application(3).await?;
 
     first_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -525,7 +492,17 @@ async fn test_rejecting_block_from_called_applications_finalize() -> anyhow::Res
                 application_id: first_id,
                 bytes: vec![],
             },
-            &mut TransactionTracker::new(0, Some(Vec::new())),
+            &mut TransactionTracker::new(
+                0,
+                0,
+                Some(blob_oracle_responses(
+                    first_app_blobs
+                        .iter()
+                        .chain(second_app_blobs.iter())
+                        .chain(third_app_blobs.iter())
+                        .chain(fourth_app_blobs.iter()),
+                )),
+            ),
             &mut controller,
         )
         .await;
@@ -541,10 +518,12 @@ async fn test_sending_message_from_finalize() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (first_id, first_application) = view.register_mock_application().await?;
-    let (second_id, second_application) = view.register_mock_application().await?;
-    let (third_id, third_application) = view.register_mock_application().await?;
-    let (fourth_id, fourth_application) = view.register_mock_application().await?;
+    let (first_id, first_application, first_app_blobs) = view.register_mock_application(0).await?;
+    let (second_id, second_application, second_app_blobs) =
+        view.register_mock_application(1).await?;
+    let (third_id, third_application, third_app_blobs) = view.register_mock_application(2).await?;
+    let (fourth_id, fourth_application, fourth_app_blobs) =
+        view.register_mock_application(3).await?;
 
     let destination_chain = ChainId::from(ChainDescription::Root(1));
     let first_message = SendMessageRequest {
@@ -625,7 +604,17 @@ async fn test_sending_message_from_finalize() -> anyhow::Result<()> {
 
     let context = create_dummy_operation_context();
     let mut controller = ResourceController::default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(
+        0,
+        0,
+        Some(blob_oracle_responses(
+            first_app_blobs
+                .iter()
+                .chain(second_app_blobs.iter())
+                .chain(third_app_blobs.iter())
+                .chain(fourth_app_blobs.iter()),
+        )),
+    );
     view.execute_operation(
         context,
         Timestamp::from(0),
@@ -637,72 +626,31 @@ async fn test_sending_message_from_finalize() -> anyhow::Result<()> {
         &mut controller,
     )
     .await?;
-    view.update_execution_outcomes_with_app_registrations(&mut txn_tracker)
-        .await?;
 
-    let applications = stream::iter([third_id, first_id])
-        .then(|id| view.system.registry.describe_application(id))
-        .try_collect()
-        .await?;
-    let registration_message = RawOutgoingMessage {
-        destination: Destination::from(destination_chain),
-        authenticated: false,
-        grant: Amount::ZERO,
-        kind: MessageKind::Simple,
-        message: SystemMessage::RegisterApplications { applications },
-    };
     let account = Account {
         chain_id: ChainId::root(0),
-        owner: None,
+        owner: AccountOwner::Chain,
     };
 
     let txn_outcome = txn_tracker.into_outcome().unwrap();
+    let mut expected = TransactionTracker::default();
+    expected.add_user_outcome(
+        third_id,
+        RawExecutionOutcome::default()
+            .with_refund_grant_to(Some(account))
+            .with_message(expected_first_message)
+            .with_message(expected_second_message)
+            .with_message(expected_third_message),
+    )?;
+    expected.add_user_outcome(
+        first_id,
+        RawExecutionOutcome::default()
+            .with_refund_grant_to(Some(account))
+            .with_message(expected_fourth_message),
+    )?;
     assert_eq!(
-        txn_outcome.outcomes,
-        vec![
-            ExecutionOutcome::System(
-                RawExecutionOutcome::default().with_message(registration_message)
-            ),
-            ExecutionOutcome::User(
-                fourth_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                third_id,
-                RawExecutionOutcome::default()
-                    .with_refund_grant_to(Some(account))
-                    .with_message(expected_first_message)
-            ),
-            ExecutionOutcome::User(
-                second_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                first_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                fourth_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                third_id,
-                RawExecutionOutcome::default()
-                    .with_refund_grant_to(Some(account))
-                    .with_message(expected_second_message)
-                    .with_message(expected_third_message)
-            ),
-            ExecutionOutcome::User(
-                second_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                first_id,
-                RawExecutionOutcome::default()
-                    .with_refund_grant_to(Some(account))
-                    .with_message(expected_fourth_message)
-            ),
-        ]
+        txn_outcome.outgoing_messages,
+        expected.into_outcome().unwrap().outgoing_messages
     );
     Ok(())
 }
@@ -714,8 +662,8 @@ async fn test_cross_application_call_from_finalize() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (target_id, _target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, _target_application, target_blobs) = view.register_mock_application(1).await?;
 
     caller_application.expect_call(ExpectedCall::execute_operation(
         move |_runtime, _context, _operation| Ok(vec![]),
@@ -738,7 +686,13 @@ async fn test_cross_application_call_from_finalize() -> anyhow::Result<()> {
                 application_id: caller_id,
                 bytes: vec![],
             },
-            &mut TransactionTracker::new(0, Some(Vec::new())),
+            &mut TransactionTracker::new(
+                0,
+                0,
+                Some(blob_oracle_responses(
+                    caller_blobs.iter().chain(target_blobs.iter()),
+                )),
+            ),
             &mut controller,
         )
         .await;
@@ -762,8 +716,8 @@ async fn test_cross_application_call_from_finalize_of_called_application() -> an
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (target_id, target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
 
     caller_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -793,7 +747,13 @@ async fn test_cross_application_call_from_finalize_of_called_application() -> an
                 application_id: caller_id,
                 bytes: vec![],
             },
-            &mut TransactionTracker::new(0, Some(Vec::new())),
+            &mut TransactionTracker::new(
+                0,
+                0,
+                Some(blob_oracle_responses(
+                    caller_blobs.iter().chain(target_blobs.iter()),
+                )),
+            ),
             &mut controller,
         )
         .await;
@@ -816,8 +776,8 @@ async fn test_calling_application_again_from_finalize() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (target_id, target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
 
     caller_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -847,7 +807,13 @@ async fn test_calling_application_again_from_finalize() -> anyhow::Result<()> {
                 application_id: caller_id,
                 bytes: vec![],
             },
-            &mut TransactionTracker::new(0, Some(Vec::new())),
+            &mut TransactionTracker::new(
+                0,
+                0,
+                Some(blob_oracle_responses(
+                    caller_blobs.iter().chain(target_blobs.iter()),
+                )),
+            ),
             &mut controller,
         )
         .await;
@@ -873,8 +839,8 @@ async fn test_cross_application_error() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (target_id, target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
 
     caller_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -900,8 +866,10 @@ async fn test_cross_application_error() -> anyhow::Result<()> {
                 bytes: vec![],
             },
             &mut TransactionTracker::new(
-                0,
-                Some(Vec::new())),
+                0, 0, Some(blob_oracle_responses(caller_blobs
+                    .iter()
+                    .chain(target_blobs.iter())))
+                ),
             &mut controller,
         )
         .await,
@@ -919,7 +887,7 @@ async fn test_simple_message() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (application_id, application) = view.register_mock_application().await?;
+    let (application_id, application, blobs) = view.register_mock_application(0).await?;
 
     let destination_chain = ChainId::from(ChainDescription::Root(1));
     let dummy_message = SendMessageRequest {
@@ -944,7 +912,7 @@ async fn test_simple_message() -> anyhow::Result<()> {
 
     let context = create_dummy_operation_context();
     let mut controller = ResourceController::default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(0, 0, Some(blob_oracle_responses(blobs.iter())));
     view.execute_operation(
         context,
         Timestamp::from(0),
@@ -956,46 +924,23 @@ async fn test_simple_message() -> anyhow::Result<()> {
         &mut controller,
     )
     .await?;
-    view.update_execution_outcomes_with_app_registrations(&mut txn_tracker)
-        .await?;
 
-    let application_description = view
-        .system
-        .registry
-        .describe_application(application_id)
-        .await?;
-    let registration_message = RawOutgoingMessage {
-        destination: Destination::from(destination_chain),
-        authenticated: false,
-        grant: Amount::ZERO,
-        kind: MessageKind::Simple,
-        message: SystemMessage::RegisterApplications {
-            applications: vec![application_description],
-        },
-    };
     let account = Account {
         chain_id: ChainId::root(0),
-        owner: None,
+        owner: AccountOwner::Chain,
     };
 
     let txn_outcome = txn_tracker.into_outcome().unwrap();
+    let mut expected = TransactionTracker::default();
+    expected.add_user_outcome(
+        application_id,
+        RawExecutionOutcome::default()
+            .with_message(expected_dummy_message)
+            .with_refund_grant_to(Some(account)),
+    )?;
     assert_eq!(
-        txn_outcome.outcomes,
-        &[
-            ExecutionOutcome::System(
-                RawExecutionOutcome::default().with_message(registration_message)
-            ),
-            ExecutionOutcome::User(
-                application_id,
-                RawExecutionOutcome::default()
-                    .with_message(expected_dummy_message)
-                    .with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                application_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-        ]
+        txn_outcome.outgoing_messages,
+        expected.into_outcome().unwrap().outgoing_messages
     );
 
     Ok(())
@@ -1009,8 +954,8 @@ async fn test_message_from_cross_application_call() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (target_id, target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
 
     caller_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -1044,7 +989,13 @@ async fn test_message_from_cross_application_call() -> anyhow::Result<()> {
 
     let context = create_dummy_operation_context();
     let mut controller = ResourceController::default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(
+        0,
+        0,
+        Some(blob_oracle_responses(
+            caller_blobs.iter().chain(target_blobs.iter()),
+        )),
+    );
     view.execute_operation(
         context,
         Timestamp::from(0),
@@ -1056,50 +1007,23 @@ async fn test_message_from_cross_application_call() -> anyhow::Result<()> {
         &mut controller,
     )
     .await?;
-    view.update_execution_outcomes_with_app_registrations(&mut txn_tracker)
-        .await?;
 
-    let target_description = view.system.registry.describe_application(target_id).await?;
-    let registration_message = RawOutgoingMessage {
-        destination: Destination::from(destination_chain),
-        authenticated: false,
-        grant: Amount::ZERO,
-        kind: MessageKind::Simple,
-        message: SystemMessage::RegisterApplications {
-            applications: vec![target_description],
-        },
-    };
     let account = Account {
         chain_id: ChainId::root(0),
-        owner: None,
+        owner: AccountOwner::Chain,
     };
 
     let txn_outcome = txn_tracker.into_outcome().unwrap();
+    let mut expected = TransactionTracker::default();
+    expected.add_user_outcome(
+        target_id,
+        RawExecutionOutcome::default()
+            .with_message(expected_dummy_message)
+            .with_refund_grant_to(Some(account)),
+    )?;
     assert_eq!(
-        txn_outcome.outcomes,
-        &[
-            ExecutionOutcome::System(
-                RawExecutionOutcome::default().with_message(registration_message)
-            ),
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default()
-                    .with_message(expected_dummy_message)
-                    .with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-        ]
+        txn_outcome.outgoing_messages,
+        expected.into_outcome().unwrap().outgoing_messages
     );
 
     Ok(())
@@ -1112,9 +1036,9 @@ async fn test_message_from_deeper_call() -> anyhow::Result<()> {
     state.description = Some(ChainDescription::Root(0));
     let mut view = state.into_view().await;
 
-    let (caller_id, caller_application) = view.register_mock_application().await?;
-    let (middle_id, middle_application) = view.register_mock_application().await?;
-    let (target_id, target_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (middle_id, middle_application, middle_blobs) = view.register_mock_application(1).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(2).await?;
 
     caller_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -1156,7 +1080,16 @@ async fn test_message_from_deeper_call() -> anyhow::Result<()> {
 
     let context = create_dummy_operation_context();
     let mut controller = ResourceController::default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(
+        0,
+        0,
+        Some(blob_oracle_responses(
+            caller_blobs
+                .iter()
+                .chain(middle_blobs.iter())
+                .chain(target_blobs.iter()),
+        )),
+    );
     view.execute_operation(
         context,
         Timestamp::from(0),
@@ -1169,56 +1102,21 @@ async fn test_message_from_deeper_call() -> anyhow::Result<()> {
     )
     .await?;
 
-    let target_description = view.system.registry.describe_application(target_id).await?;
-    let registration_message = RawOutgoingMessage {
-        destination: Destination::from(destination_chain),
-        authenticated: false,
-        grant: Amount::ZERO,
-        kind: MessageKind::Simple,
-        message: SystemMessage::RegisterApplications {
-            applications: vec![target_description],
-        },
-    };
-    view.update_execution_outcomes_with_app_registrations(&mut txn_tracker)
-        .await?;
     let account = Account {
         chain_id: ChainId::root(0),
-        owner: None,
+        owner: AccountOwner::Chain,
     };
     let txn_outcome = txn_tracker.into_outcome().unwrap();
+    let mut expected = TransactionTracker::default();
+    expected.add_user_outcome(
+        target_id,
+        RawExecutionOutcome::default()
+            .with_message(expected_dummy_message)
+            .with_refund_grant_to(Some(account)),
+    )?;
     assert_eq!(
-        txn_outcome.outcomes,
-        &[
-            ExecutionOutcome::System(
-                RawExecutionOutcome::default().with_message(registration_message)
-            ),
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default()
-                    .with_message(expected_dummy_message)
-                    .with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                middle_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                middle_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-        ]
+        txn_outcome.outgoing_messages,
+        expected.into_outcome().unwrap().outgoing_messages
     );
 
     Ok(())
@@ -1236,11 +1134,13 @@ async fn test_multiple_messages_from_different_applications() -> anyhow::Result<
     let mut view = state.into_view().await;
 
     // The entrypoint application, which sends a message and calls other applications
-    let (caller_id, caller_application) = view.register_mock_application().await?;
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
     // An application that does not send any messages
-    let (silent_target_id, silent_target_application) = view.register_mock_application().await?;
+    let (silent_target_id, silent_target_application, silent_blobs) =
+        view.register_mock_application(1).await?;
     // An application that sends a message when handling a cross-application call
-    let (sending_target_id, sending_target_application) = view.register_mock_application().await?;
+    let (sending_target_id, sending_target_application, sending_blobs) =
+        view.register_mock_application(2).await?;
 
     // The first destination chain receives messages from the caller and the sending applications
     let first_destination_chain = ChainId::from(ChainDescription::Root(1));
@@ -1313,7 +1213,16 @@ async fn test_multiple_messages_from_different_applications() -> anyhow::Result<
     // Execute the operation, starting the test scenario
     let context = create_dummy_operation_context();
     let mut controller = ResourceController::default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(
+        0,
+        0,
+        Some(blob_oracle_responses(
+            caller_blobs
+                .iter()
+                .chain(silent_blobs.iter())
+                .chain(sending_blobs.iter()),
+        )),
+    );
     view.execute_operation(
         context,
         Timestamp::from(0),
@@ -1325,85 +1234,31 @@ async fn test_multiple_messages_from_different_applications() -> anyhow::Result<
         &mut controller,
     )
     .await?;
-    view.update_execution_outcomes_with_app_registrations(&mut txn_tracker)
-        .await?;
-
-    // Describe the two applications that sent messages, and will therefore handle them in the
-    // other chains
-    let caller_description = view.system.registry.describe_application(caller_id).await?;
-    let sending_target_description = view
-        .system
-        .registry
-        .describe_application(sending_target_id)
-        .await?;
-
-    // The registration message for the first destination chain
-    let first_registration_message = RawOutgoingMessage {
-        destination: Destination::from(first_destination_chain),
-        authenticated: false,
-        grant: Amount::ZERO,
-        kind: MessageKind::Simple,
-        message: SystemMessage::RegisterApplications {
-            applications: vec![sending_target_description.clone(), caller_description],
-        },
-    };
-
-    // The registration message for the second destination chain
-    let second_registration_message = RawOutgoingMessage {
-        destination: Destination::from(second_destination_chain),
-        authenticated: false,
-        grant: Amount::ZERO,
-        kind: MessageKind::Simple,
-        message: SystemMessage::RegisterApplications {
-            applications: vec![sending_target_description],
-        },
-    };
 
     let account = Account {
         chain_id: ChainId::root(0),
-        owner: None,
+        owner: AccountOwner::Chain,
     };
 
     // Return to checking the user application outcomes
     let txn_outcome = txn_tracker.into_outcome().unwrap();
+    let mut expected = TransactionTracker::default();
+    expected.add_user_outcome(
+        caller_id,
+        RawExecutionOutcome::default()
+            .with_message(expected_first_message.clone())
+            .with_refund_grant_to(Some(account)),
+    )?;
+    expected.add_user_outcome(
+        sending_target_id,
+        RawExecutionOutcome::default()
+            .with_message(expected_first_message)
+            .with_message(expected_second_message)
+            .with_refund_grant_to(Some(account)),
+    )?;
     assert_eq!(
-        txn_outcome.outcomes,
-        &[
-            ExecutionOutcome::System(
-                RawExecutionOutcome::default()
-                    .with_message(second_registration_message)
-                    .with_message(first_registration_message)
-            ),
-            ExecutionOutcome::User(
-                silent_target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account)),
-            ),
-            ExecutionOutcome::User(
-                sending_target_id,
-                RawExecutionOutcome::default()
-                    .with_message(expected_first_message.clone())
-                    .with_message(expected_second_message)
-                    .with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default()
-                    .with_message(expected_first_message)
-                    .with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                sending_target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-            ExecutionOutcome::User(
-                silent_target_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account)),
-            ),
-            ExecutionOutcome::User(
-                caller_id,
-                RawExecutionOutcome::default().with_refund_grant_to(Some(account))
-            ),
-        ]
+        txn_outcome.outgoing_messages,
+        expected.into_outcome().unwrap().outgoing_messages
     );
 
     Ok(())
@@ -1427,7 +1282,7 @@ async fn test_open_chain() -> anyhow::Result<()> {
         ..SystemExecutionState::new(Epoch::ZERO, ChainDescription::Root(0), ChainId::root(0))
     };
     let mut view = state.into_view().await;
-    let (application_id, application) = view.register_mock_application().await?;
+    let (application_id, application, blobs) = view.register_mock_application(0).await?;
 
     let context = OperationContext {
         height: BlockHeight(1),
@@ -1448,7 +1303,7 @@ async fn test_open_chain() -> anyhow::Result<()> {
         move |runtime, _context, _operation| {
             assert_eq!(runtime.chain_ownership()?, ownership);
             let destination = Account::chain(ChainId::root(2));
-            runtime.transfer(None, destination, Amount::ONE)?;
+            runtime.transfer(AccountOwner::Chain, destination, Amount::ONE)?;
             let id = runtime.application_id()?;
             let application_permissions = ApplicationPermissions::new_single(id);
             let (actual_message_id, chain_id) =
@@ -1465,7 +1320,11 @@ async fn test_open_chain() -> anyhow::Result<()> {
         application_id,
         bytes: vec![],
     };
-    let mut txn_tracker = TransactionTracker::new(first_message_index, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(
+        first_message_index,
+        0,
+        Some(blob_oracle_responses(blobs.iter())),
+    );
     view.execute_operation(
         context,
         Timestamp::from(0),
@@ -1477,17 +1336,9 @@ async fn test_open_chain() -> anyhow::Result<()> {
 
     assert_eq!(*view.system.balance.get(), Amount::from_tokens(3));
     let txn_outcome = txn_tracker.into_outcome().unwrap();
-    let message = txn_outcome
-        .outcomes
-        .iter()
-        .flat_map(|outcome| match outcome {
-            ExecutionOutcome::System(outcome) => &outcome.messages,
-            ExecutionOutcome::User(_, _) => panic!("Unexpected message"),
-        })
-        .nth((index - first_message_index) as usize)
-        .context("Message index out of bounds")?;
-    let RawOutgoingMessage {
-        message: SystemMessage::OpenChain(config),
+    let message = &txn_outcome.outgoing_messages[(index - first_message_index) as usize];
+    let OutgoingMessage {
+        message: Message::System(SystemMessage::OpenChain(config)),
         destination: Destination::Recipient(recipient_id),
         ..
     } = message
@@ -1533,7 +1384,7 @@ async fn test_close_chain() -> anyhow::Result<()> {
         ..SystemExecutionState::new(Epoch::ZERO, ChainDescription::Root(0), ChainId::root(0))
     };
     let mut view = state.into_view().await;
-    let (application_id, application) = view.register_mock_application().await?;
+    let (application_id, application, blobs) = view.register_mock_application(0).await?;
 
     // The application is not authorized to close the chain.
     let context = create_dummy_operation_context();
@@ -1557,7 +1408,7 @@ async fn test_close_chain() -> anyhow::Result<()> {
         context,
         Timestamp::from(0),
         operation,
-        &mut TransactionTracker::new(0, Some(Vec::new())),
+        &mut TransactionTracker::new(0, 0, Some(blob_oracle_responses(blobs.iter()))),
         &mut controller,
     )
     .await?;
@@ -1570,7 +1421,7 @@ async fn test_close_chain() -> anyhow::Result<()> {
         context,
         Timestamp::from(0),
         operation.into(),
-        &mut TransactionTracker::new(0, Some(Vec::new())),
+        &mut TransactionTracker::new(0, 0, Some(Vec::new())),
         &mut controller,
     )
     .await?;
@@ -1591,7 +1442,7 @@ async fn test_close_chain() -> anyhow::Result<()> {
         context,
         Timestamp::from(0),
         operation,
-        &mut TransactionTracker::new(0, Some(Vec::new())),
+        &mut TransactionTracker::new(0, 0, Some(Vec::new())),
         &mut controller,
     )
     .await?;
@@ -1609,30 +1460,22 @@ async fn test_close_chain() -> anyhow::Result<()> {
 )]
 #[test_case(
     Some(AccountPublicKey::test_key(1).into()), Some(AccountPublicKey::test_key(2).into())
-    => matches Ok(Err(
-        ExecutionError::SystemError(SystemExecutionError::UnauthenticatedTransferOwner)
-    ));
+    => matches Ok(Err(ExecutionError::UnauthenticatedTransferOwner));
     "fails if sender is not a receiving chain owner"
 )]
 #[test_case(
     Some(AccountPublicKey::test_key(1).into()), None
-    => matches Ok(Err(
-        ExecutionError::SystemError(SystemExecutionError::UnauthenticatedTransferOwner)
-    ));
+    => matches Ok(Err(ExecutionError::UnauthenticatedTransferOwner));
     "fails if unauthenticated"
 )]
 #[test_case(
     None, None
-    => matches Ok(Err(
-        ExecutionError::SystemError(SystemExecutionError::UnauthenticatedTransferOwner)
-    ));
+    => matches Ok(Err(ExecutionError::UnauthenticatedTransferOwner));
     "fails if unauthenticated and receiving chain has no owners"
 )]
 #[test_case(
     None, Some(AccountPublicKey::test_key(1).into())
-    => matches Ok(Err(
-        ExecutionError::SystemError(SystemExecutionError::UnauthenticatedTransferOwner)
-    ));
+    => matches Ok(Err(ExecutionError::UnauthenticatedTransferOwner));
     "fails if receiving chain has no owners"
 )]
 #[tokio::test]
@@ -1655,13 +1498,13 @@ async fn test_message_receipt_spending_chain_balance(
     .into_view()
     .await;
 
-    let (application_id, application) = view.register_mock_application().await?;
+    let (application_id, application, blobs) = view.register_mock_application(0).await?;
 
-    let receiver_chain_account = None;
+    let receiver_chain_account = AccountOwner::Chain;
     let sender_chain_id = ChainId::root(2);
     let recipient = Account {
         chain_id: sender_chain_id,
-        owner: None,
+        owner: AccountOwner::Chain,
     };
 
     application.expect_call(ExpectedCall::execute_message(
@@ -1674,7 +1517,7 @@ async fn test_message_receipt_spending_chain_balance(
 
     let context = create_dummy_message_context(authenticated_signer);
     let mut controller = ResourceController::default();
-    let mut txn_tracker = TransactionTracker::new(0, Some(Vec::new()));
+    let mut txn_tracker = TransactionTracker::new(0, 0, Some(blob_oracle_responses(blobs.iter())));
 
     let execution_result = view
         .execute_message(

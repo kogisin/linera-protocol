@@ -19,7 +19,7 @@ use linera_base::{
     },
     doc_scalar,
     hashed::Hashed,
-    identifiers::{BlobId, ChainId, Owner, UserApplicationId},
+    identifiers::{BlobId, ChainId, EventId, Owner, UserApplicationId},
     time::timer::{sleep, timeout},
 };
 use linera_chain::{
@@ -40,7 +40,7 @@ use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, OwnedRwLockReadGuard};
-use tracing::{error, instrument, trace, warn, Instrument as _};
+use tracing::{error, instrument, trace, warn};
 #[cfg(with_metrics)]
 use {
     linera_base::prometheus_util::{
@@ -190,11 +190,9 @@ pub enum WorkerError {
     #[error("The block does not contain the hash that we expected for the previous block")]
     InvalidBlockChaining,
     #[error(
-        "
-        The given outcome is not what we computed after executing the block.\n\
+        "The given outcome is not what we computed after executing the block.\n\
         Computed: {computed:#?}\n\
-        Submitted: {submitted:#?}\n
-    "
+        Submitted: {submitted:#?}"
     )]
     IncorrectOutcome {
         computed: Box<BlockExecutionOutcome>,
@@ -212,6 +210,8 @@ pub enum WorkerError {
     BlobsNotFound(Vec<BlobId>),
     #[error("The block proposal is invalid: {0}")]
     InvalidBlockProposal(String),
+    #[error("Trying to overwrite an event: {0:?}")]
+    OverwritingEvent(Box<EventId>),
     #[error("The worker is too busy to handle new chains")]
     FullChainWorkerCache,
     #[error("Failed to join spawned worker task")]
@@ -278,8 +278,10 @@ where
 }
 
 /// The sender endpoint for [`ChainWorkerRequest`]s.
-type ChainActorEndpoint<StorageClient> =
-    mpsc::UnboundedSender<ChainWorkerRequest<<StorageClient as Storage>::Context>>;
+type ChainActorEndpoint<StorageClient> = mpsc::UnboundedSender<(
+    ChainWorkerRequest<<StorageClient as Storage>::Context>,
+    tracing::Span,
+)>;
 
 pub(crate) type DeliveryNotifiers = HashMap<ChainId, DeliveryNotifier>;
 
@@ -658,7 +660,7 @@ where
         let (callback, response) = oneshot::channel();
 
         chain_actor
-            .send(request_builder(callback))
+            .send((request_builder(callback), tracing::Span::current()))
             .expect("`ChainWorkerActor` stopped executing unexpectedly");
 
         response
@@ -707,7 +709,7 @@ where
             self.chain_worker_tasks
                 .lock()
                 .unwrap()
-                .spawn_task(actor_task.in_current_span());
+                .spawn_task(actor_task);
         }
 
         Ok(sender)
@@ -724,7 +726,9 @@ where
         chain_id: ChainId,
     ) -> Option<(
         ChainActorEndpoint<StorageClient>,
-        Option<mpsc::UnboundedReceiver<ChainWorkerRequest<StorageClient::Context>>>,
+        Option<
+            mpsc::UnboundedReceiver<(ChainWorkerRequest<StorageClient::Context>, tracing::Span)>,
+        >,
     )> {
         let mut chain_workers = self.chain_workers.lock().unwrap();
 

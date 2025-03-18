@@ -3,7 +3,7 @@
 
 //! This module tracks the resources used during the execution of a transaction.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use custom_debug_derive::Debug;
 use linera_base::{
@@ -14,10 +14,7 @@ use linera_base::{
 use linera_views::{context::Context, views::ViewError};
 use serde::Serialize;
 
-use crate::{
-    system::SystemExecutionError, ExecutionError, ExecutionStateView, Message, Operation,
-    ResourceControlPolicy,
-};
+use crate::{ExecutionError, ExecutionStateView, Message, Operation, ResourceControlPolicy};
 
 #[derive(Clone, Debug, Default)]
 pub struct ResourceController<Account = Amount, Tracker = ResourceTracker> {
@@ -56,6 +53,12 @@ pub struct ResourceTracker {
     pub messages: u32,
     /// The total size of the arguments of outgoing user messages.
     pub message_bytes: u64,
+    /// The number of HTTP requests performed.
+    pub http_requests: u32,
+    /// The number of calls to services as oracles.
+    pub service_oracle_queries: u32,
+    /// The time spent executing services as oracles.
+    pub service_oracle_execution: Duration,
     /// The amount allocated to message grants.
     pub grants: Amount,
 }
@@ -87,7 +90,7 @@ where
         if other <= initial {
             self.account
                 .try_sub_assign(initial.try_sub(other).expect("other <= initial"))
-                .map_err(|_| SystemExecutionError::InsufficientFundingForFees {
+                .map_err(|_| ExecutionError::InsufficientFundingForFees {
                     balance: self.balance().unwrap_or(Amount::MAX),
                 })?;
         } else {
@@ -100,7 +103,7 @@ where
     /// Subtracts an amount from a balance and reports an error if that is impossible.
     fn update_balance(&mut self, fees: Amount) -> Result<(), ExecutionError> {
         self.account.try_sub_assign(fees).map_err(|_| {
-            SystemExecutionError::InsufficientFundingForFees {
+            ExecutionError::InsufficientFundingForFees {
                 balance: self.balance().unwrap_or(Amount::MAX),
             }
         })?;
@@ -185,6 +188,17 @@ where
         }
     }
 
+    /// Tracks the execution of an HTTP request.
+    pub fn track_http_request(&mut self) -> Result<(), ExecutionError> {
+        self.tracker.as_mut().http_requests = self
+            .tracker
+            .as_ref()
+            .http_requests
+            .checked_add(1)
+            .ok_or(ArithmeticError::Overflow)?;
+        self.update_balance(self.policy.http_request)
+    }
+
     /// Tracks a number of fuel units used.
     pub(crate) fn track_fuel(&mut self, fuel: u64) -> Result<(), ExecutionError> {
         self.tracker.as_mut().fuel = self
@@ -262,6 +276,49 @@ where
             .bytes_stored
             .checked_add(delta)
             .ok_or(ArithmeticError::Overflow)?;
+        Ok(())
+    }
+
+    /// Returns the remaining time services can spend executing as oracles.
+    pub(crate) fn remaining_service_oracle_execution_time(
+        &self,
+    ) -> Result<Duration, ExecutionError> {
+        let tracker = self.tracker.as_ref();
+        let spent_execution_time = tracker.service_oracle_execution;
+        let limit = Duration::from_millis(self.policy.maximum_service_oracle_execution_ms);
+
+        limit
+            .checked_sub(spent_execution_time)
+            .ok_or(ExecutionError::MaximumServiceOracleExecutionTimeExceeded)
+    }
+
+    /// Tracks a call to a service to run as an oracle.
+    pub(crate) fn track_service_oracle_call(&mut self) -> Result<(), ExecutionError> {
+        self.tracker.as_mut().service_oracle_queries = self
+            .tracker
+            .as_mut()
+            .service_oracle_queries
+            .checked_add(1)
+            .ok_or(ArithmeticError::Overflow)?;
+        self.update_balance(self.policy.service_as_oracle_query)
+    }
+
+    /// Tracks the time spent executing the service as an oracle.
+    pub(crate) fn track_service_oracle_execution(
+        &mut self,
+        execution_time: Duration,
+    ) -> Result<(), ExecutionError> {
+        let tracker = self.tracker.as_mut();
+        let spent_execution_time = &mut tracker.service_oracle_execution;
+        let limit = Duration::from_millis(self.policy.maximum_service_oracle_execution_ms);
+
+        *spent_execution_time = spent_execution_time.saturating_add(execution_time);
+
+        ensure!(
+            *spent_execution_time < limit,
+            ExecutionError::MaximumServiceOracleExecutionTimeExceeded
+        );
+
         Ok(())
     }
 }

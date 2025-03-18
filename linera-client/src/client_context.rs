@@ -44,7 +44,7 @@ use {
 use {
     linera_base::{
         data_types::{BlobContent, Bytecode},
-        identifiers::BytecodeId,
+        identifiers::ModuleId,
         vm::VmRuntime,
     },
     linera_core::client::create_bytecode_blobs,
@@ -109,7 +109,7 @@ where
     }
 
     async fn update_wallet(&mut self, client: &ChainClient<NodeProvider, S>) -> Result<(), Error> {
-        self.update_and_save_wallet(client).await
+        self.update_wallet_from_client(client).await
     }
 }
 
@@ -305,20 +305,11 @@ where
             .map_err(|e| error::Inner::Persistence(Box::new(e)).into())
     }
 
-    async fn update_wallet_from_client(
+    pub async fn update_wallet_from_client(
         &mut self,
         client: &ChainClient<NodeProvider, S>,
     ) -> Result<(), Error> {
         self.wallet.as_mut().update_from_state(client).await;
-        self.save_wallet().await?;
-        Ok(())
-    }
-
-    pub async fn update_and_save_wallet(
-        &mut self,
-        client: &ChainClient<NodeProvider, S>,
-    ) -> Result<(), Error> {
-        self.update_wallet_from_client(client).await?;
         self.save_wallet().await
     }
 
@@ -497,7 +488,7 @@ where
         client.prepare_chain().await?;
         // Try applying f optimistically without validator notifications. Return if committed.
         let result = f(client).await;
-        self.update_and_save_wallet(client).await?;
+        self.update_wallet_from_client(client).await?;
         if let ClientOutcome::Committed(t) = result? {
             return Ok(t);
         }
@@ -510,7 +501,7 @@ where
             // Try applying f. Return if committed.
             client.prepare_chain().await?;
             let result = f(client).await;
-            self.update_and_save_wallet(client).await?;
+            self.update_wallet_from_client(client).await?;
             let timeout = match result? {
                 ClientOutcome::Committed(t) => return Ok(t),
                 ClientOutcome::WaitForTimeout(timeout) => timeout,
@@ -557,13 +548,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     W: Persist<Target = Wallet>,
 {
-    pub async fn publish_bytecode(
+    pub async fn publish_module(
         &mut self,
         chain_client: &ChainClient<NodeProvider, S>,
         contract: PathBuf,
         service: PathBuf,
         vm_runtime: VmRuntime,
-    ) -> Result<BytecodeId, Error> {
+    ) -> Result<ModuleId, Error> {
         info!("Loading bytecode files");
         let contract_bytecode = Bytecode::load_from_file(&contract)
             .await
@@ -572,28 +563,28 @@ where
             .await
             .with_context(|| format!("failed to load service bytecode from {:?}", &service))?;
 
-        info!("Publishing bytecode");
-        let (contract_blob, service_blob, bytecode_id) =
+        info!("Publishing module");
+        let (contract_blob, service_blob, module_id) =
             create_bytecode_blobs(contract_bytecode, service_bytecode, vm_runtime).await;
-        let (bytecode_id, _) = self
+        let (module_id, _) = self
             .apply_client_command(chain_client, |chain_client| {
                 let contract_blob = contract_blob.clone();
                 let service_blob = service_blob.clone();
                 let chain_client = chain_client.clone();
                 async move {
                     chain_client
-                        .publish_bytecode_blobs(contract_blob, service_blob, bytecode_id)
+                        .publish_module_blobs(contract_blob, service_blob, module_id)
                         .await
-                        .context("Failed to publish bytecode")
+                        .context("Failed to publish module")
                 }
             })
             .await?;
 
-        info!("{}", "Bytecode published successfully!");
+        info!("{}", "Module published successfully!");
 
         info!("Synchronizing client and processing inbox");
         self.process_inbox(chain_client).await?;
-        Ok(bytecode_id)
+        Ok(module_id)
     }
 
     pub async fn publish_data_blob(
@@ -690,8 +681,7 @@ where
 
         if let Some(id) = fungible_application_id {
             let start = Instant::now();
-            self.supply_fungible_tokens(&key_pairs, id, &chain_clients)
-                .await?;
+            self.supply_fungible_tokens(&key_pairs, id).await?;
             info!(
                 "Supplied fungible tokens in {} ms",
                 start.elapsed().as_millis()
@@ -760,7 +750,7 @@ where
         Ok(certificates)
     }
 
-    /// Creates chains, and returns a map of exactly `num_chains` chain IDs
+    /// Creates chains if necessary, and returns a map of exactly `num_chains` chain IDs
     /// with key pairs, as well as a map of the chain clients.
     async fn make_benchmark_chains(
         &mut self,
@@ -773,7 +763,38 @@ where
         ),
         Error,
     > {
+        let mut benchmark_chains = HashMap::new();
+        let mut chain_clients = HashMap::new();
         let start = Instant::now();
+        for chain_id in self.wallet.owned_chain_ids() {
+            if benchmark_chains.len() == num_chains {
+                break;
+            }
+            // This should never panic, because `owned_chain_ids` only returns the owned chains that
+            // we have a key pair for.
+            let key_pair = self
+                .wallet
+                .get(chain_id)
+                .and_then(|chain| chain.key_pair.as_ref().map(|kp| kp.copy()))
+                .unwrap();
+            let chain_client = self.make_chain_client(chain_id)?;
+            let ownership = chain_client.chain_info().await?.manager.ownership;
+            if !ownership.owners.is_empty() || ownership.super_owners.len() != 1 {
+                continue;
+            }
+            benchmark_chains.insert(chain_client.chain_id(), key_pair);
+            chain_client.process_inbox().await?;
+            chain_clients.insert(chain_id, chain_client);
+        }
+        info!(
+            "Got {} chains from the wallet in {} ms",
+            benchmark_chains.len(),
+            start.elapsed().as_millis()
+        );
+
+        let chains_from_wallet = benchmark_chains.len();
+        let num_chains_to_create = num_chains - chains_from_wallet;
+
         let default_chain_id = self
             .wallet
             .default_chain()
@@ -781,17 +802,15 @@ where
         let operations_per_block = 900; // Over this we seem to hit the block size limits.
 
         let mut key_pairs = Vec::new();
-        for _ in (0..num_chains).step_by(operations_per_block) {
+        for _ in (0..num_chains_to_create).step_by(operations_per_block) {
             key_pairs.push(self.wallet.generate_key_pair());
         }
         let mut key_pairs_iter = key_pairs.into_iter();
         let admin_id = self.wallet.genesis_admin_chain();
         let default_chain_client = self.make_chain_client(default_chain_id)?;
 
-        let mut chain_clients = HashMap::new();
-        let mut benchmark_chains = HashMap::new();
-        for i in (0..num_chains).step_by(operations_per_block) {
-            let num_new_chains = operations_per_block.min(num_chains - i);
+        for i in (0..num_chains_to_create).step_by(operations_per_block) {
+            let num_new_chains = operations_per_block.min(num_chains_to_create - i);
             let key_pair = key_pairs_iter.next().unwrap();
 
             let certificate = Self::execute_open_chains_operations(
@@ -826,11 +845,13 @@ where
             }
         }
 
-        info!(
-            "Created {} chains in {} ms",
-            num_chains,
-            start.elapsed().as_millis()
-        );
+        if num_chains_to_create > 0 {
+            info!(
+                "Created {} chains in {} ms",
+                num_chains_to_create,
+                start.elapsed().as_millis()
+            );
+        }
 
         info!("Updating wallet from client");
         self.update_wallet_from_client(&default_chain_client)
@@ -840,7 +861,7 @@ where
             .retry_pending_outgoing_messages()
             .await
             .context("outgoing messages to create the new chains should be delivered")?;
-        info!("Processing inbox");
+        info!("Processing default chain inbox");
         default_chain_client.process_inbox().await?;
 
         Ok((benchmark_chains, chain_clients))
@@ -879,7 +900,6 @@ where
         &mut self,
         key_pairs: &HashMap<ChainId, AccountSecretKey>,
         application_id: ApplicationId,
-        chain_clients: &HashMap<ChainId, ChainClient<NodeProvider, S>>,
     ) -> Result<(), Error> {
         let default_chain_id = self
             .wallet
@@ -915,49 +935,6 @@ where
                 .expect("should execute block with Transfer operations");
         }
         self.update_wallet_from_client(&chain_client).await?;
-        // Make sure all chains have registered the application now.
-        let mut join_set = task::JoinSet::new();
-        for (chain_id, chain_client) in chain_clients.iter() {
-            let chain_id = *chain_id;
-            let chain_client = chain_client.clone();
-            join_set.spawn(async move {
-                let mut delay_ms = 0;
-                let mut total_delay_ms = 0;
-                loop {
-                    linera_base::time::timer::sleep(Duration::from_millis(delay_ms)).await;
-                    chain_client.process_inbox().await?;
-                    let chain_state = chain_client.chain_state_view().await?;
-                    if chain_state
-                        .execution_state
-                        .system
-                        .registry
-                        .known_applications
-                        .contains_key(&application_id)
-                        .await?
-                    {
-                        return Ok::<_, Error>(());
-                    }
-
-                    total_delay_ms += delay_ms;
-                    // If we've been waiting already for more than 10 seconds, give up.
-                    if total_delay_ms > 10_000 {
-                        break;
-                    }
-
-                    if delay_ms == 0 {
-                        delay_ms = 100;
-                    } else {
-                        delay_ms *= 2;
-                    }
-                }
-                panic!("Could not instantiate application on chain {chain_id:?}");
-            });
-        }
-        join_set
-            .join_all()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(())
     }

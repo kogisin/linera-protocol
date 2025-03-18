@@ -47,6 +47,14 @@ input ApplicationPermissions {
 	These applications are allowed to change the application permissions using the system API.
 	"""
 	changeApplicationPermissions: [ApplicationId!]! = []
+	"""
+	These applications are allowed to perform calls to services as oracles.
+	"""
+	callServiceAsOracle: [ApplicationId!] = null
+	"""
+	These applications are allowed to perform HTTP requests.
+	"""
+	makeHttpRequests: [ApplicationId!] = null
 }
 
 """
@@ -103,6 +111,14 @@ type BlockBody {
 	The list of events produced by each transaction.
 	"""
 	events: [[Event!]!]!
+	"""
+	The list of blobs produced by each transaction.
+	"""
+	blobs: [[Blob!]!]!
+	"""
+	The execution result for each operation.
+	"""
+	operationResults: [OperationResult!]!
 }
 
 """
@@ -162,6 +178,14 @@ type BlockHeader {
 	Cryptographic hash of all the events in the block.
 	"""
 	eventsHash: CryptoHash!
+	"""
+	Cryptographic hash of all the created blobs in the block.
+	"""
+	blobsHash: CryptoHash!
+	"""
+	A cryptographic hash of the execution results of all operations in a block.
+	"""
+	operationResultsHash: CryptoHash!
 }
 
 """
@@ -188,11 +212,6 @@ type BundleInInbox {
 A WebAssembly module's bytecode
 """
 scalar Bytecode
-
-"""
-A unique identifier for an application bytecode
-"""
-scalar BytecodeId
 
 """
 A chain ID with a block height.
@@ -710,6 +729,11 @@ The kind of outgoing message being sent
 """
 scalar MessageKind
 
+"""
+A unique identifier for an application module
+"""
+scalar ModuleId
+
 type MutationRoot {
 	"""
 	Processes the inbox and returns the lists of certificate hashes that were created, if any.
@@ -723,7 +747,7 @@ type MutationRoot {
 	Transfers `amount` units of value from the given owner's account to the recipient.
 	If no owner is given, try to take the units out of the unattributed account.
 	"""
-	transfer(chainId: ChainId!, owner: Owner, recipient: Recipient!, amount: Amount!): CryptoHash!
+	transfer(chainId: ChainId!, owner: AccountOwner!, recipient: Recipient!, amount: Amount!): CryptoHash!
 	"""
 	Claims `amount` units of value from the given owner's account in the remote
 	`target` chain. Depending on its configuration, the `target` chain may refuse to
@@ -793,13 +817,13 @@ type MutationRoot {
 	"""
 	Changes the application permissions configuration on this chain.
 	"""
-	changeApplicationPermissions(chainId: ChainId!, closeChain: [ApplicationId!]!, executeOperations: [ApplicationId!], mandatoryApplications: [ApplicationId!]!, changeApplicationPermissions: [ApplicationId!]!): CryptoHash!
+	changeApplicationPermissions(chainId: ChainId!, closeChain: [ApplicationId!]!, executeOperations: [ApplicationId!], mandatoryApplications: [ApplicationId!]!, changeApplicationPermissions: [ApplicationId!]!, callServiceAsOracle: [ApplicationId!], makeHttpRequests: [ApplicationId!]): CryptoHash!
 	"""
 	(admin chain only) Registers a new committee. This will notify the subscribers of
 	the admin chain so that they can migrate to the new epoch (by accepting the
 	notification as an "incoming message" in a next block).
 	"""
-	createCommittee(chainId: ChainId!, epoch: Epoch!, committee: Committee!): CryptoHash!
+	createCommittee(chainId: ChainId!, committee: Committee!): CryptoHash!
 	"""
 	Subscribes to a system channel.
 	"""
@@ -815,9 +839,9 @@ type MutationRoot {
 	"""
 	removeCommittee(chainId: ChainId!, epoch: Epoch!): CryptoHash!
 	"""
-	Publishes a new application bytecode.
+	Publishes a new application module.
 	"""
-	publishBytecode(chainId: ChainId!, contract: Bytecode!, service: Bytecode!, vmRuntime: VmRuntime!): BytecodeId!
+	publishModule(chainId: ChainId!, contract: Bytecode!, service: Bytecode!, vmRuntime: VmRuntime!): ModuleId!
 	"""
 	Publishes a new data blob.
 	"""
@@ -825,12 +849,7 @@ type MutationRoot {
 	"""
 	Creates a new application.
 	"""
-	createApplication(chainId: ChainId!, bytecodeId: BytecodeId!, parameters: String!, instantiationArgument: String!, requiredApplicationIds: [ApplicationId!]!): ApplicationId!
-	"""
-	Requests a `RegisterApplications` message from another chain so the application can be used
-	on this one.
-	"""
-	requestApplication(chainId: ChainId!, applicationId: ApplicationId!, targetChainId: ChainId): CryptoHash!
+	createApplication(chainId: ChainId!, moduleId: ModuleId!, parameters: String!, instantiationArgument: String!, requiredApplicationIds: [ApplicationId!]!): ApplicationId!
 }
 
 """
@@ -842,6 +861,11 @@ scalar Notification
 An operation to be executed in a block
 """
 scalar Operation
+
+"""
+The execution result of a single operation.
+"""
+scalar OperationResult
 
 """
 A record of a single oracle response.
@@ -1063,9 +1087,21 @@ input ResourceControlPolicy {
 	"""
 	messageByte: Amount!
 	"""
+	The price per query to a service as an oracle.
+	"""
+	serviceAsOracleQuery: Amount!
+	"""
+	The price for a performing an HTTP request.
+	"""
+	httpRequest: Amount!
+	"""
 	The maximum amount of fuel a block can consume.
 	"""
 	maximumFuelPerBlock: Int!
+	"""
+	The maximum time in milliseconds that a block can spend executing services as oracles.
+	"""
+	maximumServiceOracleExecutionMs: Int!
 	"""
 	The maximum size of an executed block. This includes the block proposal itself as well as
 	the execution outcome.
@@ -1095,6 +1131,18 @@ input ResourceControlPolicy {
 	The maximum data to write per block
 	"""
 	maximumBytesWrittenPerBlock: Int!
+	"""
+	The maximum size in bytes of a received HTTP response.
+	"""
+	maximumHttpResponseBytes: Int!
+	"""
+	The maximum amount of time allowed to wait for an HTTP response.
+	"""
+	httpRequestTimeoutMs: Int!
+	"""
+	The list of hosts that contracts and services can send HTTP requests to.
+	"""
+	httpRequestAllowList: [String!]!
 }
 
 """

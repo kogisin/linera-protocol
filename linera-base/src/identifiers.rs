@@ -37,7 +37,9 @@ pub enum AccountOwner {
     /// An account owned by a user.
     User(Owner),
     /// An account for an application.
-    Application(ApplicationId),
+    Application(UserApplicationId),
+    /// Chain account.
+    Chain,
 }
 
 /// A system account.
@@ -48,8 +50,7 @@ pub struct Account {
     /// The chain of the account.
     pub chain_id: ChainId,
     /// The owner of the account, or `None` for the chain balance.
-    #[debug(skip_if = Option::is_none)]
-    pub owner: Option<AccountOwner>,
+    pub owner: AccountOwner,
 }
 
 impl Account {
@@ -57,7 +58,7 @@ impl Account {
     pub fn chain(chain_id: ChainId) -> Self {
         Account {
             chain_id,
-            owner: None,
+            owner: AccountOwner::Chain,
         }
     }
 
@@ -65,17 +66,14 @@ impl Account {
     pub fn owner(chain_id: ChainId, owner: impl Into<AccountOwner>) -> Self {
         Account {
             chain_id,
-            owner: Some(owner.into()),
+            owner: owner.into(),
         }
     }
 }
 
 impl Display for Account {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.owner {
-            Some(owner) => write!(f, "{}:{}", self.chain_id, owner),
-            None => write!(f, "{}", self.chain_id),
-        }
+        write!(f, "{}:{}", self.chain_id, self.owner)
     }
 }
 
@@ -164,6 +162,10 @@ pub enum BlobType {
     ContractBytecode,
     /// A blob containing compressed service bytecode.
     ServiceBytecode,
+    /// A blob containing an application description.
+    ApplicationDescription,
+    /// A blob containing a committee of validators.
+    Committee,
 }
 
 impl Display for BlobType {
@@ -289,19 +291,20 @@ pub struct MessageId {
     pub index: u32,
 }
 
-/// A unique identifier for a user application.
+/// A unique identifier for a user application from a blob.
 #[derive(Debug, WitLoad, WitStore, WitType)]
 #[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
 pub struct ApplicationId<A = ()> {
-    /// The bytecode to use for the application.
-    pub bytecode_id: BytecodeId<A>,
-    /// The unique ID of the application's creation.
-    pub creation: MessageId,
+    /// The hash of the `UserApplicationDescription` this refers to.
+    pub application_description_hash: CryptoHash,
+    #[witty(skip)]
+    #[debug(skip)]
+    _phantom: PhantomData<A>,
 }
 
 /// Alias for `ApplicationId`. Use this alias in the core
 /// protocol where the distinction with the more general enum `GenericApplicationId` matters.
-pub type UserApplicationId<A = ()> = ApplicationId<A>;
+pub type UserApplicationId = ApplicationId<()>;
 
 /// A unique identifier for an application.
 #[derive(
@@ -323,7 +326,7 @@ pub enum GenericApplicationId {
     /// The system application.
     System,
     /// A user application.
-    User(ApplicationId),
+    User(UserApplicationId),
 }
 
 impl GenericApplicationId {
@@ -343,10 +346,10 @@ impl From<ApplicationId> for GenericApplicationId {
     }
 }
 
-/// A unique identifier for an application bytecode.
+/// A unique identifier for a module.
 #[derive(Debug, WitLoad, WitStore, WitType)]
 #[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
-pub struct BytecodeId<Abi = (), Parameters = (), InstantiationArgument = ()> {
+pub struct ModuleId<Abi = (), Parameters = (), InstantiationArgument = ()> {
     /// The hash of the blob containing the contract bytecode.
     pub contract_blob_hash: CryptoHash,
     /// The hash of the blob containing the service bytecode.
@@ -437,6 +440,15 @@ pub struct StreamName(
     pub Vec<u8>,
 );
 
+impl<T> From<T> for StreamName
+where
+    T: Into<Vec<u8>>,
+{
+    fn from(name: T) -> Self {
+        StreamName(name.into())
+    }
+}
+
 /// An event stream ID.
 #[derive(
     Clone,
@@ -458,6 +470,16 @@ pub struct StreamId {
     pub application_id: GenericApplicationId,
     /// The name of this stream: an application can have multiple streams with different names.
     pub stream_name: StreamName,
+}
+
+impl StreamId {
+    /// Creates a system stream ID with the given name.
+    pub fn system(name: impl Into<StreamName>) -> Self {
+        StreamId {
+            application_id: GenericApplicationId::System,
+            stream_name: name.into(),
+        }
+    }
 }
 
 /// An event identifier.
@@ -552,7 +574,7 @@ impl StreamName {
 
 // Cannot use #[derive(Clone)] because it requires `A: Clone`.
 impl<Abi, Parameters, InstantiationArgument> Clone
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn clone(&self) -> Self {
         *self
@@ -560,15 +582,15 @@ impl<Abi, Parameters, InstantiationArgument> Clone
 }
 
 impl<Abi, Parameters, InstantiationArgument> Copy
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
 }
 
 impl<Abi, Parameters, InstantiationArgument> PartialEq
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn eq(&self, other: &Self) -> bool {
-        let BytecodeId {
+        let ModuleId {
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
@@ -581,12 +603,12 @@ impl<Abi, Parameters, InstantiationArgument> PartialEq
 }
 
 impl<Abi, Parameters, InstantiationArgument> Eq
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
 }
 
 impl<Abi, Parameters, InstantiationArgument> PartialOrd
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -594,10 +616,10 @@ impl<Abi, Parameters, InstantiationArgument> PartialOrd
 }
 
 impl<Abi, Parameters, InstantiationArgument> Ord
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let BytecodeId {
+        let ModuleId {
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
@@ -613,10 +635,10 @@ impl<Abi, Parameters, InstantiationArgument> Ord
 }
 
 impl<Abi, Parameters, InstantiationArgument> Hash
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let BytecodeId {
+        let ModuleId {
             contract_blob_hash: contract_blob_id,
             service_blob_hash: service_blob_id,
             vm_runtime: vm_runtime_id,
@@ -629,37 +651,37 @@ impl<Abi, Parameters, InstantiationArgument> Hash
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename = "BytecodeId")]
-struct SerializableBytecodeId {
+#[serde(rename = "ModuleId")]
+struct SerializableModuleId {
     contract_blob_hash: CryptoHash,
     service_blob_hash: CryptoHash,
     vm_runtime: VmRuntime,
 }
 
 impl<Abi, Parameters, InstantiationArgument> Serialize
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::ser::Serializer,
     {
-        let serializable_bytecode_id = SerializableBytecodeId {
+        let serializable_module_id = SerializableModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
         };
         if serializer.is_human_readable() {
             let bytes =
-                bcs::to_bytes(&serializable_bytecode_id).map_err(serde::ser::Error::custom)?;
+                bcs::to_bytes(&serializable_module_id).map_err(serde::ser::Error::custom)?;
             serializer.serialize_str(&hex::encode(bytes))
         } else {
-            SerializableBytecodeId::serialize(&serializable_bytecode_id, serializer)
+            SerializableModuleId::serialize(&serializable_module_id, serializer)
         }
     }
 }
 
 impl<'de, Abi, Parameters, InstantiationArgument> Deserialize<'de>
-    for BytecodeId<Abi, Parameters, InstantiationArgument>
+    for ModuleId<Abi, Parameters, InstantiationArgument>
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -667,35 +689,35 @@ impl<'de, Abi, Parameters, InstantiationArgument> Deserialize<'de>
     {
         if deserializer.is_human_readable() {
             let s = String::deserialize(deserializer)?;
-            let bytecode_id_bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
-            let serializable_bytecode_id: SerializableBytecodeId =
-                bcs::from_bytes(&bytecode_id_bytes).map_err(serde::de::Error::custom)?;
-            Ok(BytecodeId {
-                contract_blob_hash: serializable_bytecode_id.contract_blob_hash,
-                service_blob_hash: serializable_bytecode_id.service_blob_hash,
-                vm_runtime: serializable_bytecode_id.vm_runtime,
+            let module_id_bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+            let serializable_module_id: SerializableModuleId =
+                bcs::from_bytes(&module_id_bytes).map_err(serde::de::Error::custom)?;
+            Ok(ModuleId {
+                contract_blob_hash: serializable_module_id.contract_blob_hash,
+                service_blob_hash: serializable_module_id.service_blob_hash,
+                vm_runtime: serializable_module_id.vm_runtime,
                 _phantom: PhantomData,
             })
         } else {
-            let serializable_bytecode_id = SerializableBytecodeId::deserialize(deserializer)?;
-            Ok(BytecodeId {
-                contract_blob_hash: serializable_bytecode_id.contract_blob_hash,
-                service_blob_hash: serializable_bytecode_id.service_blob_hash,
-                vm_runtime: serializable_bytecode_id.vm_runtime,
+            let serializable_module_id = SerializableModuleId::deserialize(deserializer)?;
+            Ok(ModuleId {
+                contract_blob_hash: serializable_module_id.contract_blob_hash,
+                service_blob_hash: serializable_module_id.service_blob_hash,
+                vm_runtime: serializable_module_id.vm_runtime,
                 _phantom: PhantomData,
             })
         }
     }
 }
 
-impl BytecodeId {
-    /// Creates a bytecode ID from contract/service hashes and the VM runtime to use.
+impl ModuleId {
+    /// Creates a module ID from contract/service hashes and the VM runtime to use.
     pub fn new(
         contract_blob_hash: CryptoHash,
         service_blob_hash: CryptoHash,
         vm_runtime: VmRuntime,
     ) -> Self {
-        BytecodeId {
+        ModuleId {
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
@@ -703,11 +725,11 @@ impl BytecodeId {
         }
     }
 
-    /// Specializes a bytecode ID for a given ABI.
+    /// Specializes a module ID for a given ABI.
     pub fn with_abi<Abi, Parameters, InstantiationArgument>(
         self,
-    ) -> BytecodeId<Abi, Parameters, InstantiationArgument> {
-        BytecodeId {
+    ) -> ModuleId<Abi, Parameters, InstantiationArgument> {
+        ModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
@@ -716,10 +738,10 @@ impl BytecodeId {
     }
 }
 
-impl<Abi, Parameters, InstantiationArgument> BytecodeId<Abi, Parameters, InstantiationArgument> {
-    /// Forgets the ABI of a bytecode ID (if any).
-    pub fn forget_abi(self) -> BytecodeId {
-        BytecodeId {
+impl<Abi, Parameters, InstantiationArgument> ModuleId<Abi, Parameters, InstantiationArgument> {
+    /// Forgets the ABI of a module ID (if any).
+    pub fn forget_abi(self) -> ModuleId {
+        ModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
@@ -727,9 +749,9 @@ impl<Abi, Parameters, InstantiationArgument> BytecodeId<Abi, Parameters, Instant
         }
     }
 
-    /// Leaves just the ABI of a bytecode ID (if any).
-    pub fn just_abi(self) -> BytecodeId<Abi> {
-        BytecodeId {
+    /// Leaves just the ABI of a module ID (if any).
+    pub fn just_abi(self) -> ModuleId<Abi> {
+        ModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
@@ -749,11 +771,7 @@ impl<A> Copy for ApplicationId<A> {}
 
 impl<A: PartialEq> PartialEq for ApplicationId<A> {
     fn eq(&self, other: &Self) -> bool {
-        let ApplicationId {
-            bytecode_id,
-            creation,
-        } = other;
-        self.bytecode_id == *bytecode_id && self.creation == *creation
+        self.application_description_hash == other.application_description_hash
     }
 }
 
@@ -761,46 +779,28 @@ impl<A: Eq> Eq for ApplicationId<A> {}
 
 impl<A: PartialOrd> PartialOrd for ApplicationId<A> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        let ApplicationId {
-            bytecode_id,
-            creation,
-        } = other;
-        match self.bytecode_id.partial_cmp(bytecode_id) {
-            Some(std::cmp::Ordering::Equal) => self.creation.partial_cmp(creation),
-            result => result,
-        }
+        self.application_description_hash
+            .partial_cmp(&other.application_description_hash)
     }
 }
 
 impl<A: Ord> Ord for ApplicationId<A> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let ApplicationId {
-            bytecode_id,
-            creation,
-        } = other;
-        match self.bytecode_id.cmp(bytecode_id) {
-            std::cmp::Ordering::Equal => self.creation.cmp(creation),
-            result => result,
-        }
+        self.application_description_hash
+            .cmp(&other.application_description_hash)
     }
 }
 
 impl<A> Hash for ApplicationId<A> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let ApplicationId {
-            bytecode_id,
-            creation,
-        } = self;
-        bytecode_id.hash(state);
-        creation.hash(state);
+        self.application_description_hash.hash(state);
     }
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename = "ApplicationId")]
 struct SerializableApplicationId {
-    pub bytecode_id: BytecodeId,
-    pub creation: MessageId,
+    pub application_description_hash: CryptoHash,
 }
 
 impl<A> Serialize for ApplicationId<A> {
@@ -810,16 +810,14 @@ impl<A> Serialize for ApplicationId<A> {
     {
         if serializer.is_human_readable() {
             let bytes = bcs::to_bytes(&SerializableApplicationId {
-                bytecode_id: self.bytecode_id.forget_abi(),
-                creation: self.creation,
+                application_description_hash: self.application_description_hash,
             })
             .map_err(serde::ser::Error::custom)?;
             serializer.serialize_str(&hex::encode(bytes))
         } else {
             SerializableApplicationId::serialize(
                 &SerializableApplicationId {
-                    bytecode_id: self.bytecode_id.forget_abi(),
-                    creation: self.creation,
+                    application_description_hash: self.application_description_hash,
                 },
                 serializer,
             )
@@ -838,36 +836,53 @@ impl<'de, A> Deserialize<'de> for ApplicationId<A> {
             let application_id: SerializableApplicationId =
                 bcs::from_bytes(&application_id_bytes).map_err(serde::de::Error::custom)?;
             Ok(ApplicationId {
-                bytecode_id: application_id.bytecode_id.with_abi(),
-                creation: application_id.creation,
+                application_description_hash: application_id.application_description_hash,
+                _phantom: PhantomData,
             })
         } else {
             let value = SerializableApplicationId::deserialize(deserializer)?;
             Ok(ApplicationId {
-                bytecode_id: value.bytecode_id.with_abi(),
-                creation: value.creation,
+                application_description_hash: value.application_description_hash,
+                _phantom: PhantomData,
             })
         }
     }
 }
 
 impl ApplicationId {
+    /// Creates an application ID from the application description hash.
+    pub fn new(application_description_hash: CryptoHash) -> Self {
+        ApplicationId {
+            application_description_hash,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Specializes an application ID for a given ABI.
     pub fn with_abi<A>(self) -> ApplicationId<A> {
         ApplicationId {
-            bytecode_id: self.bytecode_id.with_abi(),
-            creation: self.creation,
+            application_description_hash: self.application_description_hash,
+            _phantom: PhantomData,
         }
     }
 }
 
 impl<A> ApplicationId<A> {
-    /// Forgets the ABI of a bytecode ID (if any).
+    /// Forgets the ABI of a module ID (if any).
     pub fn forget_abi(self) -> ApplicationId {
         ApplicationId {
-            bytecode_id: self.bytecode_id.forget_abi(),
-            creation: self.creation,
+            application_description_hash: self.application_description_hash,
+            _phantom: PhantomData,
         }
+    }
+
+    /// Converts the application ID to the ID of the blob containing the
+    /// `UserApplicationDescription`.
+    pub fn description_blob_id(self) -> BlobId {
+        BlobId::new(
+            self.application_description_hash,
+            BlobType::ApplicationDescription,
+        )
     }
 }
 
@@ -934,6 +949,7 @@ impl<'de> serde::de::Visitor<'de> for OwnerVisitor {
 enum SerializableAccountOwner {
     User(Owner),
     Application(ApplicationId),
+    Chain,
 }
 
 impl Serialize for AccountOwner {
@@ -944,6 +960,7 @@ impl Serialize for AccountOwner {
             match self {
                 AccountOwner::Application(app_id) => SerializableAccountOwner::Application(*app_id),
                 AccountOwner::User(owner) => SerializableAccountOwner::User(*owner),
+                AccountOwner::Chain => SerializableAccountOwner::Chain,
             }
             .serialize(serializer)
         }
@@ -963,6 +980,7 @@ impl<'de> Deserialize<'de> for AccountOwner {
                     Ok(AccountOwner::Application(app_id))
                 }
                 SerializableAccountOwner::User(owner) => Ok(AccountOwner::User(owner)),
+                SerializableAccountOwner::Chain => Ok(AccountOwner::Chain),
             }
         }
     }
@@ -973,6 +991,7 @@ impl Display for AccountOwner {
         match self {
             AccountOwner::User(owner) => write!(f, "User:{}", owner)?,
             AccountOwner::Application(app_id) => write!(f, "Application:{}", app_id)?,
+            AccountOwner::Chain => write!(f, "Chain")?,
         };
 
         Ok(())
@@ -991,6 +1010,8 @@ impl FromStr for AccountOwner {
             Ok(AccountOwner::Application(
                 ApplicationId::from_str(app_id).context("Getting ApplicationId should not fail")?,
             ))
+        } else if s.strip_prefix("Chain").is_some() {
+            Ok(AccountOwner::Chain)
         } else {
             Err(anyhow!("Invalid enum! Enum: {}", s))
         }
@@ -1059,10 +1080,7 @@ doc_scalar!(
     GenericApplicationId,
     "A unique identifier for a user application or for the system application"
 );
-bcs_scalar!(
-    BytecodeId,
-    "A unique identifier for an application bytecode"
-);
+bcs_scalar!(ModuleId, "A unique identifier for an application module");
 doc_scalar!(ChainDescription, "How to create a chain");
 doc_scalar!(
     ChainId,

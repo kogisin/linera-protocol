@@ -41,7 +41,9 @@ wasmtime = [
 web = ["linera-base/web", "linera-views/web", "js-sys"]
 
 [dependencies]
-alloy = { workspace = true, default-features = false, optional = true, features = [ "rpc-types-eth" ] }
+alloy = { workspace = true, default-features = false, optional = true, features = [
+    "rpc-types-eth",
+] }
 alloy-sol-types = { workspace = true, optional = true }
 anyhow.workspace = true
 async-graphql.workspace = true
@@ -64,7 +66,7 @@ lru.workspace = true
 oneshot.workspace = true
 prometheus = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
-reqwest = { workspace = true, features = ["blocking", "json"] }
+reqwest = { workspace = true, features = ["blocking", "json", "stream"] }
 revm = { workspace = true, optional = true, features = ["serde"] }
 revm-primitives = { workspace = true, optional = true }
 serde.workspace = true
@@ -73,6 +75,7 @@ serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing = { workspace = true, features = ["log"] }
+url.workspace = true
 wasm-encoder = { workspace = true, optional = true }
 wasm-instrument = { workspace = true, optional = true, features = ["sign_ext"] }
 wasmparser = { workspace = true, optional = true }
@@ -80,7 +83,10 @@ wasmtime = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-wasmer = { workspace = true, optional = true, features = ["cranelift", "singlepass"] }
+wasmer = { workspace = true, optional = true, features = [
+    "cranelift",
+    "singlepass",
+] }
 wasmer-compiler-singlepass.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -92,7 +98,10 @@ anyhow.workspace = true
 assert_matches.workspace = true
 bcs.workspace = true
 linera-base = { workspace = true, features = ["test"] }
-linera-execution = { path = ".", default-features = false, features = ["fs", "test"] }
+linera-execution = { path = ".", default-features = false, features = [
+    "fs",
+    "test",
+] }
 linera-witty = { workspace = true, features = ["log", "macros", "test"] }
 proptest.workspace = true
 test-case.workspace = true
@@ -107,3 +116,8 @@ cfg_aliases.workspace = true
 
 [package.metadata.cargo-machete]
 ignored = ["serde_bytes"]
+
+[[bin]]
+name = "wit-generator"
+path = "src/bin/wit_generator.rs"
+required-features = ["wasmer"]

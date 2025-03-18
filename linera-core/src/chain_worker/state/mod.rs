@@ -200,6 +200,7 @@ where
     }
 
     /// Handles a proposal for the next block for this chain.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn handle_block_proposal(
         &mut self,
         proposal: BlockProposal,
@@ -235,6 +236,7 @@ where
     }
 
     /// Processes a validated block issued for this multi-owner chain.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn process_validated_block(
         &mut self,
         certificate: ValidatedBlockCertificate,
@@ -246,6 +248,7 @@ where
     }
 
     /// Processes a confirmed block (aka a commit).
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn process_confirmed_block(
         &mut self,
         certificate: ConfirmedBlockCertificate,
@@ -258,6 +261,7 @@ where
     }
 
     /// Updates the chain's inboxes, receiving messages from a cross-chain update.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn process_cross_chain_update(
         &mut self,
         origin: Origin,
@@ -281,6 +285,7 @@ where
     }
 
     /// Handles a [`ChainInfoQuery`], potentially voting on the next block.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn handle_chain_info_query(
         &mut self,
         query: ChainInfoQuery,
@@ -315,6 +320,7 @@ where
     }
 
     /// Adds the blob to pending blocks or validated block certificates that are missing it.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub(super) async fn handle_pending_blob(
         &mut self,
         blob: Blob,
@@ -339,8 +345,11 @@ where
     async fn get_required_blobs(
         &self,
         required_blob_ids: impl IntoIterator<Item = BlobId>,
+        created_blobs: &BTreeMap<BlobId, Blob>,
     ) -> Result<BTreeMap<BlobId, Blob>, WorkerError> {
-        let maybe_blobs = self.maybe_get_required_blobs(required_blob_ids).await?;
+        let maybe_blobs = self
+            .maybe_get_required_blobs(required_blob_ids, Some(created_blobs))
+            .await?;
         let not_found_blob_ids = missing_blob_ids(&maybe_blobs);
         ensure!(
             not_found_blob_ids.is_empty(),
@@ -356,11 +365,14 @@ where
     async fn maybe_get_required_blobs(
         &self,
         blob_ids: impl IntoIterator<Item = BlobId>,
+        created_blobs: Option<&BTreeMap<BlobId, Blob>>,
     ) -> Result<BTreeMap<BlobId, Option<Blob>>, WorkerError> {
         let mut maybe_blobs = BTreeMap::from_iter(blob_ids.into_iter().zip(iter::repeat(None)));
 
         for (blob_id, maybe_blob) in &mut maybe_blobs {
-            if let Some(blob) = self.chain.manager.pending_blob(blob_id).await? {
+            if let Some(blob) = created_blobs.and_then(|blob_map| blob_map.get(blob_id)) {
+                *maybe_blob = Some(blob.clone());
+            } else if let Some(blob) = self.chain.manager.pending_blob(blob_id).await? {
                 *maybe_blob = Some(blob);
             } else if let Some(blob) = self.chain.pending_validated_blobs.get(blob_id).await? {
                 *maybe_blob = Some(blob);
@@ -567,7 +579,7 @@ fn missing_blob_ids(maybe_blobs: &BTreeMap<BlobId, Option<Blob>>) -> Vec<BlobId>
     maybe_blobs
         .iter()
         .filter(|(_, maybe_blob)| maybe_blob.is_none())
-        .map(|(chain_id, _)| *chain_id)
+        .map(|(blob_id, _)| *blob_id)
         .collect()
 }
 

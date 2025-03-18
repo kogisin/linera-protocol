@@ -3,7 +3,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     env,
     marker::PhantomData,
     mem,
@@ -23,7 +23,7 @@ use linera_base::{
     command::{resolve_binary, CommandExt},
     crypto::CryptoHash,
     data_types::{Amount, Bytecode},
-    identifiers::{Account, ApplicationId, BytecodeId, ChainId, MessageId, Owner},
+    identifiers::{Account, ApplicationId, ChainId, MessageId, ModuleId, Owner},
     vm::VmRuntime,
 };
 use linera_client::{client_options::ResourceControlPolicyConfig, wallet::Wallet};
@@ -238,6 +238,7 @@ impl ClientWrapper {
         num_other_initial_chains: u32,
         initial_funding: Amount,
         policy_config: ResourceControlPolicyConfig,
+        http_allow_list: Option<Vec<String>>,
     ) -> Result<()> {
         let mut command = self.command().await?;
         command
@@ -252,7 +253,9 @@ impl ClientWrapper {
                 "--policy-config",
                 &policy_config.to_string().to_kebab_case(),
             ]);
-
+        if let Some(allow_list) = http_allow_list {
+            command.arg("--http-allow-list").arg(allow_list.join(","));
+        }
         if let Some(seed) = self.testing_prng_seed {
             command.arg("--testing-prng-seed").arg(seed.to_string());
         }
@@ -342,6 +345,7 @@ impl ClientWrapper {
     }
 
     /// Runs `linera wallet publish-and-create`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_and_create<
         A: ContractAbi,
         Parameters: Serialize,
@@ -350,6 +354,7 @@ impl ClientWrapper {
         &self,
         contract: PathBuf,
         service: PathBuf,
+        vm_runtime: VmRuntime,
         parameters: &Parameters,
         argument: &InstantiationArgument,
         required_application_ids: &[ApplicationId],
@@ -358,9 +363,11 @@ impl ClientWrapper {
         let json_parameters = serde_json::to_string(parameters)?;
         let json_argument = serde_json::to_string(argument)?;
         let mut command = self.command().await?;
+        let vm_runtime = format!("{}", vm_runtime);
         command
             .arg("publish-and-create")
             .args([contract, service])
+            .args(["--vm-runtime", &vm_runtime.to_lowercase()])
             .args(publisher.into().iter().map(ChainId::to_string))
             .args(["--json-parameters", &json_parameters])
             .args(["--json-argument", &json_argument]);
@@ -376,23 +383,23 @@ impl ClientWrapper {
         Ok(stdout.trim().parse::<ApplicationId>()?.with_abi())
     }
 
-    /// Runs `linera publish-bytecode`.
-    pub async fn publish_bytecode<Abi, Parameters, InstantiationArgument>(
+    /// Runs `linera publish-module`.
+    pub async fn publish_module<Abi, Parameters, InstantiationArgument>(
         &self,
         contract: PathBuf,
         service: PathBuf,
         publisher: impl Into<Option<ChainId>>,
-    ) -> Result<BytecodeId<Abi, Parameters, InstantiationArgument>> {
+    ) -> Result<ModuleId<Abi, Parameters, InstantiationArgument>> {
         let stdout = self
             .command()
             .await?
-            .arg("publish-bytecode")
+            .arg("publish-module")
             .args([contract, service])
             .args(publisher.into().iter().map(ChainId::to_string))
             .spawn_and_wait_for_stdout()
             .await?;
-        let bytecode_id: BytecodeId = stdout.trim().parse()?;
-        Ok(bytecode_id.with_abi())
+        let module_id: ModuleId = stdout.trim().parse()?;
+        Ok(module_id.with_abi())
     }
 
     /// Runs `linera create-application`.
@@ -402,7 +409,7 @@ impl ClientWrapper {
         InstantiationArgument: Serialize,
     >(
         &self,
-        bytecode_id: &BytecodeId<Abi, Parameters, InstantiationArgument>,
+        module_id: &ModuleId<Abi, Parameters, InstantiationArgument>,
         parameters: &Parameters,
         argument: &InstantiationArgument,
         required_application_ids: &[ApplicationId],
@@ -413,7 +420,7 @@ impl ClientWrapper {
         let mut command = self.command().await?;
         command
             .arg("create-application")
-            .arg(bytecode_id.forget_abi().to_string())
+            .arg(module_id.forget_abi().to_string())
             .args(["--json-parameters", &json_parameters])
             .args(["--json-argument", &json_argument])
             .args(creator.into().iter().map(ChainId::to_string));
@@ -427,25 +434,6 @@ impl ClientWrapper {
         }
         let stdout = command.spawn_and_wait_for_stdout().await?;
         Ok(stdout.trim().parse::<ApplicationId>()?.with_abi())
-    }
-
-    /// Runs `linera request-application`
-    pub async fn request_application(
-        &self,
-        application_id: ApplicationId,
-        requester_chain_id: ChainId,
-        target_chain_id: Option<ChainId>,
-    ) -> Result<BytecodeId> {
-        let mut command = self.command().await?;
-        command
-            .arg("request-application")
-            .arg(application_id.to_string())
-            .args(["--requester-chain-id", &requester_chain_id.to_string()]);
-        if let Some(target_chain_id) = target_chain_id {
-            command.args(["--target-chain-id", &target_chain_id.to_string()]);
-        }
-        let stdout = command.spawn_and_wait_for_stdout().await?;
-        Ok(stdout.trim().parse()?)
     }
 
     /// Runs `linera service`.
@@ -1118,35 +1106,11 @@ impl NodeService {
         application_id: &ApplicationId<A>,
     ) -> Result<ApplicationWrapper<A>> {
         let application_id = application_id.forget_abi().to_string();
-        let values = self.try_get_applications_uri(chain_id).await?;
-        let Some(link) = values.get(&application_id) else {
-            bail!("Could not find application URI: {application_id}");
-        };
-        Ok(ApplicationWrapper::from(link.to_string()))
-    }
-
-    pub async fn try_get_applications_uri(
-        &self,
-        chain_id: &ChainId,
-    ) -> Result<HashMap<String, String>> {
-        let query = format!("query {{ applications(chainId: \"{chain_id}\") {{ id link }}}}");
-        let data = self.query_node(query).await?;
-        data["applications"]
-            .as_array()
-            .context("missing applications in response")?
-            .iter()
-            .map(|a| {
-                let id = a["id"]
-                    .as_str()
-                    .context("missing id field in response")?
-                    .to_string();
-                let link = a["link"]
-                    .as_str()
-                    .context("missing link field in response")?
-                    .to_string();
-                Ok((id, link))
-            })
-            .collect()
+        let link = format!(
+            "http://localhost:{}/chains/{chain_id}/applications/{application_id}",
+            self.port
+        );
+        Ok(ApplicationWrapper::from(link))
     }
 
     pub async fn publish_data_blob(
@@ -1164,30 +1128,28 @@ impl NodeService {
             .context("missing publishDataBlob field in response")
     }
 
-    pub async fn publish_bytecode<Abi, Parameters, InstantiationArgument>(
+    pub async fn publish_module<Abi, Parameters, InstantiationArgument>(
         &self,
         chain_id: &ChainId,
         contract: PathBuf,
         service: PathBuf,
         vm_runtime: VmRuntime,
-    ) -> Result<BytecodeId<Abi, Parameters, InstantiationArgument>> {
+    ) -> Result<ModuleId<Abi, Parameters, InstantiationArgument>> {
         let contract_code = Bytecode::load_from_file(&contract).await?;
         let service_code = Bytecode::load_from_file(&service).await?;
         let query = format!(
-            "mutation {{ publishBytecode(chainId: {}, contract: {}, service: {}, vmRuntime: {}) }}",
+            "mutation {{ publishModule(chainId: {}, contract: {}, service: {}, vmRuntime: {}) }}",
             chain_id.to_value(),
             contract_code.to_value(),
             service_code.to_value(),
             vm_runtime.to_value(),
         );
         let data = self.query_node(query).await?;
-        let bytecode_str = data["publishBytecode"]
+        let module_str = data["publishModule"]
             .as_str()
-            .context("bytecode ID not found")?;
-        let bytecode_id: BytecodeId = bytecode_str
-            .parse()
-            .context("could not parse bytecode ID")?;
-        Ok(bytecode_id.with_abi())
+            .context("module ID not found")?;
+        let module_id: ModuleId = module_str.parse().context("could not parse module ID")?;
+        Ok(module_id.with_abi())
     }
 
     pub async fn query_committees(&self, chain_id: &ChainId) -> Result<BTreeMap<Epoch, Committee>> {
@@ -1257,12 +1219,12 @@ impl NodeService {
     >(
         &self,
         chain_id: &ChainId,
-        bytecode_id: &BytecodeId<Abi, Parameters, InstantiationArgument>,
+        module_id: &ModuleId<Abi, Parameters, InstantiationArgument>,
         parameters: &Parameters,
         argument: &InstantiationArgument,
         required_application_ids: &[ApplicationId],
     ) -> Result<ApplicationId<Abi>> {
-        let bytecode_id = bytecode_id.forget_abi();
+        let module_id = module_id.forget_abi();
         let json_required_applications_ids = required_application_ids
             .iter()
             .map(ApplicationId::to_string)
@@ -1278,7 +1240,7 @@ impl NodeService {
         let query = format!(
             "mutation {{ createApplication(\
                  chainId: \"{chain_id}\",
-                 bytecodeId: \"{bytecode_id}\", \
+                 moduleId: \"{module_id}\", \
                  parameters: {new_parameters}, \
                  instantiationArgument: {new_argument}, \
                  requiredApplicationIds: {json_required_applications_ids}) \
@@ -1293,23 +1255,6 @@ impl NodeService {
             .parse::<ApplicationId>()
             .context("invalid application ID")?
             .with_abi())
-    }
-
-    pub async fn request_application<A: ContractAbi>(
-        &self,
-        chain_id: &ChainId,
-        application_id: &ApplicationId<A>,
-    ) -> Result<String> {
-        let application_id = application_id.forget_abi();
-        let query = format!(
-            "mutation {{ requestApplication(\
-                 chainId: \"{chain_id}\", \
-                 applicationId: \"{application_id}\") \
-             }}"
-        );
-        let data = self.query_node(query).await?;
-        serde_json::from_value(data["requestApplication"].clone())
-            .context("missing requestApplication field in response")
     }
 
     pub async fn subscribe(

@@ -16,19 +16,15 @@ use linera_base::{
         Amount, ArithmeticError, BlockHeight, OracleResponse, Timestamp, UserApplicationDescription,
     },
     ensure,
-    identifiers::{
-        ChainId, ChannelFullName, Destination, GenericApplicationId, MessageId, Owner,
-        UserApplicationId,
-    },
+    identifiers::{ChainId, ChannelFullName, Destination, MessageId, Owner, UserApplicationId},
     ownership::ChainOwnership,
 };
 use linera_execution::{
     committee::{Committee, Epoch},
     system::OpenChainConfig,
-    ExecutionOutcome, ExecutionRuntimeContext, ExecutionStateView, Message, MessageContext,
-    Operation, OperationContext, Query, QueryContext, QueryOutcome, RawExecutionOutcome,
-    RawOutgoingMessage, ResourceController, ResourceTracker, ServiceRuntimeEndpoint,
-    TransactionTracker,
+    ExecutionRuntimeContext, ExecutionStateView, Message, MessageContext, Operation,
+    OperationContext, OutgoingMessage, Query, QueryContext, QueryOutcome, ResourceController,
+    ResourceTracker, ServiceRuntimeEndpoint, TransactionTracker,
 };
 use linera_views::{
     context::Context,
@@ -44,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     data_types::{
         BlockExecutionOutcome, ChainAndHeight, IncomingBundle, MessageAction, MessageBundle,
-        Origin, OutgoingMessage, PostedMessage, ProposedBlock, Target, Transaction,
+        OperationResult, Origin, PostedMessage, ProposedBlock, Target, Transaction,
     },
     inbox::{Cursor, InboxError, InboxStateView},
     manager::ChainManager,
@@ -77,7 +73,7 @@ static BLOCK_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         "block_execution_latency",
         "Block execution latency",
         &[],
-        exponential_bucket_latencies(50.0),
+        exponential_bucket_latencies(1000.0),
     )
 });
 
@@ -87,7 +83,7 @@ static MESSAGE_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         "message_execution_latency",
         "Message execution latency",
         &[],
-        exponential_bucket_latencies(2.5),
+        exponential_bucket_latencies(50.0),
     )
 });
 
@@ -97,7 +93,7 @@ static OPERATION_EXECUTION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
         "operation_execution_latency",
         "Operation execution latency",
         &[],
-        exponential_bucket_latencies(2.5),
+        exponential_bucket_latencies(50.0),
     )
 });
 
@@ -107,7 +103,7 @@ static WASM_FUEL_USED_PER_BLOCK: LazyLock<HistogramVec> = LazyLock::new(|| {
         "wasm_fuel_used_per_block",
         "Wasm fuel used per block",
         &[],
-        exponential_bucket_interval(10.0, 500_000.0),
+        exponential_bucket_interval(10.0, 1_000_000.0),
     )
 });
 
@@ -147,7 +143,7 @@ static STATE_HASH_COMPUTATION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(||
         "state_hash_computation_latency",
         "Time to recompute the state hash",
         &[],
-        exponential_bucket_latencies(5.0),
+        exponential_bucket_latencies(10.0),
     )
 });
 
@@ -157,7 +153,7 @@ static NUM_INBOXES: LazyLock<HistogramVec> = LazyLock::new(|| {
         "num_inboxes",
         "Number of inboxes",
         &[],
-        exponential_bucket_interval(1.0, 10000.0),
+        exponential_bucket_interval(1.0, 10_000.0),
     )
 });
 
@@ -167,12 +163,12 @@ static NUM_OUTBOXES: LazyLock<HistogramVec> = LazyLock::new(|| {
         "num_outboxes",
         "Number of outboxes",
         &[],
-        exponential_bucket_interval(1.0, 10000.0),
+        exponential_bucket_interval(1.0, 10_000.0),
     )
 });
 
 /// The BCS-serialized size of an empty [`Block`].
-const EMPTY_BLOCK_SIZE: usize = 91;
+const EMPTY_BLOCK_SIZE: usize = 93;
 
 /// An origin, cursor and timestamp of a unskippable bundle in our inbox.
 #[derive(Debug, Clone, Serialize, Deserialize, async_graphql::SimpleObject)]
@@ -375,8 +371,7 @@ where
     ) -> Result<UserApplicationDescription, ChainError> {
         self.execution_state
             .system
-            .registry
-            .describe_application(application_id)
+            .describe_application(application_id, None)
             .await
             .with_execution_context(ChainExecutionContext::DescribeApplication)
     }
@@ -773,9 +768,12 @@ where
         // Collect messages, events and oracle responses, each as one list per transaction.
         let mut replaying_oracle_responses = replaying_oracle_responses.map(Vec::into_iter);
         let mut next_message_index = 0;
+        let mut next_application_index = 0;
         let mut oracle_responses = Vec::new();
         let mut events = Vec::new();
+        let mut blobs = Vec::new();
         let mut messages = Vec::new();
+        let mut operation_results = Vec::new();
         for (txn_index, transaction) in block.transactions() {
             let chain_execution_context = match transaction {
                 Transaction::ReceiveMessages(_) => ChainExecutionContext::IncomingBundle(txn_index),
@@ -786,7 +784,11 @@ where
                 Some(None) => return Err(ChainError::MissingOracleResponseList),
                 None => None,
             };
-            let mut txn_tracker = TransactionTracker::new(next_message_index, maybe_responses);
+            let mut txn_tracker = TransactionTracker::new(
+                next_message_index,
+                next_application_index,
+                maybe_responses,
+            );
             match transaction {
                 Transaction::ReceiveMessages(incoming_bundle) => {
                     resource_controller
@@ -838,19 +840,15 @@ where
                 }
             }
 
-            self.execution_state
-                .update_execution_outcomes_with_app_registrations(&mut txn_tracker)
-                .await
-                .with_execution_context(chain_execution_context)?;
             let txn_outcome = txn_tracker
                 .into_outcome()
                 .with_execution_context(chain_execution_context)?;
             next_message_index = txn_outcome.next_message_index;
+            next_application_index = txn_outcome.next_application_index;
 
             // Update the channels.
             self.process_unsubscribes(txn_outcome.unsubscribe).await?;
-            let txn_messages = self
-                .process_execution_outcomes(block.height, txn_outcome.outcomes)
+            self.process_outgoing_messages(block.height, &txn_outcome.outgoing_messages)
                 .await?;
             self.process_subscribes(txn_outcome.subscribe).await?;
             if matches!(
@@ -861,7 +859,7 @@ where
                         ..
                     })
             ) {
-                for message_out in &txn_messages {
+                for message_out in &txn_outcome.outgoing_messages {
                     resource_controller
                         .with_state(&mut self.execution_state)
                         .await?
@@ -873,7 +871,7 @@ where
             resource_controller
                 .track_block_size_of(&(
                     &txn_outcome.oracle_responses,
-                    &txn_messages,
+                    &txn_outcome.outgoing_messages,
                     &txn_outcome.events,
                 ))
                 .with_execution_context(chain_execution_context)?;
@@ -887,8 +885,19 @@ where
                 .track_executed_block_size_sequence_extension(events.len(), 1)
                 .with_execution_context(chain_execution_context)?;
             oracle_responses.push(txn_outcome.oracle_responses);
-            messages.push(txn_messages);
+            messages.push(txn_outcome.outgoing_messages);
             events.push(txn_outcome.events);
+            blobs.push(txn_outcome.blobs);
+
+            if let Transaction::ExecuteOperation(_) = transaction {
+                resource_controller
+                    .track_block_size_of(&(&txn_outcome.operation_result))
+                    .with_execution_context(chain_execution_context)?;
+                resource_controller
+                    .track_executed_block_size_sequence_extension(operation_results.len(), 1)
+                    .with_execution_context(chain_execution_context)?;
+                operation_results.push(OperationResult(txn_outcome.operation_result));
+            }
         }
 
         // Finally, charge for the block fee, except if the chain is closed. Closed chains should
@@ -918,6 +927,8 @@ where
             state_hash,
             oracle_responses,
             events,
+            blobs,
+            operation_results,
         };
         Ok(outcome)
     }
@@ -1097,85 +1108,32 @@ where
             .observe(tracker.bytes_written as f64);
     }
 
-    async fn process_execution_outcomes(
+    async fn process_outgoing_messages(
         &mut self,
         height: BlockHeight,
-        results: Vec<ExecutionOutcome>,
-    ) -> Result<Vec<OutgoingMessage>, ChainError> {
-        let mut messages = Vec::new();
-        for result in results {
-            match result {
-                ExecutionOutcome::System(result) => {
-                    self.process_raw_execution_outcome(
-                        GenericApplicationId::System,
-                        Message::System,
-                        &mut messages,
-                        height,
-                        result,
-                    )
-                    .await?;
-                }
-                ExecutionOutcome::User(application_id, result) => {
-                    self.process_raw_execution_outcome(
-                        GenericApplicationId::User(application_id),
-                        |bytes| Message::User {
-                            application_id,
-                            bytes,
-                        },
-                        &mut messages,
-                        height,
-                        result,
-                    )
-                    .await?;
-                }
-            }
-        }
-        Ok(messages)
-    }
-
-    async fn process_raw_execution_outcome<E, F>(
-        &mut self,
-        application_id: GenericApplicationId,
-        lift: F,
-        messages: &mut Vec<OutgoingMessage>,
-        height: BlockHeight,
-        raw_outcome: RawExecutionOutcome<E, Amount>,
-    ) -> Result<(), ChainError>
-    where
-        F: Fn(E) -> Message,
-    {
+        messages: &[OutgoingMessage],
+    ) -> Result<(), ChainError> {
         let max_stream_queries = self.context().max_stream_queries();
         // Record the messages of the execution. Messages are understood within an
         // application.
         let mut recipients = HashSet::new();
         let mut channel_broadcasts = HashSet::new();
-        for RawOutgoingMessage {
-            destination,
-            authenticated,
-            grant,
-            kind,
-            message,
-        } in raw_outcome.messages
-        {
-            match &destination {
+        for message in messages {
+            match &message.destination {
                 Destination::Recipient(id) => {
                     recipients.insert(*id);
                 }
                 Destination::Subscribers(name) => {
-                    ensure!(grant == Amount::ZERO, ChainError::GrantUseOnBroadcast);
-                    channel_broadcasts.insert(name.clone());
+                    ensure!(
+                        message.grant == Amount::ZERO,
+                        ChainError::GrantUseOnBroadcast
+                    );
+                    channel_broadcasts.insert(ChannelFullName {
+                        application_id: message.message.application_id(),
+                        name: name.clone(),
+                    });
                 }
             }
-            let authenticated_signer = raw_outcome.authenticated_signer.filter(|_| authenticated);
-            let refund_grant_to = raw_outcome.refund_grant_to.filter(|_| grant > Amount::ZERO);
-            messages.push(OutgoingMessage {
-                destination,
-                authenticated_signer,
-                grant,
-                refund_grant_to,
-                kind,
-                message: lift(message),
-            });
         }
 
         // Update the (regular) outboxes.
@@ -1191,13 +1149,7 @@ where
             }
         }
 
-        let full_names = channel_broadcasts
-            .into_iter()
-            .map(|name| ChannelFullName {
-                application_id,
-                name,
-            })
-            .collect::<Vec<_>>();
+        let full_names = channel_broadcasts.into_iter().collect::<Vec<_>>();
         let channels = self.channels.try_load_entries_mut(&full_names).await?;
         let stream = full_names.into_iter().zip(channels);
         let stream = stream::iter(stream)

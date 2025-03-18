@@ -8,9 +8,9 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use futures::{lock::Mutex, FutureExt as _};
 use linera_base::{
-    crypto::{AccountPublicKey, AccountSecretKey},
+    crypto::{AccountPublicKey, AccountSecretKey, Secp256k1SecretKey},
     data_types::{Amount, BlockHeight, TimeDelta, Timestamp},
-    identifiers::ChainId,
+    identifiers::{AccountOwner, ChainId},
     ownership::{ChainOwnership, TimeoutConfig},
 };
 use linera_core::{
@@ -136,7 +136,7 @@ async fn test_chain_listener() -> anyhow::Result<()> {
             Duration::from_secs(1),
         )),
     };
-    let key_pair = AccountSecretKey::generate_from(&mut rng);
+    let key_pair = AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate_from(&mut rng));
     let owner = key_pair.public().into();
     context
         .update_wallet_for_new_chain(chain_id0, Some(key_pair), clock.current_time())
@@ -160,7 +160,9 @@ async fn test_chain_listener() -> anyhow::Result<()> {
     // Transfer one token to chain 0. The listener should eventually become leader and receive
     // the message.
     let recipient0 = Recipient::chain(chain_id0);
-    client1.transfer(None, Amount::ONE, recipient0).await?;
+    client1
+        .transfer(AccountOwner::Chain, Amount::ONE, recipient0)
+        .await?;
     for i in 0.. {
         client0.synchronize_from_validators().boxed().await?;
         let balance = client0.local_balance().await?;

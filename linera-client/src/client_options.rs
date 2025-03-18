@@ -12,9 +12,7 @@ use chrono::{DateTime, Utc};
 use linera_base::{
     crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
     data_types::{Amount, ApplicationPermissions, TimeDelta},
-    identifiers::{
-        Account, ApplicationId, BytecodeId, ChainId, MessageId, Owner, UserApplicationId,
-    },
+    identifiers::{Account, ApplicationId, ChainId, MessageId, ModuleId, Owner, UserApplicationId},
     ownership::{ChainOwnership, TimeoutConfig},
     time::Duration,
     vm::VmRuntime,
@@ -613,10 +611,22 @@ pub enum ClientCommand {
         #[arg(long)]
         bps: Option<usize>,
 
-        /// If provided, will not close the chains after the benchmark is finished. This is useful
-        /// when running with many chains, as closing them all might take a while.
+        /// If provided, will close the chains after the benchmark is finished. Keep in mind that
+        /// closing the chains might take a while, and will increase the validator latency while
+        /// they're being closed.
         #[arg(long)]
-        keep_chains_open: bool,
+        close_chains: bool,
+        /// A comma-separated list of host:port pairs to query for health metrics.
+        /// If provided, the benchmark will check these endpoints for validator health
+        /// and terminate if any validator is unhealthy.
+        /// Example: "127.0.0.1:21100,validator-1.some-network.linera.net:21100"
+        #[arg(long)]
+        health_check_endpoints: Option<String>,
+        /// The maximum number of in-flight requests to validators when wrapping up the benchmark.
+        /// While wrapping up, this controls the concurrency level when processing inboxes and
+        /// closing chains.
+        #[arg(long, default_value = "5")]
+        wrap_up_max_in_flight: usize,
     },
 
     /// Create genesis configuration for a Linera deployment.
@@ -747,6 +757,10 @@ pub enum ClientCommand {
         #[arg(long)]
         maximum_bytes_written_per_block: Option<u64>,
 
+        /// Set the list of hosts that contracts and services can send HTTP requests to.
+        #[arg(long)]
+        http_allow_list: Option<Vec<String>>,
+
         /// Force this wallet to generate keys using a PRNG and a given seed. USE FOR
         /// TESTING ONLY.
         #[arg(long)]
@@ -801,8 +815,8 @@ pub enum ClientCommand {
         config: ChainListenerConfig,
     },
 
-    /// Publish bytecode.
-    PublishBytecode {
+    /// Publish module.
+    PublishModule {
         /// Path to the Wasm file for the application "contract" bytecode.
         contract: PathBuf,
 
@@ -813,7 +827,7 @@ pub enum ClientCommand {
         #[arg(long, default_value = "wasm")]
         vm_runtime: VmRuntime,
 
-        /// An optional chain ID to publish the bytecode. The default chain of the wallet
+        /// An optional chain ID to publish the module. The default chain of the wallet
         /// is used otherwise.
         publisher: Option<ChainId>,
     },
@@ -839,8 +853,8 @@ pub enum ClientCommand {
 
     /// Create an application.
     CreateApplication {
-        /// The bytecode ID of the application to create.
-        bytecode_id: BytecodeId,
+        /// The module ID of the application to create.
+        module_id: ModuleId,
 
         /// An optional chain ID to host the application. The default chain of the wallet
         /// is used otherwise.
@@ -867,7 +881,7 @@ pub enum ClientCommand {
         required_application_ids: Option<Vec<UserApplicationId>>,
     },
 
-    /// Create an application, and publish the required bytecode.
+    /// Create an application, and publish the required module.
     PublishAndCreate {
         /// Path to the Wasm file for the application "contract" bytecode.
         contract: PathBuf,
@@ -879,7 +893,7 @@ pub enum ClientCommand {
         #[arg(long, default_value = "wasm")]
         vm_runtime: VmRuntime,
 
-        /// An optional chain ID to publish the bytecode. The default chain of the wallet
+        /// An optional chain ID to publish the module. The default chain of the wallet
         /// is used otherwise.
         publisher: Option<ChainId>,
 
@@ -902,21 +916,6 @@ pub enum ClientCommand {
         /// The list of required dependencies of application, if any.
         #[arg(long, num_args(0..))]
         required_application_ids: Option<Vec<UserApplicationId>>,
-    },
-
-    /// Request an application from another chain, so it can be used on this one.
-    RequestApplication {
-        /// The ID of the application to request.
-        application_id: UserApplicationId,
-
-        /// The target chain on which the application is already registered.
-        /// If not specified, the chain on which the application was created is used.
-        #[arg(long)]
-        target_chain_id: Option<ChainId>,
-
-        /// The owned chain on which the application is missing.
-        #[arg(long)]
-        requester_chain_id: Option<ChainId>,
     },
 
     /// Create an unassigned key pair.
@@ -1295,14 +1294,14 @@ pub enum ProjectCommand {
         path: Option<PathBuf>,
 
         /// Specify the name of the Linera project.
-        /// This is used to locate the generated bytecode. The generated bytecode should
+        /// This is used to locate the generated bytecode files. The generated bytecode files should
         /// be of the form `<name>_{contract,service}.wasm`.
         ///
         /// Defaults to the package name in Cargo.toml, with dashes replaced by
         /// underscores.
         name: Option<String>,
 
-        /// An optional chain ID to publish the bytecode. The default chain of the wallet
+        /// An optional chain ID to publish the module. The default chain of the wallet
         /// is used otherwise.
         publisher: Option<ChainId>,
 
@@ -1451,6 +1450,14 @@ pub struct ApplicationPermissionsConfig {
     /// using the system API.
     #[arg(long)]
     pub change_application_permissions: Option<Vec<ApplicationId>>,
+    /// These applications are allowed to call services as oracles on the current chain using the
+    /// system API.
+    #[arg(long)]
+    pub call_service_as_oracle: Option<Vec<ApplicationId>>,
+    /// These applications are allowed to make HTTP requests on the current chain using the system
+    /// API.
+    #[arg(long)]
+    pub make_http_requests: Option<Vec<ApplicationId>>,
 }
 
 impl From<ApplicationPermissionsConfig> for ApplicationPermissions {
@@ -1462,6 +1469,8 @@ impl From<ApplicationPermissionsConfig> for ApplicationPermissions {
             change_application_permissions: config
                 .change_application_permissions
                 .unwrap_or_default(),
+            call_service_as_oracle: config.call_service_as_oracle,
+            make_http_requests: config.make_http_requests,
         }
     }
 }

@@ -6,6 +6,7 @@
 //! This allows manipulating a test microchain.
 
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,15 +15,18 @@ use std::{
 use cargo_toml::Manifest;
 use linera_base::{
     crypto::{AccountPublicKey, AccountSecretKey},
-    data_types::{Blob, BlockHeight, Bytecode, CompressedBytecode},
-    identifiers::{ApplicationId, BytecodeId, ChainDescription, ChainId, MessageId},
+    data_types::{
+        Amount, Blob, BlockHeight, Bytecode, CompressedBytecode, UserApplicationDescription,
+    },
+    identifiers::{AccountOwner, ApplicationId, ChainDescription, ChainId, ModuleId},
     vm::VmRuntime,
 };
-use linera_chain::{types::ConfirmedBlockCertificate, ChainError, ChainExecutionContext};
+use linera_chain::types::ConfirmedBlockCertificate;
 use linera_core::{data_types::ChainInfoQuery, worker::WorkerError};
 use linera_execution::{
-    system::{SystemExecutionError, SystemOperation, CREATE_APPLICATION_MESSAGE_INDEX},
-    ExecutionError, Query, QueryOutcome, QueryResponse,
+    committee::Epoch,
+    system::{SystemOperation, SystemQuery, SystemResponse},
+    Operation, Query, QueryOutcome, QueryResponse,
 };
 use linera_storage::Storage as _;
 use serde::Serialize;
@@ -89,6 +93,117 @@ impl ActiveChain {
         self.key_pair = key_pair
     }
 
+    /// Returns the current [`Epoch`] the chain is in.
+    pub async fn epoch(&self) -> Epoch {
+        self.validator
+            .worker()
+            .chain_state_view(self.id())
+            .await
+            .expect("Failed to load chain")
+            .execution_state
+            .system
+            .epoch
+            .get()
+            .expect("Active chains should be in an epoch")
+    }
+
+    /// Reads the current shared balance available to all of the owners of this microchain.
+    pub async fn chain_balance(&self) -> Amount {
+        let query = Query::System(SystemQuery);
+
+        let QueryOutcome { response, .. } = self
+            .validator
+            .worker()
+            .query_application(self.id(), query)
+            .await
+            .expect("Failed to query chain's balance");
+
+        let QueryResponse::System(SystemResponse { balance, .. }) = response else {
+            panic!("Unexpected response from system application");
+        };
+
+        balance
+    }
+
+    /// Reads the current account balance on this microchain of an [`AccountOwner`].
+    pub async fn owner_balance(&self, owner: &AccountOwner) -> Option<Amount> {
+        let chain_state = self
+            .validator
+            .worker()
+            .chain_state_view(self.id())
+            .await
+            .expect("Failed to read chain state");
+
+        chain_state
+            .execution_state
+            .system
+            .balances
+            .get(owner)
+            .await
+            .expect("Failed to read owner balance")
+    }
+
+    /// Reads the current account balance on this microchain of all [`AccountOwner`]s.
+    pub async fn owner_balances(
+        &self,
+        owners: impl IntoIterator<Item = AccountOwner>,
+    ) -> HashMap<AccountOwner, Option<Amount>> {
+        let chain_state = self
+            .validator
+            .worker()
+            .chain_state_view(self.id())
+            .await
+            .expect("Failed to read chain state");
+
+        let mut balances = HashMap::new();
+
+        for owner in owners {
+            let balance = chain_state
+                .execution_state
+                .system
+                .balances
+                .get(&owner)
+                .await
+                .expect("Failed to read an owner's balance");
+
+            balances.insert(owner, balance);
+        }
+
+        balances
+    }
+
+    /// Reads a list of [`AccountOwner`]s that have a non-zero balance on this microchain.
+    pub async fn accounts(&self) -> Vec<AccountOwner> {
+        let chain_state = self
+            .validator
+            .worker()
+            .chain_state_view(self.id())
+            .await
+            .expect("Failed to read chain state");
+
+        chain_state
+            .execution_state
+            .system
+            .balances
+            .indices()
+            .await
+            .expect("Failed to list accounts on the chain")
+    }
+
+    /// Reads all the non-zero account balances on this microchain.
+    pub async fn all_owner_balances(&self) -> HashMap<AccountOwner, Amount> {
+        self.owner_balances(self.accounts().await)
+            .await
+            .into_iter()
+            .map(|(owner, balance)| {
+                (
+                    owner,
+                    balance.expect("`accounts` should only return accounts with non-zero balance"),
+                )
+            })
+            .collect()
+    }
+
     /// Adds a block to this microchain.
     ///
     /// The `block_builder` parameter is a closure that should use the [`BlockBuilder`] parameter
@@ -127,6 +242,13 @@ impl ActiveChain {
         self.try_add_block_with_blobs(block_builder, vec![]).await
     }
 
+    /// Tries to add a block to this microchain, writing some `blobs` to storage if needed.
+    ///
+    /// The `block_builder` parameter is a closure that should use the [`BlockBuilder`] parameter
+    /// to provide the block's contents.
+    ///
+    /// The blobs are either all written to storage, if executing the block fails due to a missing
+    /// blob, or none are written to storage if executing the block succeeds without the blobs.
     async fn try_add_block_with_blobs(
         &self,
         block_builder: impl FnOnce(&mut BlockBuilder),
@@ -136,6 +258,7 @@ impl ActiveChain {
         let mut block = BlockBuilder::new(
             self.description.into(),
             self.key_pair.public().into(),
+            self.epoch().await,
             tip.as_ref(),
             self.validator.clone(),
         );
@@ -186,43 +309,43 @@ impl ActiveChain {
         .await;
     }
 
-    /// Publishes the bytecodes in the crate calling this method to this microchain.
+    /// Publishes the module in the crate calling this method to this microchain.
     ///
     /// Searches the Cargo manifest for binaries that end with `contract` and `service`, builds
-    /// them for WebAssembly and uses the generated binaries as the contract and service bytecodes
-    /// to be published on this chain. Returns the bytecode ID to reference the published bytecode.
-    pub async fn publish_current_bytecode<Abi, Parameters, InstantiationArgument>(
+    /// them for WebAssembly and uses the generated binaries as the contract and service bytecode files
+    /// to be published on this chain. Returns the module ID to reference the published module.
+    pub async fn publish_current_module<Abi, Parameters, InstantiationArgument>(
         &self,
-    ) -> BytecodeId<Abi, Parameters, InstantiationArgument> {
-        self.publish_bytecodes_in(".").await
+    ) -> ModuleId<Abi, Parameters, InstantiationArgument> {
+        self.publish_bytecode_files_in(".").await
     }
 
-    /// Publishes the bytecodes in the crate at `repository_path`.
+    /// Publishes the bytecode files in the crate at `repository_path`.
     ///
     /// Searches the Cargo manifest for binaries that end with `contract` and `service`, builds
-    /// them for WebAssembly and uses the generated binaries as the contract and service bytecodes
-    /// to be published on this chain. Returns the bytecode ID to reference the published bytecode.
-    pub async fn publish_bytecodes_in<Abi, Parameters, InstantiationArgument>(
+    /// them for WebAssembly and uses the generated binaries as the contract and service bytecode files
+    /// to be published on this chain. Returns the module ID to reference the published module.
+    pub async fn publish_bytecode_files_in<Abi, Parameters, InstantiationArgument>(
         &self,
         repository_path: impl AsRef<Path>,
-    ) -> BytecodeId<Abi, Parameters, InstantiationArgument> {
+    ) -> ModuleId<Abi, Parameters, InstantiationArgument> {
         let repository_path = fs::canonicalize(repository_path)
             .await
             .expect("Failed to obtain absolute application repository path");
-        Self::build_bytecodes_in(&repository_path).await;
-        let (contract, service) = self.find_bytecodes_in(&repository_path).await;
+        Self::build_bytecode_files_in(&repository_path).await;
+        let (contract, service) = self.find_bytecode_files_in(&repository_path).await;
         let contract_blob = Blob::new_contract_bytecode(contract);
         let service_blob = Blob::new_service_bytecode(service);
         let contract_blob_hash = contract_blob.id().hash;
         let service_blob_hash = service_blob.id().hash;
         let vm_runtime = VmRuntime::Wasm;
 
-        let bytecode_id = BytecodeId::new(contract_blob_hash, service_blob_hash, vm_runtime);
+        let module_id = ModuleId::new(contract_blob_hash, service_blob_hash, vm_runtime);
 
         let certificate = self
             .add_block_with_blobs(
                 |block| {
-                    block.with_system_operation(SystemOperation::PublishBytecode { bytecode_id });
+                    block.with_system_operation(SystemOperation::PublishModule { module_id });
                 },
                 vec![contract_blob, service_blob],
             )
@@ -232,11 +355,11 @@ impl ActiveChain {
         assert_eq!(executed_block.messages().len(), 1);
         assert_eq!(executed_block.messages()[0].len(), 0);
 
-        bytecode_id.with_abi()
+        module_id.with_abi()
     }
 
     /// Compiles the crate in the `repository` path.
-    async fn build_bytecodes_in(repository: &Path) {
+    async fn build_bytecode_files_in(repository: &Path) {
         let output = std::process::Command::new("cargo")
             .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
             .current_dir(repository)
@@ -253,11 +376,11 @@ impl ActiveChain {
     }
 
     /// Searches the Cargo manifest of the crate calling this method for binaries to use as the
-    /// contract and service bytecodes.
+    /// contract and service bytecode files.
     ///
     /// Returns a tuple with the loaded contract and service [`CompressedBytecode`]s,
     /// ready to be published.
-    async fn find_bytecodes_in(
+    async fn find_bytecode_files_in(
         &self,
         repository: &Path,
     ) -> (CompressedBytecode, CompressedBytecode) {
@@ -276,7 +399,7 @@ impl ActiveChain {
             binaries.len(),
             2,
             "Could not figure out contract and service bytecode binaries.\
-            Please specify them manually using `publish_bytecode`."
+            Please specify them manually using `publish_module`."
         );
 
         let (contract_binary, service_binary) = if binaries[0].ends_with("contract") {
@@ -301,7 +424,7 @@ impl ActiveChain {
 
         tokio::task::spawn_blocking(move || (contract.compress(), service.compress()))
             .await
-            .expect("Failed to compress bytecodes")
+            .expect("Failed to compress bytecode files")
     }
 
     /// Searches for the directory where the built WebAssembly binaries should be.
@@ -342,19 +465,19 @@ impl ActiveChain {
             .height
     }
 
-    /// Creates an application on this microchain, using the bytecode referenced by `bytecode_id`.
+    /// Creates an application on this microchain, using the module referenced by `module_id`.
     ///
     /// Returns the [`ApplicationId`] of the created application.
     ///
     /// If necessary, this microchain will subscribe to the microchain that published the
-    /// bytecode to use, and fetch it.
+    /// module to use, and fetch it.
     ///
     /// The application is instantiated using the instantiation parameters, which consist of the
     /// global static `parameters`, the one time `instantiation_argument` and the
     /// `required_application_ids` of the applications that the new application will depend on.
     pub async fn create_application<Abi, Parameters, InstantiationArgument>(
         &mut self,
-        bytecode_id: BytecodeId<Abi, Parameters, InstantiationArgument>,
+        module_id: ModuleId<Abi, Parameters, InstantiationArgument>,
         parameters: Parameters,
         instantiation_argument: InstantiationArgument,
         required_application_ids: Vec<ApplicationId>,
@@ -367,33 +490,31 @@ impl ActiveChain {
         let parameters = serde_json::to_vec(&parameters).unwrap();
         let instantiation_argument = serde_json::to_vec(&instantiation_argument).unwrap();
 
-        for &dependency in &required_application_ids {
-            self.register_application(dependency).await;
-        }
-
         let creation_certificate = self
             .add_block(|block| {
                 block.with_system_operation(SystemOperation::CreateApplication {
-                    bytecode_id: bytecode_id.forget_abi(),
-                    parameters,
+                    module_id: module_id.forget_abi(),
+                    parameters: parameters.clone(),
                     instantiation_argument,
-                    required_application_ids,
+                    required_application_ids: required_application_ids.clone(),
                 });
             })
             .await;
 
         let block = creation_certificate.inner().block();
         assert_eq!(block.messages().len(), 1);
-        let creation = MessageId {
-            chain_id: block.header.chain_id,
-            height: block.header.height,
-            index: CREATE_APPLICATION_MESSAGE_INDEX,
+        assert!(block.messages()[0].is_empty());
+
+        let description = UserApplicationDescription {
+            module_id: module_id.forget_abi(),
+            creator_chain_id: block.header.chain_id,
+            block_height: block.header.height,
+            application_index: 0,
+            parameters,
+            required_application_ids,
         };
 
-        ApplicationId {
-            bytecode_id: bytecode_id.just_abi(),
-            creation,
-        }
+        ApplicationId::<()>::from(&description).with_abi()
     }
 
     /// Returns whether this chain has been closed.
@@ -404,61 +525,6 @@ impl ActiveChain {
             .await
             .expect("Failed to load chain")
             .is_closed()
-    }
-
-    /// Registers on this chain an application created on another chain.
-    pub async fn register_application<Abi>(&self, application_id: ApplicationId<Abi>) {
-        if self.needs_application_description(application_id).await {
-            let source_chain = self.validator.get_chain(&application_id.creation.chain_id);
-
-            let request_certificate = self
-                .add_block(|block| {
-                    block.with_request_for_application(application_id);
-                })
-                .await;
-
-            let register_certificate = source_chain
-                .add_block(|block| {
-                    block.with_messages_from(&request_certificate);
-                })
-                .await;
-
-            let final_certificate = self
-                .add_block(|block| {
-                    block.with_messages_from(&register_certificate);
-                })
-                .await;
-
-            assert_eq!(final_certificate.outgoing_message_count(), 0);
-        }
-    }
-
-    /// Checks if the `application_id` is missing from this microchain.
-    async fn needs_application_description<Abi>(&self, application_id: ApplicationId<Abi>) -> bool {
-        let description_result = self
-            .validator
-            .worker()
-            .describe_application(self.id(), application_id.forget_abi())
-            .await;
-
-        match description_result {
-            Ok(_) => false,
-            Err(WorkerError::ChainError(boxed_chain_error))
-                if matches!(
-                    &*boxed_chain_error,
-                    ChainError::ExecutionError(
-                        execution_error,
-                        ChainExecutionContext::DescribeApplication,
-                    ) if matches!(
-                        **execution_error,
-                        ExecutionError::SystemError(SystemExecutionError::UnknownApplicationId(_))
-                    )
-                ) =>
-            {
-                true
-            }
-            Err(_) => panic!("Failed to check known bytecode locations"),
-        }
     }
 
     /// Executes a `query` on an `application`'s state on this microchain.
@@ -537,5 +603,37 @@ impl ActiveChain {
             response: json_response,
             operations,
         }
+    }
+
+    /// Executes a GraphQL `mutation` on an `application` and proposes a block with the resulting
+    /// scheduled operations.
+    ///
+    /// Returns the certificate of the new block.
+    pub async fn graphql_mutation<Abi>(
+        &self,
+        application_id: ApplicationId<Abi>,
+        query: impl Into<async_graphql::Request>,
+    ) -> ConfirmedBlockCertificate
+    where
+        Abi: ServiceAbi<Query = async_graphql::Request, QueryResponse = async_graphql::Response>,
+    {
+        let QueryOutcome { operations, .. } = self.graphql_query(application_id, query).await;
+
+        self.add_block(|block| {
+            for operation in operations {
+                match operation {
+                    Operation::User {
+                        application_id,
+                        bytes,
+                    } => {
+                        block.with_raw_operation(application_id, bytes);
+                    }
+                    Operation::System(system_operation) => {
+                        block.with_system_operation(system_operation);
+                    }
+                }
+            }
+        })
+        .await
     }
 }

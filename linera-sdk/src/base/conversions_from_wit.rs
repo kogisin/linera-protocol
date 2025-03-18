@@ -7,9 +7,8 @@ use linera_base::{
     crypto::CryptoHash,
     data_types::{Amount, BlockHeight, TimeDelta, Timestamp},
     http,
-    identifiers::{AccountOwner, ApplicationId, BytecodeId, ChainId, MessageId, Owner},
+    identifiers::{AccountOwner, ApplicationId, ChainId, Owner},
     ownership::{ChainOwnership, TimeoutConfig},
-    vm::VmRuntime,
 };
 
 use crate::{
@@ -43,6 +42,7 @@ macro_rules! impl_from_wit {
                     $wit_base_api::AccountOwner::Application(owner) => {
                         AccountOwner::Application(owner.into())
                     }
+                    $wit_base_api::AccountOwner::Chain => AccountOwner::Chain,
                 }
             }
         }
@@ -67,41 +67,9 @@ macro_rules! impl_from_wit {
             }
         }
 
-        impl From<$wit_base_api::BytecodeId> for BytecodeId {
-            fn from(bytecode_id: $wit_base_api::BytecodeId) -> Self {
-                BytecodeId::new(
-                    bytecode_id.contract_blob_hash.into(),
-                    bytecode_id.service_blob_hash.into(),
-                    bytecode_id.vm_runtime.into(),
-                )
-            }
-        }
-
-        impl From<$wit_base_api::VmRuntime> for VmRuntime {
-            fn from(vm_runtime: $wit_base_api::VmRuntime) -> Self {
-                match vm_runtime {
-                    $wit_base_api::VmRuntime::Wasm => VmRuntime::Wasm,
-                    $wit_base_api::VmRuntime::Evm => VmRuntime::Evm,
-                }
-            }
-        }
-
-        impl From<$wit_base_api::MessageId> for MessageId {
-            fn from(message_id: $wit_base_api::MessageId) -> Self {
-                MessageId {
-                    chain_id: message_id.chain_id.into(),
-                    height: message_id.height.into(),
-                    index: message_id.index,
-                }
-            }
-        }
-
         impl From<$wit_base_api::ApplicationId> for ApplicationId {
             fn from(application_id: $wit_base_api::ApplicationId) -> Self {
-                ApplicationId {
-                    bytecode_id: application_id.bytecode_id.into(),
-                    creation: application_id.creation.into(),
-                }
+                ApplicationId::new(application_id.application_description_hash.into())
             }
         }
 

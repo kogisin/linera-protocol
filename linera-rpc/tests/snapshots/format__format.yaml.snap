@@ -7,8 +7,7 @@ Account:
     - chain_id:
         TYPENAME: ChainId
     - owner:
-        OPTION:
-          TYPENAME: AccountOwner
+        TYPENAME: AccountOwner
 AccountOwner:
   ENUM:
     0:
@@ -19,12 +18,28 @@ AccountOwner:
       Application:
         NEWTYPE:
           TYPENAME: ApplicationId
+    2:
+      Chain: UNIT
 AccountPublicKey:
-  NEWTYPESTRUCT:
-    TYPENAME: Ed25519PublicKey
+  ENUM:
+    0:
+      Ed25519:
+        NEWTYPE:
+          TYPENAME: Ed25519PublicKey
+    1:
+      Secp256k1:
+        NEWTYPE:
+          TYPENAME: Secp256k1PublicKey
 AccountSignature:
-  NEWTYPESTRUCT:
-    TYPENAME: Ed25519Signature
+  ENUM:
+    0:
+      Ed25519:
+        NEWTYPE:
+          TYPENAME: Ed25519Signature
+    1:
+      Secp256k1:
+        NEWTYPE:
+          TYPENAME: Secp256k1Signature
 AdminOperation:
   ENUM:
     0:
@@ -32,8 +47,8 @@ AdminOperation:
         STRUCT:
           - epoch:
               TYPENAME: Epoch
-          - committee:
-              TYPENAME: Committee
+          - blob_hash:
+              TYPENAME: CryptoHash
     1:
       RemoveCommittee:
         STRUCT:
@@ -43,10 +58,8 @@ Amount:
   NEWTYPESTRUCT: U128
 ApplicationId:
   STRUCT:
-    - bytecode_id:
-        TYPENAME: BytecodeId
-    - creation:
-        TYPENAME: MessageId
+    - application_description_hash:
+        TYPENAME: CryptoHash
 ApplicationPermissions:
   STRUCT:
     - execute_operations:
@@ -62,6 +75,14 @@ ApplicationPermissions:
     - change_application_permissions:
         SEQ:
           TYPENAME: ApplicationId
+    - call_service_as_oracle:
+        OPTION:
+          SEQ:
+            TYPENAME: ApplicationId
+    - make_http_requests:
+        OPTION:
+          SEQ:
+            TYPENAME: ApplicationId
 BlobContent:
   STRUCT:
     - blob_type:
@@ -81,6 +102,10 @@ BlobType:
       ContractBytecode: UNIT
     2:
       ServiceBytecode: UNIT
+    3:
+      ApplicationDescription: UNIT
+    4:
+      Committee: UNIT
 Block:
   STRUCT:
     - header:
@@ -107,6 +132,13 @@ BlockBody:
         SEQ:
           SEQ:
             TYPENAME: Event
+    - blobs:
+        SEQ:
+          SEQ:
+            TYPENAME: BlobContent
+    - operation_results:
+        SEQ:
+          TYPENAME: OperationResult
 BlockExecutionOutcome:
   STRUCT:
     - messages:
@@ -123,6 +155,13 @@ BlockExecutionOutcome:
         SEQ:
           SEQ:
             TYPENAME: Event
+    - blobs:
+        SEQ:
+          SEQ:
+            TYPENAME: BlobContent
+    - operation_results:
+        SEQ:
+          TYPENAME: OperationResult
 BlockHeader:
   STRUCT:
     - chain_id:
@@ -160,14 +199,6 @@ BlockProposal:
     - validated_block_certificate:
         OPTION:
           TYPENAME: LiteCertificate
-BytecodeId:
-  STRUCT:
-    - contract_blob_hash:
-        TYPENAME: CryptoHash
-    - service_blob_hash:
-        TYPENAME: CryptoHash
-    - vm_runtime:
-        TYPENAME: VmRuntime
 Certificate:
   ENUM:
     0:
@@ -260,8 +291,7 @@ ChainInfoQuery:
         OPTION:
           TYPENAME: BlockHeight
     - request_owner_balance:
-        OPTION:
-          TYPENAME: AccountOwner
+        TYPENAME: AccountOwner
     - request_committees: BOOL
     - request_pending_message_bundles: BOOL
     - request_sent_certificate_hashes_in_range:
@@ -431,6 +461,14 @@ Event:
         TYPENAME: StreamId
     - key: BYTES
     - value: BYTES
+EventId:
+  STRUCT:
+    - chain_id:
+        TYPENAME: ChainId
+    - stream_id:
+        TYPENAME: StreamId
+    - key:
+        SEQ: U8
 GenericApplicationId:
   ENUM:
     0:
@@ -563,6 +601,14 @@ MessageKind:
       Tracked: UNIT
     3:
       Bouncing: UNIT
+ModuleId:
+  STRUCT:
+    - contract_blob_hash:
+        TYPENAME: CryptoHash
+    - service_blob_hash:
+        TYPENAME: CryptoHash
+    - vm_runtime:
+        TYPENAME: VmRuntime
 NodeError:
   ENUM:
     0:
@@ -688,6 +734,8 @@ Operation:
           - application_id:
               TYPENAME: ApplicationId
           - bytes: BYTES
+OperationResult:
+  NEWTYPESTRUCT: BYTES
 OracleResponse:
   ENUM:
     0:
@@ -707,6 +755,11 @@ OracleResponse:
       Round:
         NEWTYPE:
           OPTION: U32
+    5:
+      Event:
+        TUPLE:
+          - TYPENAME: EventId
+          - SEQ: U8
 Origin:
   STRUCT:
     - sender:
@@ -810,7 +863,12 @@ ResourceControlPolicy:
         TYPENAME: Amount
     - message_byte:
         TYPENAME: Amount
+    - service_as_oracle_query:
+        TYPENAME: Amount
+    - http_request:
+        TYPENAME: Amount
     - maximum_fuel_per_block: U64
+    - maximum_service_oracle_execution_ms: U64
     - maximum_executed_block_size: U64
     - maximum_bytecode_size: U64
     - maximum_blob_size: U64
@@ -818,6 +876,10 @@ ResourceControlPolicy:
     - maximum_block_proposal_size: U64
     - maximum_bytes_read_per_block: U64
     - maximum_bytes_written_per_block: U64
+    - maximum_http_response_bytes: U64
+    - http_request_timeout_ms: U64
+    - http_request_allow_list:
+        SEQ: STR
 Response:
   STRUCT:
     - status: U16
@@ -988,13 +1050,11 @@ SystemMessage:
       Credit:
         STRUCT:
           - target:
-              OPTION:
-                TYPENAME: AccountOwner
+              TYPENAME: AccountOwner
           - amount:
               TYPENAME: Amount
           - source:
-              OPTION:
-                TYPENAME: AccountOwner
+              TYPENAME: AccountOwner
     1:
       Withdraw:
         STRUCT:
@@ -1009,51 +1069,28 @@ SystemMessage:
         NEWTYPE:
           TYPENAME: OpenChainConfig
     3:
-      CreateCommittee:
-        STRUCT:
-          - epoch:
-              TYPENAME: Epoch
-          - committee:
-              TYPENAME: Committee
-    4:
-      RemoveCommittee:
-        STRUCT:
-          - epoch:
-              TYPENAME: Epoch
-    5:
       Subscribe:
         STRUCT:
           - id:
               TYPENAME: ChainId
           - subscription:
               TYPENAME: ChannelSubscription
-    6:
+    4:
       Unsubscribe:
         STRUCT:
           - id:
               TYPENAME: ChainId
           - subscription:
               TYPENAME: ChannelSubscription
-    7:
+    5:
       ApplicationCreated: UNIT
-    8:
-      RegisterApplications:
-        STRUCT:
-          - applications:
-              SEQ:
-                TYPENAME: UserApplicationDescription
-    9:
-      RequestApplication:
-        NEWTYPE:
-          TYPENAME: ApplicationId
 SystemOperation:
   ENUM:
     0:
       Transfer:
         STRUCT:
           - owner:
-              OPTION:
-                TYPENAME: Owner
+              TYPENAME: AccountOwner
           - recipient:
               TYPENAME: Recipient
           - amount:
@@ -1109,41 +1146,47 @@ SystemOperation:
           - channel:
               TYPENAME: SystemChannel
     8:
-      PublishBytecode:
+      PublishModule:
         STRUCT:
-          - bytecode_id:
-              TYPENAME: BytecodeId
+          - module_id:
+              TYPENAME: ModuleId
     9:
-      PublishDataBlob:
+      PublishCommitteeBlob:
         STRUCT:
           - blob_hash:
               TYPENAME: CryptoHash
     10:
+      PublishDataBlob:
+        STRUCT:
+          - blob_hash:
+              TYPENAME: CryptoHash
+    11:
       ReadBlob:
         STRUCT:
           - blob_id:
               TYPENAME: BlobId
-    11:
+    12:
       CreateApplication:
         STRUCT:
-          - bytecode_id:
-              TYPENAME: BytecodeId
+          - module_id:
+              TYPENAME: ModuleId
           - parameters: BYTES
           - instantiation_argument: BYTES
           - required_application_ids:
               SEQ:
                 TYPENAME: ApplicationId
-    12:
-      RequestApplication:
-        STRUCT:
-          - chain_id:
-              TYPENAME: ChainId
-          - application_id:
-              TYPENAME: ApplicationId
     13:
       Admin:
         NEWTYPE:
           TYPENAME: AdminOperation
+    14:
+      ProcessNewEpoch:
+        NEWTYPE:
+          TYPENAME: Epoch
+    15:
+      ProcessRemovedEpoch:
+        NEWTYPE:
+          TYPENAME: Epoch
 TimeDelta:
   NEWTYPESTRUCT: U64
 Timeout:
@@ -1178,16 +1221,6 @@ TimeoutConfig:
         TYPENAME: TimeDelta
 Timestamp:
   NEWTYPESTRUCT: U64
-UserApplicationDescription:
-  STRUCT:
-    - bytecode_id:
-        TYPENAME: BytecodeId
-    - creation:
-        TYPENAME: MessageId
-    - parameters: BYTES
-    - required_application_ids:
-        SEQ:
-          TYPENAME: ApplicationId
 ValidatedBlockCertificate:
   STRUCT:
     - value:

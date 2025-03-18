@@ -16,6 +16,7 @@ test = ["tokio/macros", "linera-base/test", "linera-execution/test"]
 metrics = ["prometheus", "linera-views/metrics", "linera-execution/metrics"]
 web = ["linera-base/web", "linera-views/web", "linera-execution/web"]
 benchmark = ["linera-base/test"]
+unstable-oracles = ["linera-execution/unstable-oracles"]
 
 [dependencies]
 async-graphql.workspace = true
@@ -39,6 +40,7 @@ anyhow.workspace = true
 assert_matches.workspace = true
 bcs.workspace = true
 linera-chain = { path = ".", default-features = false, features = ["test"] }
+test-case.workspace = true
 
 [build-dependencies]
 cfg_aliases.workspace = true

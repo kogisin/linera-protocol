@@ -25,6 +25,11 @@ loki-stack:
       clients:
         - url: http://linera-core-loki:3100/loki/api/v1/push
 
+# Pyroscope Configuration
+pyroscope:
+  persistence:
+    enabled: true
+
 # Prometheus/Grafana
 kube-prometheus-stack:
   grafana:
@@ -33,6 +38,9 @@ kube-prometheus-stack:
         enabled: true
         label: grafana_dashboard
         labelValue: "1"
+        folderAnnotation: grafana_folder
+        provider:
+          foldersFromFilesStructure: true
     persistence:
       enabled: true
       size: 1Gi

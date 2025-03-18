@@ -154,7 +154,7 @@ where
             ClientOutcome::WaitForTimeout(timeout) => {
                 return Err(Error::new(format!(
                     "This faucet is using a multi-owner chain and is not the leader right now. \
-                    try again at {}",
+                    Try again at {}",
                     timeout.timestamp,
                 )));
             }
@@ -270,6 +270,7 @@ where
     }
 
     /// Runs the faucet.
+    #[tracing::instrument(name = "FaucetService::run", skip_all, fields(port = self.port, chain_id = ?self.chain_id))]
     pub async fn run(self) -> anyhow::Result<()> {
         let port = self.port.get();
         let index_handler = axum::routing::get(graphiql).post(Self::index_handler);

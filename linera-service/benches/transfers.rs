@@ -7,8 +7,9 @@ use futures::{
     Stream, StreamExt,
 };
 use linera_base::{
+    crypto::{AccountSecretKey, Ed25519SecretKey, Secp256k1SecretKey},
     data_types::Amount,
-    identifiers::{Account, ChainId, Owner},
+    identifiers::{Account, AccountOwner, ChainId},
     time::{Duration, Instant},
 };
 use linera_execution::system::Recipient;
@@ -63,7 +64,14 @@ async fn setup_native_token_balances(
 
     let validator = TestValidator::new().await;
     let chains = stream::iter(0..chain_count)
-        .then(|_| validator.new_chain())
+        .then(|idx| {
+            let key_pair = if idx % 2 == 0 {
+                AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate())
+            } else {
+                AccountSecretKey::Ed25519(Ed25519SecretKey::generate())
+            };
+            validator.new_chain_with_keypair(key_pair)
+        })
         .collect::<Vec<_>>()
         .await;
 
@@ -72,7 +80,7 @@ async fn setup_native_token_balances(
     for chain in &chains {
         let recipient = Recipient::Account(Account {
             chain_id: chain.id(),
-            owner: Some(chain.public_key().into()),
+            owner: chain.public_key().into(),
         });
 
         // TODO: Support benchmarking chains with multiple owner accounts
@@ -80,7 +88,7 @@ async fn setup_native_token_balances(
         admin_chain
             .add_block(|block| {
                 block.with_native_token_transfer(
-                    None,
+                    AccountOwner::Chain,
                     recipient,
                     Amount::from_tokens(initial_balance),
                 );
@@ -102,7 +110,7 @@ fn prepare_transfers(
         .iter()
         .map(|chain| Account {
             chain_id: chain.id(),
-            owner: Some(chain.public_key().into()),
+            owner: chain.public_key().into(),
         })
         .collect::<Vec<_>>();
 
@@ -111,7 +119,7 @@ fn prepare_transfers(
         .enumerate()
         .map(|(index, chain)| {
             let chain_id = chain.id();
-            let sender = Some(Owner::from(chain.public_key()));
+            let sender = AccountOwner::from(chain.public_key());
 
             let transfers = accounts
                 .iter()

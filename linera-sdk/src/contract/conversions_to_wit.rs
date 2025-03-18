@@ -9,8 +9,8 @@ use linera_base::{
         Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, TimeDelta,
     },
     identifiers::{
-        Account, AccountOwner, ApplicationId, BytecodeId, ChainId, ChannelName, Destination,
-        MessageId, Owner, StreamName,
+        Account, AccountOwner, ApplicationId, ChainId, ChannelName, Destination, MessageId,
+        ModuleId, Owner, StreamName,
     },
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
@@ -58,7 +58,7 @@ impl From<Account> for wit_contract_api::Account {
     fn from(account: Account) -> Self {
         wit_contract_api::Account {
             chain_id: account.chain_id.into(),
-            owner: account.owner.map(|owner| owner.into()),
+            owner: account.owner.into(),
         }
     }
 }
@@ -70,6 +70,7 @@ impl From<AccountOwner> for wit_contract_api::AccountOwner {
             AccountOwner::Application(application_id) => {
                 wit_contract_api::AccountOwner::Application(application_id.into())
             }
+            AccountOwner::Chain => wit_contract_api::AccountOwner::Chain,
         }
     }
 }
@@ -90,12 +91,12 @@ impl From<BlockHeight> for wit_contract_api::BlockHeight {
     }
 }
 
-impl From<BytecodeId> for wit_contract_api::BytecodeId {
-    fn from(bytecode_id: BytecodeId) -> Self {
-        wit_contract_api::BytecodeId {
-            contract_blob_hash: bytecode_id.contract_blob_hash.into(),
-            service_blob_hash: bytecode_id.service_blob_hash.into(),
-            vm_runtime: bytecode_id.vm_runtime.into(),
+impl From<ModuleId> for wit_contract_api::ModuleId {
+    fn from(module_id: ModuleId) -> Self {
+        wit_contract_api::ModuleId {
+            contract_blob_hash: module_id.contract_blob_hash.into(),
+            service_blob_hash: module_id.service_blob_hash.into(),
+            vm_runtime: module_id.vm_runtime.into(),
         }
     }
 }
@@ -122,8 +123,7 @@ impl From<MessageId> for wit_contract_api::MessageId {
 impl From<ApplicationId> for wit_contract_api::ApplicationId {
     fn from(application_id: ApplicationId) -> Self {
         wit_contract_api::ApplicationId {
-            bytecode_id: application_id.bytecode_id.into(),
-            creation: application_id.creation.into(),
+            application_description_hash: application_id.application_description_hash.into(),
         }
     }
 }
@@ -139,6 +139,8 @@ impl From<Resources> for wit_contract_api::Resources {
             messages: resources.messages,
             message_size: resources.message_size,
             storage_size_delta: resources.storage_size_delta,
+            service_as_oracle_queries: resources.service_as_oracle_queries,
+            http_requests: resources.http_requests,
         }
     }
 }
@@ -216,6 +218,8 @@ impl From<ApplicationPermissions> for wit_contract_api::ApplicationPermissions {
             mandatory_applications,
             close_chain,
             change_application_permissions,
+            call_service_as_oracle,
+            make_http_requests,
         } = permissions;
         Self {
             execute_operations: execute_operations
@@ -226,6 +230,10 @@ impl From<ApplicationPermissions> for wit_contract_api::ApplicationPermissions {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            call_service_as_oracle: call_service_as_oracle
+                .map(|app_ids| app_ids.into_iter().map(Into::into).collect()),
+            make_http_requests: make_http_requests
+                .map(|app_ids| app_ids.into_iter().map(Into::into).collect()),
         }
     }
 }

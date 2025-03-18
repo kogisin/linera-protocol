@@ -4,10 +4,10 @@
 use graphql_client::GraphQLQuery;
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Amount, BlockHeight, OracleResponse, Round, Timestamp},
+    data_types::{Amount, Blob, BlockHeight, OracleResponse, Round, Timestamp},
     identifiers::{
-        Account, BlobId, ChainDescription, ChainId, ChannelName, Destination, GenericApplicationId,
-        Owner, StreamName,
+        Account, AccountOwner, BlobId, ChainDescription, ChainId, ChannelName, Destination,
+        GenericApplicationId, Owner, StreamName,
     },
 };
 
@@ -33,6 +33,7 @@ mod types {
     pub type Origin = Value;
     pub type Target = Value;
     pub type UserApplicationDescription = Value;
+    pub type OperationResult = Value;
 
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
     pub struct Notification {
@@ -65,7 +66,7 @@ mod types {
         ownership::ChainOwnership,
     };
     pub use linera_chain::{
-        data_types::{MessageAction, MessageBundle, Origin, Target},
+        data_types::{MessageAction, MessageBundle, OperationResult, Origin, Target},
         manager::ChainManager,
     };
     pub use linera_core::worker::{Notification, Reason};
@@ -136,11 +137,10 @@ mod from {
     use linera_base::{data_types::Event, hashed::Hashed, identifiers::StreamId};
     use linera_chain::{
         block::{Block, BlockBody, BlockHeader},
-        data_types::{
-            ExecutedBlock, IncomingBundle, MessageBundle, OutgoingMessage, PostedMessage,
-        },
+        data_types::{ExecutedBlock, IncomingBundle, MessageBundle, PostedMessage},
         types::ConfirmedBlock,
     };
+    use linera_execution::OutgoingMessage;
 
     use super::*;
 
@@ -237,6 +237,8 @@ mod from {
                 operations_hash,
                 oracle_responses_hash,
                 events_hash,
+                blobs_hash,
+                operation_results_hash,
             } = header;
             let block::BlockBlockValueBlockBody {
                 incoming_bundles,
@@ -244,6 +246,8 @@ mod from {
                 operations,
                 oracle_responses,
                 events,
+                blobs,
+                operation_results,
             } = body;
 
             let block_header = BlockHeader {
@@ -259,6 +263,8 @@ mod from {
                 operations_hash,
                 oracle_responses_hash,
                 events_hash,
+                blobs_hash,
+                operation_results_hash,
             };
             let block_body = BlockBody {
                 incoming_bundles: incoming_bundles
@@ -275,6 +281,11 @@ mod from {
                     .into_iter()
                     .map(|events| events.into_iter().map(Into::into).collect())
                     .collect(),
+                blobs: blobs
+                    .into_iter()
+                    .map(|blobs| blobs.into_iter().map(Into::into).collect())
+                    .collect(),
+                operation_results,
             };
 
             Block {

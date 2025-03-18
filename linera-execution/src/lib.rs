@@ -7,7 +7,6 @@
 #![cfg_attr(web, feature(trait_upcasting))]
 #![deny(clippy::large_futures)]
 
-mod applications;
 pub mod committee;
 mod execution;
 mod execution_state_actor;
@@ -43,20 +42,17 @@ use linera_base::{
     },
     doc_scalar, hex_debug, http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BlobId, BytecodeId, ChainId, ChannelName,
-        Destination, EventId, GenericApplicationId, MessageId, Owner, StreamName,
-        UserApplicationId,
+        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, ChannelName, Destination,
+        EventId, GenericApplicationId, MessageId, ModuleId, Owner, StreamName, UserApplicationId,
     },
     ownership::ChainOwnership,
     task,
 };
 use linera_views::{batch::Batch, views::ViewError};
 use serde::{Deserialize, Serialize};
-use system::OpenChainConfig;
+use system::{OpenChainConfig, SystemChannel};
 use thiserror::Error;
 
-#[cfg(with_testing)]
-pub use crate::applications::ApplicationRegistry;
 #[cfg(with_revm)]
 use crate::revm::EvmExecutionError;
 use crate::runtime::ContractSyncRuntime;
@@ -68,7 +64,6 @@ pub use crate::wasm::{
     ServiceRuntimeApi, WasmContractModule, WasmExecutionError, WasmServiceModule,
 };
 pub use crate::{
-    applications::ApplicationRegistryView,
     execution::{ExecutionStateView, ServiceRuntimeEndpoint},
     execution_state_actor::ExecutionRequest,
     policy::ResourceControlPolicy,
@@ -78,8 +73,7 @@ pub use crate::{
         ServiceSyncRuntimeHandle,
     },
     system::{
-        SystemExecutionError, SystemExecutionStateView, SystemMessage, SystemOperation,
-        SystemQuery, SystemResponse,
+        SystemExecutionStateView, SystemMessage, SystemOperation, SystemQuery, SystemResponse,
     },
     transaction_tracker::{TransactionOutcome, TransactionTracker},
 };
@@ -198,8 +192,6 @@ pub enum ExecutionError {
     ViewError(ViewError),
     #[error(transparent)]
     ArithmeticError(#[from] ArithmeticError),
-    #[error(transparent)]
-    SystemError(SystemExecutionError),
     #[error("User application reported an error: {0}")]
     UserError(String),
     #[cfg(with_wasm_runtime)]
@@ -237,12 +229,16 @@ pub enum ExecutionError {
     ExcessiveWrite,
     #[error("Block execution required too much fuel")]
     MaximumFuelExceeded,
+    #[error("Services running as oracles in block took longer than allowed")]
+    MaximumServiceOracleExecutionTimeExceeded,
     #[error("Serialized size of the executed block exceeds limit")]
     ExecutedBlockTooLarge,
+    #[error("HTTP response exceeds the size limit of {limit} bytes, having at least {size} bytes")]
+    HttpResponseSizeLimitExceeded { limit: u64, size: u64 },
     #[error("Runtime failed to respond to application")]
     MissingRuntimeResponse,
-    #[error("Bytecode ID {0:?} is invalid")]
-    InvalidBytecodeId(BytecodeId),
+    #[error("Module ID {0:?} is invalid")]
+    InvalidModuleId(ModuleId),
     #[error("Owner is None")]
     OwnerIsNone,
     #[error("Application is not authorized to perform system operations on this chain: {0:}")]
@@ -273,6 +269,10 @@ pub enum ExecutionError {
     BlobTooLarge,
     #[error("Bytecode exceeds size limit")]
     BytecodeTooLarge,
+    #[error("Attempt to perform an HTTP request to an unauthorized host: {0:?}")]
+    UnauthorizedHttpRequest(reqwest::Url),
+    #[error("Attempt to perform an HTTP request to an invalid URL")]
+    InvalidUrlForHttpRequest(#[from] url::ParseError),
     // TODO(#2127): Remove this error and the unstable-oracles feature once there are fees
     // and enforced limits for all oracles.
     #[error("Unstable oracles are disabled on this network.")]
@@ -288,6 +288,53 @@ pub enum ExecutionError {
     InvalidHeaderName(#[from] reqwest::header::InvalidHeaderName),
     #[error("Invalid HTTP header value used for HTTP request")]
     InvalidHeaderValue(#[from] reqwest::header::InvalidHeaderValue),
+
+    #[error("Invalid admin ID in new chain: {0}")]
+    InvalidNewChainAdminId(ChainId),
+    #[error("Invalid committees")]
+    InvalidCommittees,
+    #[error("{epoch:?} is not recognized by chain {chain_id:}")]
+    InvalidEpoch { chain_id: ChainId, epoch: Epoch },
+    #[error("Transfer must have positive amount")]
+    IncorrectTransferAmount,
+    #[error("Transfer from owned account must be authenticated by the right signer")]
+    UnauthenticatedTransferOwner,
+    #[error("The transferred amount must not exceed the current chain balance: {balance}")]
+    InsufficientFunding { balance: Amount },
+    #[error("Required execution fees exceeded the total funding available: {balance}")]
+    InsufficientFundingForFees { balance: Amount },
+    #[error("Claim must have positive amount")]
+    IncorrectClaimAmount,
+    #[error("Claim must be authenticated by the right signer")]
+    UnauthenticatedClaimOwner,
+    #[error("Admin operations are only allowed on the admin chain.")]
+    AdminOperationOnNonAdminChain,
+    #[error("Failed to create new committee: expected {expected}, but got {provided}")]
+    InvalidCommitteeEpoch { expected: Epoch, provided: Epoch },
+    #[error("Failed to remove committee")]
+    InvalidCommitteeRemoval,
+    #[error("Cannot subscribe to a channel ({1}) on the same chain ({0})")]
+    SelfSubscription(ChainId, SystemChannel),
+    #[error("Chain {0} tried to subscribe to channel {1} but it is already subscribed")]
+    AlreadySubscribedToChannel(ChainId, SystemChannel),
+    #[error("Invalid unsubscription request to channel {1} on chain {0}")]
+    InvalidUnsubscription(ChainId, SystemChannel),
+    #[error("Amount overflow")]
+    AmountOverflow,
+    #[error("Amount underflow")]
+    AmountUnderflow,
+    #[error("Chain balance overflow")]
+    BalanceOverflow,
+    #[error("Chain balance underflow")]
+    BalanceUnderflow,
+    #[error("Cannot decrease the chain's timestamp")]
+    TicksOutOfOrder,
+    #[error("Application {0:?} is not registered by the chain")]
+    UnknownApplicationId(Box<UserApplicationId>),
+    #[error("Chain is not active yet.")]
+    InactiveChain,
+    #[error("No recorded response for oracle query")]
+    MissingOracleResponse,
 }
 
 impl From<ViewError> for ExecutionError {
@@ -295,17 +342,6 @@ impl From<ViewError> for ExecutionError {
         match error {
             ViewError::BlobsNotFound(blob_ids) => ExecutionError::BlobsNotFound(blob_ids),
             error => ExecutionError::ViewError(error),
-        }
-    }
-}
-
-impl From<SystemExecutionError> for ExecutionError {
-    fn from(error: SystemExecutionError) -> Self {
-        match error {
-            SystemExecutionError::BlobsNotFound(blob_ids) => {
-                ExecutionError::BlobsNotFound(blob_ids)
-            }
-            error => ExecutionError::SystemError(error),
         }
     }
 }
@@ -345,23 +381,6 @@ pub trait UserService {
         context: QueryContext,
         argument: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError>;
-}
-
-/// The result of calling into a user application.
-#[derive(Default)]
-pub struct ApplicationCallOutcome {
-    /// The return value.
-    pub value: Vec<u8>,
-    /// The externally-visible result.
-    pub execution_outcome: RawExecutionOutcome<Vec<u8>>,
-}
-
-impl ApplicationCallOutcome {
-    /// Adds a `message` to this [`ApplicationCallOutcome`].
-    pub fn with_message(mut self, message: RawOutgoingMessage<Vec<u8>>) -> Self {
-        self.execution_outcome.messages.push(message);
-        self
-    }
 }
 
 /// Configuration options for the execution runtime available to applications.
@@ -655,11 +674,11 @@ pub trait ServiceRuntime: BaseRuntime {
         argument: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError>;
 
-    /// Fetches blob of bytes from an arbitrary URL.
-    fn fetch_url(&mut self, url: &str) -> Result<Vec<u8>, ExecutionError>;
-
     /// Schedules an operation to be included in the block proposed after execution.
     fn schedule_operation(&mut self, operation: Vec<u8>) -> Result<(), ExecutionError>;
+
+    /// Checks if the service has exceeded its execution time limit.
+    fn check_execution_time(&mut self) -> Result<(), ExecutionError>;
 }
 
 pub trait ContractRuntime: BaseRuntime {
@@ -695,7 +714,7 @@ pub trait ContractRuntime: BaseRuntime {
     /// Transfers amount from source to destination.
     fn transfer(
         &mut self,
-        source: Option<AccountOwner>,
+        source: AccountOwner,
         destination: Account,
         amount: Amount,
     ) -> Result<(), ExecutionError>;
@@ -752,7 +771,7 @@ pub trait ContractRuntime: BaseRuntime {
     /// Creates a new application on chain.
     fn create_application(
         &mut self,
-        bytecode_id: BytecodeId,
+        module_id: ModuleId,
         parameters: Vec<u8>,
         argument: Vec<u8>,
         required_application_ids: Vec<UserApplicationId>,
@@ -860,7 +879,7 @@ pub enum QueryResponse {
 /// A message together with routing information.
 #[derive(Clone, Debug)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
-pub struct RawOutgoingMessage<Message, Grant = Resources> {
+pub struct RawOutgoingMessage<Message, Grant> {
     /// The destination of the message.
     pub destination: Destination,
     /// Whether the message is authenticated.
@@ -914,18 +933,40 @@ pub enum MessageKind {
     Bouncing,
 }
 
+/// A posted message together with routing information.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+pub struct OutgoingMessage {
+    /// The destination of the message.
+    pub destination: Destination,
+    /// The user authentication carried by the message, if any.
+    #[debug(skip_if = Option::is_none)]
+    pub authenticated_signer: Option<Owner>,
+    /// A grant to pay for the message execution.
+    #[debug(skip_if = Amount::is_zero)]
+    pub grant: Amount,
+    /// Where to send a refund for the unused part of the grant after execution, if any.
+    #[debug(skip_if = Option::is_none)]
+    pub refund_grant_to: Option<Account>,
+    /// The kind of message being sent.
+    pub kind: MessageKind,
+    /// The message itself.
+    pub message: Message,
+}
+
+impl<'de> BcsHashable<'de> for OutgoingMessage {}
+
 /// Externally visible results of an execution. These results are meant in the context of
 /// the application that created them.
 #[derive(Debug)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
-pub struct RawExecutionOutcome<Message, Grant = Resources> {
+pub struct RawExecutionOutcome<Message> {
     /// The signer who created the messages.
     pub authenticated_signer: Option<Owner>,
     /// Where to send a refund for the unused part of each grant after execution, if any.
     pub refund_grant_to: Option<Account>,
     /// Sends messages to the given destinations, possibly forwarding the authenticated
     /// signer and including grant with the refund policy described above.
-    pub messages: Vec<RawOutgoingMessage<Message, Grant>>,
+    pub messages: Vec<RawOutgoingMessage<Message, Amount>>,
 }
 
 /// The identifier of a channel, relative to a particular application.
@@ -939,32 +980,7 @@ pub struct ChannelSubscription {
     pub name: ChannelName,
 }
 
-/// Externally visible results of an execution, tagged by their application.
-#[derive(Debug)]
-#[cfg_attr(with_testing, derive(Eq, PartialEq))]
-#[expect(clippy::large_enum_variant)]
-pub enum ExecutionOutcome {
-    System(RawExecutionOutcome<SystemMessage, Amount>),
-    User(UserApplicationId, RawExecutionOutcome<Vec<u8>, Amount>),
-}
-
-impl ExecutionOutcome {
-    pub fn application_id(&self) -> GenericApplicationId {
-        match self {
-            ExecutionOutcome::System(_) => GenericApplicationId::System,
-            ExecutionOutcome::User(app_id, _) => GenericApplicationId::User(*app_id),
-        }
-    }
-
-    pub fn message_count(&self) -> usize {
-        match self {
-            ExecutionOutcome::System(outcome) => outcome.messages.len(),
-            ExecutionOutcome::User(_, outcome) => outcome.messages.len(),
-        }
-    }
-}
-
-impl<Message, Grant> RawExecutionOutcome<Message, Grant> {
+impl<Message> RawExecutionOutcome<Message> {
     pub fn with_authenticated_signer(mut self, authenticated_signer: Option<Owner>) -> Self {
         self.authenticated_signer = authenticated_signer;
         self
@@ -976,13 +992,13 @@ impl<Message, Grant> RawExecutionOutcome<Message, Grant> {
     }
 
     /// Adds a `message` to this [`RawExecutionOutcome`].
-    pub fn with_message(mut self, message: RawOutgoingMessage<Message, Grant>) -> Self {
+    pub fn with_message(mut self, message: RawOutgoingMessage<Message, Amount>) -> Self {
         self.messages.push(message);
         self
     }
 }
 
-impl<Message, Grant> Default for RawExecutionOutcome<Message, Grant> {
+impl<Message> Default for RawExecutionOutcome<Message> {
     fn default() -> Self {
         Self {
             authenticated_signer: None,
@@ -1014,33 +1030,13 @@ impl<Message> RawOutgoingMessage<Message, Resources> {
     }
 }
 
-impl<Message> RawExecutionOutcome<Message, Resources> {
-    pub fn into_priced(
-        self,
-        policy: &ResourceControlPolicy,
-    ) -> Result<RawExecutionOutcome<Message, Amount>, ArithmeticError> {
-        let RawExecutionOutcome {
-            authenticated_signer,
-            refund_grant_to,
-            messages,
-        } = self;
-        let messages = messages
-            .into_iter()
-            .map(|message| message.into_priced(policy))
-            .collect::<Result<_, _>>()?;
-        Ok(RawExecutionOutcome {
-            authenticated_signer,
-            refund_grant_to,
-            messages,
-        })
-    }
-}
-
 impl OperationContext {
+    /// Returns an account for the refund.
+    /// Returns `None` if there is no authenticated signer of the [`OperationContext`].
     fn refund_grant_to(&self) -> Option<Account> {
-        Some(Account {
+        self.authenticated_signer.map(|owner| Account {
             chain_id: self.chain_id,
-            owner: self.authenticated_signer.map(AccountOwner::User),
+            owner: AccountOwner::User(owner),
         })
     }
 
@@ -1185,7 +1181,7 @@ impl Operation {
     /// Creates a new user application operation following the `application_id`'s [`Abi`].
     #[cfg(with_testing)]
     pub fn user<A: Abi>(
-        application_id: UserApplicationId<A>,
+        application_id: ApplicationId<A>,
         operation: &A::Operation,
     ) -> Result<Self, bcs::Error> {
         Self::user_without_abi(application_id.forget_abi(), operation)
@@ -1195,7 +1191,7 @@ impl Operation {
     /// `application_id`.
     #[cfg(with_testing)]
     pub fn user_without_abi(
-        application_id: UserApplicationId<()>,
+        application_id: ApplicationId<()>,
         operation: &impl Serialize,
     ) -> Result<Self, bcs::Error> {
         Ok(Operation::User {
@@ -1208,6 +1204,23 @@ impl Operation {
         match self {
             Self::System(_) => GenericApplicationId::System,
             Self::User { application_id, .. } => GenericApplicationId::User(*application_id),
+        }
+    }
+
+    /// Returns the IDs of all blobs published in this operation.
+    pub fn published_blob_ids(&self) -> Vec<BlobId> {
+        match self {
+            Operation::System(SystemOperation::PublishDataBlob { blob_hash }) => {
+                vec![BlobId::new(*blob_hash, BlobType::Data)]
+            }
+            Operation::System(SystemOperation::PublishCommitteeBlob { blob_hash }) => {
+                vec![BlobId::new(*blob_hash, BlobType::Committee)]
+            }
+            Operation::System(SystemOperation::PublishModule { module_id }) => vec![
+                BlobId::new(module_id.contract_blob_hash, BlobType::ContractBytecode),
+                BlobId::new(module_id.service_blob_hash, BlobType::ServiceBytecode),
+            ],
+            _ => vec![],
         }
     }
 }
@@ -1226,7 +1239,7 @@ impl Message {
     /// Creates a new user application message assuming that the `message` is valid for the
     /// `application_id`.
     pub fn user<A, M: Serialize>(
-        application_id: UserApplicationId<A>,
+        application_id: ApplicationId<A>,
         message: &M,
     ) -> Result<Self, bcs::Error> {
         let application_id = application_id.forget_abi();
@@ -1291,7 +1304,7 @@ impl Query {
 
     /// Creates a new user application query following the `application_id`'s [`Abi`].
     pub fn user<A: Abi>(
-        application_id: UserApplicationId<A>,
+        application_id: ApplicationId<A>,
         query: &A::Query,
     ) -> Result<Self, serde_json::Error> {
         Self::user_without_abi(application_id.forget_abi(), query)
@@ -1300,7 +1313,7 @@ impl Query {
     /// Creates a new user application query assuming that the `query` is valid for the
     /// `application_id`.
     pub fn user_without_abi(
-        application_id: UserApplicationId<()>,
+        application_id: ApplicationId<()>,
         query: &impl Serialize,
     ) -> Result<Self, serde_json::Error> {
         Ok(Query::User {

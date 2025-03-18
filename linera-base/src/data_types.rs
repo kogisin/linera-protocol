@@ -34,8 +34,8 @@ use crate::{
     crypto::{BcsHashable, CryptoHash},
     doc_scalar, hex_debug, http,
     identifiers::{
-        ApplicationId, BlobId, BlobType, BytecodeId, ChainId, Destination, EventId,
-        GenericApplicationId, MessageId, StreamId, UserApplicationId,
+        ApplicationId, BlobId, BlobType, ChainId, Destination, EventId, GenericApplicationId,
+        ModuleId, StreamId, UserApplicationId,
     },
     limited_writer::{LimitedWriter, LimitedWriterError},
     time::{Duration, SystemTime},
@@ -284,6 +284,10 @@ pub struct Resources {
     pub message_size: u32,
     /// An increase in the amount of storage space.
     pub storage_size_delta: u32,
+    /// A number of service-as-oracle requests to be performed.
+    pub service_as_oracle_queries: u32,
+    /// A number of HTTP requests to be performed.
+    pub http_requests: u32,
     // TODO(#1532): Account for the system calls that we plan on calling.
     // TODO(#1533): Allow declaring calls to other applications instead of having to count them here.
 }
@@ -728,6 +732,14 @@ pub struct ApplicationPermissions {
     #[graphql(default)]
     #[debug(skip_if = Vec::is_empty)]
     pub change_application_permissions: Vec<ApplicationId>,
+    /// These applications are allowed to perform calls to services as oracles.
+    #[graphql(default)]
+    #[debug(skip_if = Option::is_none)]
+    pub call_service_as_oracle: Option<Vec<ApplicationId>>,
+    /// These applications are allowed to perform HTTP requests.
+    #[graphql(default)]
+    #[debug(skip_if = Option::is_none)]
+    pub make_http_requests: Option<Vec<ApplicationId>>,
 }
 
 impl ApplicationPermissions {
@@ -739,6 +751,8 @@ impl ApplicationPermissions {
             mandatory_applications: vec![app_id],
             close_chain: vec![app_id],
             change_application_permissions: vec![app_id],
+            call_service_as_oracle: Some(vec![app_id]),
+            make_http_requests: Some(vec![app_id]),
         }
     }
 
@@ -761,6 +775,22 @@ impl ApplicationPermissions {
     pub fn can_change_application_permissions(&self, app_id: &ApplicationId) -> bool {
         self.change_application_permissions.contains(app_id)
     }
+
+    /// Returns whether the given application can call services.
+    pub fn can_call_services(&self, app_id: &ApplicationId) -> bool {
+        self.call_service_as_oracle
+            .as_ref()
+            .map(|app_ids| app_ids.contains(app_id))
+            .unwrap_or(true)
+    }
+
+    /// Returns whether the given application can make HTTP requests.
+    pub fn can_make_http_requests(&self, app_id: &ApplicationId) -> bool {
+        self.make_http_requests
+            .as_ref()
+            .map(|app_ids| app_ids.contains(app_id))
+            .unwrap_or(true)
+    }
 }
 
 /// A record of a single oracle response.
@@ -780,17 +810,23 @@ pub enum OracleResponse {
     Assert,
     /// The block's validation round.
     Round(Option<u32>),
+    /// An event was read.
+    Event(EventId, Vec<u8>),
 }
 
 impl<'de> BcsHashable<'de> for OracleResponse {}
 
-/// Description of the necessary information to run a user application.
+/// Description of the necessary information to run a user application used within blobs.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
 pub struct UserApplicationDescription {
     /// The unique ID of the bytecode to use for the application.
-    pub bytecode_id: BytecodeId,
-    /// The unique ID of the application's creation.
-    pub creation: MessageId,
+    pub module_id: ModuleId,
+    /// The chain ID that created the application.
+    pub creator_chain_id: ChainId,
+    /// Height of the block that created this application.
+    pub block_height: BlockHeight,
+    /// The index of the application among those created in the same block.
+    pub application_index: u32,
     /// The parameters of the application.
     #[serde(with = "serde_bytes")]
     #[debug(with = "hex_debug")]
@@ -801,10 +837,18 @@ pub struct UserApplicationDescription {
 
 impl From<&UserApplicationDescription> for UserApplicationId {
     fn from(description: &UserApplicationDescription) -> Self {
-        UserApplicationId {
-            bytecode_id: description.bytecode_id,
-            creation: description.creation,
-        }
+        UserApplicationId::new(CryptoHash::new(&BlobContent::new_application_description(
+            description,
+        )))
+    }
+}
+
+impl BcsHashable<'_> for UserApplicationDescription {}
+
+impl UserApplicationDescription {
+    /// Gets the serialized bytes for this `UserApplicationDescription`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bcs::to_bytes(self).expect("Serializing blob bytes should not fail!")
     }
 }
 
@@ -941,8 +985,7 @@ impl CompressedBytecode {
 impl<'a> BcsHashable<'a> for BlobContent {}
 
 /// A blob of binary data.
-#[derive(Hash, Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(with_testing, derive(Eq, PartialEq))]
+#[derive(Hash, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobContent {
     /// The type of data represented by the bytes.
     blob_type: BlobType,
@@ -980,6 +1023,19 @@ impl BlobContent {
         )
     }
 
+    /// Creates a new application description [`BlobContent`] from a [`UserApplicationDescription`].
+    pub fn new_application_description(
+        application_description: &UserApplicationDescription,
+    ) -> Self {
+        let bytes = application_description.to_bytes();
+        BlobContent::new(BlobType::ApplicationDescription, bytes)
+    }
+
+    /// Creates a new committee [`BlobContent`] from the provided serialized committee.
+    pub fn new_committee(committee: impl Into<Box<[u8]>>) -> Self {
+        BlobContent::new(BlobType::Committee, committee)
+    }
+
     /// Gets a reference to the blob's bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -1003,8 +1059,7 @@ impl From<Blob> for BlobContent {
 }
 
 /// A blob of binary data, with its hash.
-#[derive(Debug, Hash, Clone)]
-#[cfg_attr(with_testing, derive(Eq, PartialEq))]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct Blob {
     /// ID of the blob.
     hash: CryptoHash,
@@ -1043,6 +1098,16 @@ impl Blob {
     /// Creates a new service bytecode [`BlobContent`] from the provided bytes.
     pub fn new_service_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
         Blob::new(BlobContent::new_service_bytecode(compressed_bytecode))
+    }
+
+    /// Creates a new application description [`BlobContent`] from the provided
+    /// description.
+    pub fn new_application_description(
+        application_description: &UserApplicationDescription,
+    ) -> Self {
+        Blob::new(BlobContent::new_application_description(
+            application_description,
+        ))
     }
 
     /// A content-addressed blob ID i.e. the hash of the `Blob`.
@@ -1111,6 +1176,8 @@ impl<'a> Deserialize<'a> for Blob {
         }
     }
 }
+
+impl<'de> BcsHashable<'de> for Blob {}
 
 /// An event recorded in an executed block.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]

@@ -6,7 +6,7 @@
 use linera_base::{
     crypto::CryptoHash,
     data_types::{Amount, BlockHeight},
-    identifiers::{ApplicationId, BytecodeId, ChainId, MessageId, Owner},
+    identifiers::{ApplicationId, ChainId, MessageId, ModuleId, Owner},
     ownership::{ChangeApplicationPermissionsError, CloseChainError},
     vm::VmRuntime,
 };
@@ -30,12 +30,12 @@ impl From<wit_contract_api::Owner> for Owner {
     }
 }
 
-impl From<wit_contract_api::BytecodeId> for BytecodeId {
-    fn from(bytecode_id: wit_contract_api::BytecodeId) -> Self {
-        BytecodeId::new(
-            bytecode_id.contract_blob_hash.into(),
-            bytecode_id.service_blob_hash.into(),
-            bytecode_id.vm_runtime.into(),
+impl From<wit_contract_api::ModuleId> for ModuleId {
+    fn from(module_id: wit_contract_api::ModuleId) -> Self {
+        ModuleId::new(
+            module_id.contract_blob_hash.into(),
+            module_id.service_blob_hash.into(),
+            module_id.vm_runtime.into(),
         )
     }
 }
@@ -61,10 +61,7 @@ impl From<wit_contract_api::MessageId> for MessageId {
 
 impl From<wit_contract_api::ApplicationId> for ApplicationId {
     fn from(application_id: wit_contract_api::ApplicationId) -> Self {
-        ApplicationId {
-            bytecode_id: application_id.bytecode_id.into(),
-            creation: application_id.creation.into(),
-        }
+        ApplicationId::new(application_id.application_description_hash.into())
     }
 }
 

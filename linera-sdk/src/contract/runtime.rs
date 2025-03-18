@@ -10,8 +10,8 @@ use linera_base::{
     },
     http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BytecodeId, ChainId, ChannelName, Destination,
-        MessageId, Owner, StreamName,
+        Account, AccountOwner, ApplicationId, ChainId, ChannelName, Destination, MessageId,
+        ModuleId, Owner, StreamName,
     },
     ownership::{ChainOwnership, ChangeApplicationPermissionsError, CloseChainError},
 };
@@ -231,12 +231,8 @@ where
 
     /// Transfers an `amount` of native tokens from `source` owner account (or the current chain's
     /// balance) to `destination`.
-    pub fn transfer(&mut self, source: Option<AccountOwner>, destination: Account, amount: Amount) {
-        contract_wit::transfer(
-            source.map(|source| source.into()),
-            destination.into(),
-            amount.into(),
-        )
+    pub fn transfer(&mut self, source: AccountOwner, destination: Account, amount: Amount) {
+        contract_wit::transfer(source.into(), destination.into(), amount.into())
     }
 
     /// Claims an `amount` of native tokens from a `source` account to a `destination` account.
@@ -317,10 +313,10 @@ where
             .map_err(|error| error.into())
     }
 
-    /// Creates a new on-chain application, based on the supplied bytecode and parameters.
+    /// Creates a new on-chain application, based on the supplied module and parameters.
     pub fn create_application<Abi, Parameters, InstantiationArgument>(
         &mut self,
-        bytecode_id: BytecodeId,
+        module_id: ModuleId,
         parameters: &Parameters,
         argument: &InstantiationArgument,
         required_application_ids: Vec<ApplicationId>,
@@ -340,7 +336,7 @@ where
             .map(From::from)
             .collect();
         let application_id = contract_wit::create_application(
-            bytecode_id.into(),
+            module_id.into(),
             &parameters,
             &argument,
             &converted_application_ids,

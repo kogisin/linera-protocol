@@ -27,12 +27,11 @@ This document contains the help content for the `linera` command-line program.
 * [`linera watch`↴](#linera-watch)
 * [`linera service`↴](#linera-service)
 * [`linera faucet`↴](#linera-faucet)
-* [`linera publish-bytecode`↴](#linera-publish-bytecode)
+* [`linera publish-module`↴](#linera-publish-module)
 * [`linera publish-data-blob`↴](#linera-publish-data-blob)
 * [`linera read-data-blob`↴](#linera-read-data-blob)
 * [`linera create-application`↴](#linera-create-application)
 * [`linera publish-and-create`↴](#linera-publish-and-create)
-* [`linera request-application`↴](#linera-request-application)
 * [`linera keygen`↴](#linera-keygen)
 * [`linera assign`↴](#linera-assign)
 * [`linera retry-pending-block`↴](#linera-retry-pending-block)
@@ -91,12 +90,11 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `watch` — Watch the network for notifications
 * `service` — Run a GraphQL service to explore and extend the chains of the wallet
 * `faucet` — Run a GraphQL service that exposes a faucet where users can claim tokens. This gives away the chain's tokens, and is mainly intended for testing
-* `publish-bytecode` — Publish bytecode
+* `publish-module` — Publish module
 * `publish-data-blob` — Publish a data blob of binary data
 * `read-data-blob` — Verify that a data blob is readable
 * `create-application` — Create an application
-* `publish-and-create` — Create an application, and publish the required bytecode
-* `request-application` — Request an application from another chain, so it can be used on this one
+* `publish-and-create` — Create an application, and publish the required module
 * `keygen` — Create an unassigned key pair
 * `assign` — Link an owner with a key pair in the wallet to a chain that was created for that owner
 * `retry-pending-block` — Retry a block we unsuccessfully tried to propose earlier
@@ -224,6 +222,8 @@ Open (i.e. activate) a new multi-owner chain deriving the UID from an existing o
 * `--mandatory-applications <MANDATORY_APPLICATIONS>` — At least one operation or incoming message from each of these applications must occur in every block
 * `--close-chain <CLOSE_CHAIN>` — These applications are allowed to close the current chain using the system API
 * `--change-application-permissions <CHANGE_APPLICATION_PERMISSIONS>` — These applications are allowed to change the application permissions on the current chain using the system API
+* `--call-service-as-oracle <CALL_SERVICE_AS_ORACLE>` — These applications are allowed to call services as oracles on the current chain using the system API
+* `--make-http-requests <MAKE_HTTP_REQUESTS>` — These applications are allowed to make HTTP requests on the current chain using the system API
 * `--initial-balance <BALANCE>` — The initial balance of the new chain. This is subtracted from the parent chain's balance
 
   Default value: `0`
@@ -274,6 +274,8 @@ Changes the application permissions configuration
 * `--mandatory-applications <MANDATORY_APPLICATIONS>` — At least one operation or incoming message from each of these applications must occur in every block
 * `--close-chain <CLOSE_CHAIN>` — These applications are allowed to close the current chain using the system API
 * `--change-application-permissions <CHANGE_APPLICATION_PERMISSIONS>` — These applications are allowed to change the application permissions on the current chain using the system API
+* `--call-service-as-oracle <CALL_SERVICE_AS_ORACLE>` — These applications are allowed to call services as oracles on the current chain using the system API
+* `--make-http-requests <MAKE_HTTP_REQUESTS>` — These applications are allowed to make HTTP requests on the current chain using the system API
 
 
 
@@ -516,6 +518,7 @@ Create genesis configuration for a Linera deployment. Create initial user chains
 * `--maximum-block-proposal-size <MAXIMUM_BLOCK_PROPOSAL_SIZE>` — Set the maximum size of a block proposal, in bytes. (This will overwrite value from `--policy-config`)
 * `--maximum-bytes-read-per-block <MAXIMUM_BYTES_READ_PER_BLOCK>` — Set the maximum read data per block. (This will overwrite value from `--policy-config`)
 * `--maximum-bytes-written-per-block <MAXIMUM_BYTES_WRITTEN_PER_BLOCK>` — Set the maximum write data per block. (This will overwrite value from `--policy-config`)
+* `--http-allow-list <HTTP_ALLOW_LIST>` — Set the list of hosts that contracts and services can send HTTP requests to
 * `--testing-prng-seed <TESTING_PRNG_SEED>` — Force this wallet to generate keys using a PRNG and a given seed. USE FOR TESTING ONLY
 * `--network-name <NETWORK_NAME>` — A unique name to identify this network
 
@@ -585,17 +588,17 @@ Run a GraphQL service that exposes a faucet where users can claim tokens. This g
 
 
 
-## `linera publish-bytecode`
+## `linera publish-module`
 
-Publish bytecode
+Publish module
 
-**Usage:** `linera publish-bytecode [OPTIONS] <CONTRACT> <SERVICE> [PUBLISHER]`
+**Usage:** `linera publish-module [OPTIONS] <CONTRACT> <SERVICE> [PUBLISHER]`
 
 ###### **Arguments:**
 
 * `<CONTRACT>` — Path to the Wasm file for the application "contract" bytecode
 * `<SERVICE>` — Path to the Wasm file for the application "service" bytecode
-* `<PUBLISHER>` — An optional chain ID to publish the bytecode. The default chain of the wallet is used otherwise
+* `<PUBLISHER>` — An optional chain ID to publish the module. The default chain of the wallet is used otherwise
 
 ###### **Options:**
 
@@ -635,11 +638,11 @@ Verify that a data blob is readable
 
 Create an application
 
-**Usage:** `linera create-application [OPTIONS] <BYTECODE_ID> [CREATOR]`
+**Usage:** `linera create-application [OPTIONS] <MODULE_ID> [CREATOR]`
 
 ###### **Arguments:**
 
-* `<BYTECODE_ID>` — The bytecode ID of the application to create
+* `<MODULE_ID>` — The module ID of the application to create
 * `<CREATOR>` — An optional chain ID to host the application. The default chain of the wallet is used otherwise
 
 ###### **Options:**
@@ -654,7 +657,7 @@ Create an application
 
 ## `linera publish-and-create`
 
-Create an application, and publish the required bytecode
+Create an application, and publish the required module
 
 **Usage:** `linera publish-and-create [OPTIONS] <CONTRACT> <SERVICE> [PUBLISHER]`
 
@@ -662,7 +665,7 @@ Create an application, and publish the required bytecode
 
 * `<CONTRACT>` — Path to the Wasm file for the application "contract" bytecode
 * `<SERVICE>` — Path to the Wasm file for the application "service" bytecode
-* `<PUBLISHER>` — An optional chain ID to publish the bytecode. The default chain of the wallet is used otherwise
+* `<PUBLISHER>` — An optional chain ID to publish the module. The default chain of the wallet is used otherwise
 
 ###### **Options:**
 
@@ -674,23 +677,6 @@ Create an application, and publish the required bytecode
 * `--json-argument <JSON_ARGUMENT>` — The instantiation argument as a JSON string
 * `--json-argument-path <JSON_ARGUMENT_PATH>` — Path to a JSON file containing the instantiation argument
 * `--required-application-ids <REQUIRED_APPLICATION_IDS>` — The list of required dependencies of application, if any
-
-
-
-## `linera request-application`
-
-Request an application from another chain, so it can be used on this one
-
-**Usage:** `linera request-application [OPTIONS] <APPLICATION_ID>`
-
-###### **Arguments:**
-
-* `<APPLICATION_ID>` — The ID of the application to request
-
-###### **Options:**
-
-* `--target-chain-id <TARGET_CHAIN_ID>` — The target chain on which the application is already registered. If not specified, the chain on which the application was created is used
-* `--requester-chain-id <REQUESTER_CHAIN_ID>` — The owned chain on which the application is missing
 
 
 
@@ -894,10 +880,10 @@ Build and publish a Linera project
 ###### **Arguments:**
 
 * `<PATH>` — The path of the root of the Linera project. Defaults to current working directory if unspecified
-* `<NAME>` — Specify the name of the Linera project. This is used to locate the generated bytecode. The generated bytecode should be of the form `<name>_{contract,service}.wasm`.
+* `<NAME>` — Specify the name of the Linera project. This is used to locate the generated bytecode files. The generated bytecode files should be of the form `<name>_{contract,service}.wasm`.
 
    Defaults to the package name in Cargo.toml, with dashes replaced by underscores.
-* `<PUBLISHER>` — An optional chain ID to publish the bytecode. The default chain of the wallet is used otherwise
+* `<PUBLISHER>` — An optional chain ID to publish the module. The default chain of the wallet is used otherwise
 
 ###### **Options:**
 

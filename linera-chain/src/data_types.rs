@@ -15,17 +15,16 @@ use linera_base::{
         AccountPublicKey, AccountSecretKey, AccountSignature, BcsHashable, BcsSignable,
         CryptoError, CryptoHash, ValidatorPublicKey, ValidatorSecretKey, ValidatorSignature,
     },
-    data_types::{Amount, BlockHeight, Event, OracleResponse, Round, Timestamp},
+    data_types::{Amount, Blob, BlockHeight, Event, OracleResponse, Round, Timestamp},
     doc_scalar, ensure,
     hashed::Hashed,
-    identifiers::{
-        Account, BlobId, BlobType, ChainId, ChannelFullName, Destination, MessageId, Owner,
-    },
+    hex_debug,
+    identifiers::{Account, BlobId, ChainId, ChannelFullName, Destination, MessageId, Owner},
 };
 use linera_execution::{
     committee::{Committee, Epoch},
     system::OpenChainConfig,
-    Message, MessageKind, Operation, SystemMessage, SystemOperation,
+    Message, MessageKind, Operation, OutgoingMessage, SystemMessage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -81,20 +80,10 @@ pub struct ProposedBlock {
 impl ProposedBlock {
     /// Returns all the published blob IDs in this block's operations.
     pub fn published_blob_ids(&self) -> BTreeSet<BlobId> {
-        let mut blob_ids = BTreeSet::new();
-        for operation in &self.operations {
-            if let Operation::System(SystemOperation::PublishDataBlob { blob_hash }) = operation {
-                blob_ids.insert(BlobId::new(*blob_hash, BlobType::Data));
-            }
-            if let Operation::System(SystemOperation::PublishBytecode { bytecode_id }) = operation {
-                blob_ids.extend([
-                    BlobId::new(bytecode_id.contract_blob_hash, BlobType::ContractBytecode),
-                    BlobId::new(bytecode_id.service_blob_hash, BlobType::ServiceBytecode),
-                ]);
-            }
-        }
-
-        blob_ids
+        self.operations
+            .iter()
+            .flat_map(Operation::published_blob_ids)
+            .collect()
     }
 
     /// Returns whether the block contains only rejected incoming messages, which
@@ -294,28 +283,6 @@ pub struct BlockProposal {
     pub validated_block_certificate: Option<LiteCertificate<'static>>,
 }
 
-/// A posted message together with routing information.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
-pub struct OutgoingMessage {
-    /// The destination of the message.
-    pub destination: Destination,
-    /// The user authentication carried by the message, if any.
-    #[debug(skip_if = Option::is_none)]
-    pub authenticated_signer: Option<Owner>,
-    /// A grant to pay for the message execution.
-    #[debug(skip_if = Amount::is_zero)]
-    pub grant: Amount,
-    /// Where to send a refund for the unused part of the grant after execution, if any.
-    #[debug(skip_if = Option::is_none)]
-    pub refund_grant_to: Option<Account>,
-    /// The kind of message being sent.
-    pub kind: MessageKind,
-    /// The message itself.
-    pub message: Message,
-}
-
-impl<'de> BcsHashable<'de> for OutgoingMessage {}
-
 /// A message together with kind, authentication and grant information.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct PostedMessage {
@@ -336,11 +303,21 @@ pub struct PostedMessage {
     pub message: Message,
 }
 
-impl OutgoingMessage {
+pub trait OutgoingMessageExt {
     /// Returns whether this message is sent via the given medium to the specified
     /// recipient. If the medium is a channel, does not verify that the recipient is
     /// actually subscribed to that channel.
-    pub fn has_destination(&self, medium: &Medium, recipient: ChainId) -> bool {
+    fn has_destination(&self, medium: &Medium, recipient: ChainId) -> bool;
+
+    /// Returns the posted message, i.e. the outgoing message without the destination.
+    fn into_posted(self, index: u32) -> PostedMessage;
+}
+
+impl OutgoingMessageExt for OutgoingMessage {
+    /// Returns whether this message is sent via the given medium to the specified
+    /// recipient. If the medium is a channel, does not verify that the recipient is
+    /// actually subscribed to that channel.
+    fn has_destination(&self, medium: &Medium, recipient: ChainId) -> bool {
         match (&self.destination, medium) {
             (Destination::Recipient(_), Medium::Channel(_))
             | (Destination::Subscribers(_), Medium::Direct) => false,
@@ -356,7 +333,7 @@ impl OutgoingMessage {
     }
 
     /// Returns the posted message, i.e. the outgoing message without the destination.
-    pub fn into_posted(self, index: u32) -> PostedMessage {
+    fn into_posted(self, index: u32) -> PostedMessage {
         let OutgoingMessage {
             destination: _,
             authenticated_signer,
@@ -375,6 +352,21 @@ impl OutgoingMessage {
         }
     }
 }
+
+/// The execution result of a single operation.
+#[derive(Debug, Default, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+pub struct OperationResult(
+    #[debug(with = "hex_debug")]
+    #[serde(with = "serde_bytes")]
+    pub Vec<u8>,
+);
+
+impl<'de> BcsHashable<'de> for OperationResult {}
+
+doc_scalar!(
+    OperationResult,
+    "The execution result of a single operation."
+);
 
 /// A [`ProposedBlock`], together with the outcome from its execution.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, SimpleObject)]
@@ -395,6 +387,10 @@ pub struct BlockExecutionOutcome {
     pub oracle_responses: Vec<Vec<OracleResponse>>,
     /// The list of events produced by each transaction.
     pub events: Vec<Vec<Event>>,
+    /// The list of blobs created by each transaction.
+    pub blobs: Vec<Vec<Blob>>,
+    /// The execution result for each operation.
+    pub operation_results: Vec<OperationResult>,
 }
 
 /// The hash and chain ID of a `CertificateValue`.
@@ -686,12 +682,14 @@ impl ExecutedBlock {
     pub fn required_blob_ids(&self) -> HashSet<BlobId> {
         let mut blob_ids = self.outcome.oracle_blob_ids();
         blob_ids.extend(self.block.published_blob_ids());
+        blob_ids.extend(self.outcome.iter_created_blobs_ids());
         blob_ids
     }
 
     pub fn requires_blob(&self, blob_id: &BlobId) -> bool {
         self.outcome.oracle_blob_ids().contains(blob_id)
             || self.block.published_blob_ids().contains(blob_id)
+            || self.outcome.created_blobs_ids().contains(blob_id)
     }
 }
 
@@ -721,6 +719,21 @@ impl BlockExecutionOutcome {
             .iter()
             .any(|responses| !responses.is_empty())
     }
+
+    pub fn iter_created_blobs(&self) -> impl Iterator<Item = (BlobId, Blob)> + '_ {
+        self.blobs
+            .iter()
+            .flatten()
+            .map(|blob| (blob.id(), blob.clone()))
+    }
+
+    pub fn iter_created_blobs_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
+        self.blobs.iter().flatten().map(|blob| blob.id())
+    }
+
+    pub fn created_blobs_ids(&self) -> HashSet<BlobId> {
+        self.iter_created_blobs_ids().collect()
+    }
 }
 
 /// The data a block proposer signs.
@@ -742,7 +755,7 @@ impl BlockProposal {
             block,
             outcome: None,
         };
-        let signature = AccountSignature::new(&content, secret);
+        let signature = secret.sign(&content);
         Self {
             content,
             public_key: secret.public(),
@@ -764,7 +777,7 @@ impl BlockProposal {
             round,
             outcome: Some(executed_block.outcome),
         };
-        let signature = AccountSignature::new(&content, secret);
+        let signature = secret.sign(&content);
         Self {
             content,
             public_key: secret.public(),
@@ -783,6 +796,17 @@ impl BlockProposal {
                 .outcome
                 .iter()
                 .flat_map(|outcome| outcome.oracle_blob_ids()),
+        )
+    }
+
+    pub fn expected_blob_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
+        self.content.block.published_blob_ids().into_iter().chain(
+            self.content.outcome.iter().flat_map(|outcome| {
+                outcome
+                    .oracle_blob_ids()
+                    .into_iter()
+                    .chain(outcome.iter_created_blobs_ids())
+            }),
         )
     }
 
