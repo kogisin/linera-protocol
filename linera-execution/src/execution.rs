@@ -6,7 +6,7 @@ use std::{mem, vec};
 use futures::{FutureExt, StreamExt};
 use linera_base::{
     data_types::{Amount, BlockHeight, Timestamp},
-    identifiers::{Account, AccountOwner, BlobType, ChainId, Destination, Owner},
+    identifiers::{Account, AccountOwner, BlobType, ChainId, Destination},
 };
 use linera_views::{
     context::Context,
@@ -27,11 +27,11 @@ use {
 
 use super::{runtime::ServiceRuntimeRequest, ExecutionRequest};
 use crate::{
-    resources::ResourceController, system::SystemExecutionStateView, ContractSyncRuntime,
-    ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext, Message, MessageContext,
-    MessageKind, Operation, OperationContext, Query, QueryContext, QueryOutcome,
-    RawExecutionOutcome, RawOutgoingMessage, ServiceSyncRuntime, SystemMessage, TransactionTracker,
-    UserApplicationDescription, UserApplicationId,
+    resources::ResourceController, system::SystemExecutionStateView, ApplicationDescription,
+    ApplicationId, ContractSyncRuntime, ExecutionError, ExecutionRuntimeConfig,
+    ExecutionRuntimeContext, Message, MessageContext, MessageKind, Operation, OperationContext,
+    OutgoingMessage, Query, QueryContext, QueryOutcome, ServiceSyncRuntime, SystemMessage,
+    TransactionTracker,
 };
 
 /// A view accessing the execution state of a chain.
@@ -40,7 +40,7 @@ pub struct ExecutionStateView<C> {
     /// System application.
     pub system: SystemExecutionStateView<C>,
     /// User applications.
-    pub users: HashedReentrantCollectionView<C, UserApplicationId, KeyValueStoreView<C>>,
+    pub users: HashedReentrantCollectionView<C, ApplicationId, KeyValueStoreView<C>>,
 }
 
 /// How to interact with a long-lived service runtime.
@@ -61,7 +61,7 @@ where
         &mut self,
         contract: UserContractCode,
         local_time: Timestamp,
-        application_description: UserApplicationDescription,
+        application_description: ApplicationDescription,
         instantiation_argument: Vec<u8>,
         contract_blob: Blob,
         service_blob: Blob,
@@ -132,7 +132,7 @@ pub enum UserAction {
 }
 
 impl UserAction {
-    pub(crate) fn signer(&self) -> Option<Owner> {
+    pub(crate) fn signer(&self) -> Option<AccountOwner> {
         use UserAction::*;
         match self {
             Instantiate(context, _) => context.authenticated_signer,
@@ -166,14 +166,14 @@ where
     #[expect(clippy::too_many_arguments)]
     async fn run_user_action(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         chain_id: ChainId,
         local_time: Timestamp,
         action: UserAction,
         refund_grant_to: Option<Account>,
         grant: Option<&mut Amount>,
         txn_tracker: &mut TransactionTracker,
-        resource_controller: &mut ResourceController<Option<Owner>>,
+        resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ExecutionError> {
         let ExecutionRuntimeConfig {} = self.context().extra().execution_runtime_config();
         self.run_user_action_with_runtime(
@@ -192,18 +192,18 @@ where
     #[expect(clippy::too_many_arguments)]
     async fn run_user_action_with_runtime(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         chain_id: ChainId,
         local_time: Timestamp,
         action: UserAction,
         refund_grant_to: Option<Account>,
         grant: Option<&mut Amount>,
         txn_tracker: &mut TransactionTracker,
-        resource_controller: &mut ResourceController<Option<Owner>>,
+        resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ExecutionError> {
         let mut cloned_grant = grant.as_ref().map(|x| **x);
         let initial_balance = resource_controller
-            .with_state_and_grant(self, cloned_grant.as_mut())
+            .with_state_and_grant(&mut self.system, cloned_grant.as_mut())
             .await?
             .balance()?;
         let controller = ResourceController {
@@ -237,7 +237,7 @@ where
         contract_runtime_task.send(code)?;
 
         while let Some(request) = execution_state_receiver.next().await {
-            self.handle_request(request).await?;
+            self.handle_request(request, resource_controller).await?;
         }
 
         let (result, controller, txn_tracker_moved) = contract_runtime_task.join().await?;
@@ -246,7 +246,7 @@ where
         txn_tracker.add_operation_result(result);
 
         resource_controller
-            .with_state_and_grant(self, grant)
+            .with_state_and_grant(&mut self.system, grant)
             .await?
             .merge_balance(initial_balance, controller.balance()?)?;
         resource_controller.tracker = controller.tracker;
@@ -260,14 +260,14 @@ where
         local_time: Timestamp,
         operation: Operation,
         txn_tracker: &mut TransactionTracker,
-        resource_controller: &mut ResourceController<Option<Owner>>,
+        resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ExecutionError> {
         assert_eq!(context.chain_id, self.context().extra().chain_id());
         match operation {
             Operation::System(op) => {
                 let new_application = self
                     .system
-                    .execute_operation(context, op, txn_tracker)
+                    .execute_operation(context, *op, txn_tracker, resource_controller)
                     .await?;
                 if let Some((application_id, argument)) = new_application {
                     let user_action = UserAction::Instantiate(context, argument);
@@ -311,13 +311,13 @@ where
         message: Message,
         grant: Option<&mut Amount>,
         txn_tracker: &mut TransactionTracker,
-        resource_controller: &mut ResourceController<Option<Owner>>,
+        resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ExecutionError> {
         assert_eq!(context.chain_id, self.context().extra().chain_id());
         match message {
             Message::System(message) => {
                 let outcome = self.system.execute_message(context, message).await?;
-                txn_tracker.add_system_outcome(outcome)?;
+                txn_tracker.add_outgoing_messages(outcome)?;
             }
             Message::User {
                 application_id,
@@ -347,41 +347,14 @@ where
         txn_tracker: &mut TransactionTracker,
     ) -> Result<(), ExecutionError> {
         assert_eq!(context.chain_id, self.context().extra().chain_id());
-        match message {
-            Message::System(message) => {
-                let mut outcome = RawExecutionOutcome {
-                    authenticated_signer: context.authenticated_signer,
-                    refund_grant_to: context.refund_grant_to,
-                    ..Default::default()
-                };
-                outcome.messages.push(RawOutgoingMessage {
-                    destination: Destination::Recipient(context.message_id.chain_id),
-                    authenticated: true,
-                    grant,
-                    kind: MessageKind::Bouncing,
-                    message,
-                });
-                txn_tracker.add_system_outcome(outcome)?;
-            }
-            Message::User {
-                application_id,
-                bytes,
-            } => {
-                let mut outcome = RawExecutionOutcome {
-                    authenticated_signer: context.authenticated_signer,
-                    refund_grant_to: context.refund_grant_to,
-                    ..Default::default()
-                };
-                outcome.messages.push(RawOutgoingMessage {
-                    destination: Destination::Recipient(context.message_id.chain_id),
-                    authenticated: true,
-                    grant,
-                    kind: MessageKind::Bouncing,
-                    message: bytes,
-                });
-                txn_tracker.add_user_outcome(application_id, outcome)?;
-            }
-        }
+        txn_tracker.add_outgoing_message(OutgoingMessage {
+            destination: Destination::Recipient(context.message_id.chain_id),
+            authenticated_signer: context.authenticated_signer,
+            refund_grant_to: context.refund_grant_to.filter(|_| !grant.is_zero()),
+            grant,
+            kind: MessageKind::Bouncing,
+            message,
+        })?;
         Ok(())
     }
 
@@ -393,23 +366,14 @@ where
         txn_tracker: &mut TransactionTracker,
     ) -> Result<(), ExecutionError> {
         assert_eq!(context.chain_id, self.context().extra().chain_id());
-        let mut outcome = RawExecutionOutcome::default();
-        let message = RawOutgoingMessage {
-            destination: Destination::Recipient(account.chain_id),
-            authenticated: false,
-            grant: Amount::ZERO,
-            kind: MessageKind::Tracked,
-            message: SystemMessage::Credit {
-                amount,
-                source: context
-                    .authenticated_signer
-                    .map(AccountOwner::User)
-                    .unwrap_or(AccountOwner::Chain),
-                target: account.owner,
-            },
+        let message = SystemMessage::Credit {
+            amount,
+            source: context.authenticated_signer.unwrap_or(AccountOwner::CHAIN),
+            target: account.owner,
         };
-        outcome.messages.push(message);
-        txn_tracker.add_system_outcome(outcome)?;
+        txn_tracker.add_outgoing_message(
+            OutgoingMessage::new(account.chain_id, message).with_kind(MessageKind::Tracked),
+        )?;
         Ok(())
     }
 
@@ -453,7 +417,7 @@ where
 
     async fn query_user_application(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         context: QueryContext,
         query: Vec<u8>,
     ) -> Result<QueryOutcome<Vec<u8>>, ExecutionError> {
@@ -475,7 +439,8 @@ where
         service_runtime_task.send(code)?;
 
         while let Some(request) = execution_state_receiver.next().await {
-            self.handle_request(request).await?;
+            self.handle_request(request, &mut ResourceController::default())
+                .await?;
         }
 
         service_runtime_task.join().await
@@ -483,7 +448,7 @@ where
 
     async fn query_user_application_with_long_lived_service(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         context: QueryContext,
         query: Vec<u8>,
         incoming_execution_requests: &mut futures::channel::mpsc::UnboundedReceiver<
@@ -507,7 +472,7 @@ where
             futures::select! {
                 maybe_request = incoming_execution_requests.next() => {
                     if let Some(request) = maybe_request {
-                        self.handle_request(request).await?;
+                        self.handle_request(request, &mut ResourceController::default()).await?;
                     }
                 }
                 outcome = &mut outcome_receiver => {
@@ -519,14 +484,14 @@ where
 
     pub async fn list_applications(
         &self,
-    ) -> Result<Vec<(UserApplicationId, UserApplicationDescription)>, ExecutionError> {
+    ) -> Result<Vec<(ApplicationId, ApplicationDescription)>, ExecutionError> {
         let mut applications = vec![];
         for blob_id in self.system.used_blobs.indices().await? {
             if blob_id.blob_type == BlobType::ApplicationDescription {
                 let blob_content = self.system.read_blob_content(blob_id).await?;
-                let application_description: UserApplicationDescription =
+                let application_description: ApplicationDescription =
                     bcs::from_bytes(blob_content.bytes())?;
-                let app_id = UserApplicationId::from(&application_description);
+                let app_id = ApplicationId::from(&application_description);
                 applications.push((app_id, application_description));
             }
         }

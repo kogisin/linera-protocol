@@ -12,9 +12,7 @@ use linera_base::{
         Amount, ApplicationPermissions, Blob, BlockHeight, OracleResponse, Resources,
         SendMessageRequest, Timestamp,
     },
-    identifiers::{
-        Account, AccountOwner, ChainDescription, ChainId, Destination, MessageId, Owner,
-    },
+    identifiers::{Account, AccountOwner, ChainDescription, ChainId, Destination, MessageId},
     ownership::ChainOwnership,
 };
 use linera_execution::{
@@ -27,8 +25,7 @@ use linera_execution::{
     },
     BaseRuntime, ContractRuntime, ExecutionError, ExecutionRuntimeContext, Message, Operation,
     OperationContext, OutgoingMessage, Query, QueryContext, QueryOutcome, QueryResponse,
-    RawExecutionOutcome, RawOutgoingMessage, ResourceControlPolicy, ResourceController,
-    SystemOperation, TransactionTracker,
+    ResourceController, SystemOperation, TransactionTracker,
 };
 use linera_views::{batch::Batch, context::Context, views::View};
 use test_case::test_case;
@@ -90,7 +87,7 @@ async fn test_simple_user_operation() -> anyhow::Result<()> {
     let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
     let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
 
-    let owner = Owner::from(AccountPublicKey::test_key(0));
+    let owner = AccountOwner::from(AccountPublicKey::test_key(0));
     let state_key = vec![];
     let dummy_operation = vec![1];
 
@@ -533,10 +530,13 @@ async fn test_sending_message_from_finalize() -> anyhow::Result<()> {
         grant: Resources::default(),
         message: b"first".to_vec(),
     };
-
-    let fee_policy = ResourceControlPolicy::default();
-    let expected_first_message =
-        RawOutgoingMessage::from(first_message.clone()).into_priced(&fee_policy)?;
+    let expected_first_message = OutgoingMessage::new(
+        destination_chain,
+        Message::User {
+            application_id: third_id,
+            bytes: b"first".to_vec(),
+        },
+    );
 
     first_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -583,12 +583,27 @@ async fn test_sending_message_from_finalize() -> anyhow::Result<()> {
         message: b"fourth".to_vec(),
     };
 
-    let expected_second_message =
-        RawOutgoingMessage::from(second_message.clone()).into_priced(&fee_policy)?;
-    let expected_third_message =
-        RawOutgoingMessage::from(third_message.clone()).into_priced(&fee_policy)?;
-    let expected_fourth_message =
-        RawOutgoingMessage::from(fourth_message.clone()).into_priced(&fee_policy)?;
+    let expected_second_message = OutgoingMessage::new(
+        destination_chain,
+        Message::User {
+            application_id: third_id,
+            bytes: b"second".to_vec(),
+        },
+    );
+    let expected_third_message = OutgoingMessage::new(
+        destination_chain,
+        Message::User {
+            application_id: third_id,
+            bytes: b"third".to_vec(),
+        },
+    );
+    let expected_fourth_message = OutgoingMessage::new(
+        destination_chain,
+        Message::User {
+            application_id: first_id,
+            bytes: b"fourth".to_vec(),
+        },
+    );
 
     fourth_application.expect_call(ExpectedCall::default_finalize());
     third_application.expect_call(ExpectedCall::finalize(|runtime, _context| {
@@ -627,27 +642,14 @@ async fn test_sending_message_from_finalize() -> anyhow::Result<()> {
     )
     .await?;
 
-    let account = Account {
-        chain_id: ChainId::root(0),
-        owner: AccountOwner::Chain,
-    };
-
     let txn_outcome = txn_tracker.into_outcome().unwrap();
     let mut expected = TransactionTracker::default();
-    expected.add_user_outcome(
-        third_id,
-        RawExecutionOutcome::default()
-            .with_refund_grant_to(Some(account))
-            .with_message(expected_first_message)
-            .with_message(expected_second_message)
-            .with_message(expected_third_message),
-    )?;
-    expected.add_user_outcome(
-        first_id,
-        RawExecutionOutcome::default()
-            .with_refund_grant_to(Some(account))
-            .with_message(expected_fourth_message),
-    )?;
+    expected.add_outgoing_messages(vec![
+        expected_first_message,
+        expected_second_message,
+        expected_third_message,
+        expected_fourth_message,
+    ])?;
     assert_eq!(
         txn_outcome.outgoing_messages,
         expected.into_outcome().unwrap().outgoing_messages
@@ -898,9 +900,13 @@ async fn test_simple_message() -> anyhow::Result<()> {
         message: b"msg".to_vec(),
     };
 
-    let fee_policy = ResourceControlPolicy::default();
-    let expected_dummy_message =
-        RawOutgoingMessage::from(dummy_message.clone()).into_priced(&fee_policy)?;
+    let expected_dummy_message = OutgoingMessage::new(
+        destination_chain,
+        Message::User {
+            application_id,
+            bytes: b"msg".to_vec(),
+        },
+    );
 
     application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _operation| {
@@ -925,19 +931,9 @@ async fn test_simple_message() -> anyhow::Result<()> {
     )
     .await?;
 
-    let account = Account {
-        chain_id: ChainId::root(0),
-        owner: AccountOwner::Chain,
-    };
-
     let txn_outcome = txn_tracker.into_outcome().unwrap();
     let mut expected = TransactionTracker::default();
-    expected.add_user_outcome(
-        application_id,
-        RawExecutionOutcome::default()
-            .with_message(expected_dummy_message)
-            .with_refund_grant_to(Some(account)),
-    )?;
+    expected.add_outgoing_message(expected_dummy_message)?;
     assert_eq!(
         txn_outcome.outgoing_messages,
         expected.into_outcome().unwrap().outgoing_messages
@@ -973,9 +969,13 @@ async fn test_message_from_cross_application_call() -> anyhow::Result<()> {
         message: b"msg".to_vec(),
     };
 
-    let fee_policy = ResourceControlPolicy::default();
-    let expected_dummy_message =
-        RawOutgoingMessage::from(dummy_message.clone()).into_priced(&fee_policy)?;
+    let expected_dummy_message = OutgoingMessage::new(
+        destination_chain,
+        Message::User {
+            application_id: target_id,
+            bytes: b"msg".to_vec(),
+        },
+    );
 
     target_application.expect_call(ExpectedCall::execute_operation(
         |runtime, _context, _argument| {
@@ -1008,19 +1008,9 @@ async fn test_message_from_cross_application_call() -> anyhow::Result<()> {
     )
     .await?;
 
-    let account = Account {
-        chain_id: ChainId::root(0),
-        owner: AccountOwner::Chain,
-    };
-
     let txn_outcome = txn_tracker.into_outcome().unwrap();
     let mut expected = TransactionTracker::default();
-    expected.add_user_outcome(
-        target_id,
-        RawExecutionOutcome::default()
-            .with_message(expected_dummy_message)
-            .with_refund_grant_to(Some(account)),
-    )?;
+    expected.add_outgoing_message(expected_dummy_message)?;
     assert_eq!(
         txn_outcome.outgoing_messages,
         expected.into_outcome().unwrap().outgoing_messages
@@ -1063,9 +1053,13 @@ async fn test_message_from_deeper_call() -> anyhow::Result<()> {
         message: b"msg".to_vec(),
     };
 
-    let fee_policy = ResourceControlPolicy::default();
-    let expected_dummy_message =
-        RawOutgoingMessage::from(dummy_message.clone()).into_priced(&fee_policy)?;
+    let expected_dummy_message = OutgoingMessage::new(
+        destination_chain,
+        Message::User {
+            application_id: target_id,
+            bytes: b"msg".to_vec(),
+        },
+    );
 
     target_application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _context, _argument| {
@@ -1102,18 +1096,9 @@ async fn test_message_from_deeper_call() -> anyhow::Result<()> {
     )
     .await?;
 
-    let account = Account {
-        chain_id: ChainId::root(0),
-        owner: AccountOwner::Chain,
-    };
     let txn_outcome = txn_tracker.into_outcome().unwrap();
     let mut expected = TransactionTracker::default();
-    expected.add_user_outcome(
-        target_id,
-        RawExecutionOutcome::default()
-            .with_message(expected_dummy_message)
-            .with_refund_grant_to(Some(account)),
-    )?;
+    expected.add_outgoing_message(expected_dummy_message)?;
     assert_eq!(
         txn_outcome.outgoing_messages,
         expected.into_outcome().unwrap().outgoing_messages
@@ -1156,10 +1141,6 @@ async fn test_multiple_messages_from_different_applications() -> anyhow::Result<
         message: b"first".to_vec(),
     };
 
-    let fee_policy = ResourceControlPolicy::default();
-    let expected_first_message =
-        RawOutgoingMessage::from(first_message.clone()).into_priced(&fee_policy)?;
-
     // The entrypoint sends a message to the first chain and calls the silent and the sending
     // applications
     caller_application.expect_call(ExpectedCall::execute_operation({
@@ -1193,9 +1174,6 @@ async fn test_multiple_messages_from_different_applications() -> anyhow::Result<
         grant: Resources::default(),
         message: b"second".to_vec(),
     };
-
-    let expected_second_message =
-        RawOutgoingMessage::from(second_message.clone()).into_priced(&fee_policy)?;
 
     // The sending application sends two messages, one to each of the destination chains
     sending_target_application.expect_call(ExpectedCall::execute_operation(
@@ -1235,27 +1213,32 @@ async fn test_multiple_messages_from_different_applications() -> anyhow::Result<
     )
     .await?;
 
-    let account = Account {
-        chain_id: ChainId::root(0),
-        owner: AccountOwner::Chain,
-    };
-
     // Return to checking the user application outcomes
     let txn_outcome = txn_tracker.into_outcome().unwrap();
     let mut expected = TransactionTracker::default();
-    expected.add_user_outcome(
-        caller_id,
-        RawExecutionOutcome::default()
-            .with_message(expected_first_message.clone())
-            .with_refund_grant_to(Some(account)),
-    )?;
-    expected.add_user_outcome(
-        sending_target_id,
-        RawExecutionOutcome::default()
-            .with_message(expected_first_message)
-            .with_message(expected_second_message)
-            .with_refund_grant_to(Some(account)),
-    )?;
+    expected.add_outgoing_messages(vec![
+        OutgoingMessage::new(
+            first_destination_chain,
+            Message::User {
+                application_id: caller_id,
+                bytes: b"first".to_vec(),
+            },
+        ),
+        OutgoingMessage::new(
+            first_destination_chain,
+            Message::User {
+                application_id: sending_target_id,
+                bytes: b"first".to_vec(),
+            },
+        ),
+        OutgoingMessage::new(
+            second_destination_chain,
+            Message::User {
+                application_id: sending_target_id,
+                bytes: b"second".to_vec(),
+            },
+        ),
+    ])?;
     assert_eq!(
         txn_outcome.outgoing_messages,
         expected.into_outcome().unwrap().outgoing_messages
@@ -1303,7 +1286,7 @@ async fn test_open_chain() -> anyhow::Result<()> {
         move |runtime, _context, _operation| {
             assert_eq!(runtime.chain_ownership()?, ownership);
             let destination = Account::chain(ChainId::root(2));
-            runtime.transfer(AccountOwner::Chain, destination, Amount::ONE)?;
+            runtime.transfer(AccountOwner::CHAIN, destination, Amount::ONE)?;
             let id = runtime.application_id()?;
             let application_permissions = ApplicationPermissions::new_single(id);
             let (actual_message_id, chain_id) =
@@ -1368,7 +1351,7 @@ async fn test_open_chain() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Tests the system API call `close_chain``.
+/// Tests the system API call `close_chain`.
 #[tokio::test]
 async fn test_close_chain() -> anyhow::Result<()> {
     let committee = Committee::make_simple(vec![(
@@ -1480,8 +1463,8 @@ async fn test_close_chain() -> anyhow::Result<()> {
 )]
 #[tokio::test]
 async fn test_message_receipt_spending_chain_balance(
-    receiving_chain_owner: Option<Owner>,
-    authenticated_signer: Option<Owner>,
+    receiving_chain_owner: Option<AccountOwner>,
+    authenticated_signer: Option<AccountOwner>,
 ) -> anyhow::Result<Result<(), ExecutionError>> {
     let amount = Amount::ONE;
     let super_owners = receiving_chain_owner.into_iter().collect();
@@ -1500,11 +1483,11 @@ async fn test_message_receipt_spending_chain_balance(
 
     let (application_id, application, blobs) = view.register_mock_application(0).await?;
 
-    let receiver_chain_account = AccountOwner::Chain;
+    let receiver_chain_account = AccountOwner::CHAIN;
     let sender_chain_id = ChainId::root(2);
     let recipient = Account {
         chain_id: sender_chain_id,
-        owner: AccountOwner::Chain,
+        owner: AccountOwner::CHAIN,
     };
 
     application.expect_call(ExpectedCall::execute_message(

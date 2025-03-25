@@ -7,7 +7,7 @@ use linera_base::{
     crypto::{AccountPublicKey, AccountSecretKey},
     data_types::{Amount, Timestamp},
     hashed::Hashed,
-    identifiers::{AccountOwner, ApplicationId, ChainId, Owner},
+    identifiers::{AccountOwner, ApplicationId, ChainId},
     listen_for_shutdown_signals,
     time::Instant,
 };
@@ -186,7 +186,6 @@ where
             let local_node = local_node.clone();
             let chain_client = chain_clients[&chain_id].clone();
             chain_client.process_inbox().await?;
-            let short_chain_id = format!("{:?}", chain_id);
             join_set.spawn_blocking(move || {
                 handle.block_on(
                     async move {
@@ -207,7 +206,7 @@ where
                     }
                     .instrument(tracing::info_span!(
                         "benchmark_chain_id",
-                        chain_id = short_chain_id
+                        chain_id = format!("{:?}", chain_id)
                     )),
                 )
             });
@@ -494,6 +493,7 @@ where
         );
         let cross_chain_message_delivery = chain_client.options().cross_chain_message_delivery;
         let mut num_sent_proposals = 0;
+        let authenticated_signer = Some(AccountOwner::from(key_pair.public()));
         loop {
             if shutdown_notifier.is_cancelled() {
                 info!("Shutdown signal received, stopping benchmark");
@@ -506,11 +506,11 @@ where
                 operations: operations.clone(),
                 previous_block_hash: chain_client.block_hash(),
                 height: chain_client.next_block_height(),
-                authenticated_signer: Some(Owner::from(key_pair.public())),
+                authenticated_signer,
                 timestamp: chain_client.timestamp().max(Timestamp::now()),
             };
             let executed_block = local_node
-                .stage_block_execution(block.clone(), None)
+                .stage_block_execution(block.clone(), None, Vec::new())
                 .await
                 .map_err(BenchmarkError::LocalNode)?
                 .0;
@@ -557,7 +557,7 @@ where
     ) -> Result<(), BenchmarkError> {
         let start = Instant::now();
         chain_client
-            .execute_operation(Operation::System(SystemOperation::CloseChain))
+            .execute_operation(Operation::system(SystemOperation::CloseChain))
             .await?
             .expect("Close chain operation should not fail!");
 
@@ -593,8 +593,8 @@ where
                     public_key,
                     amount,
                 ),
-                None => Operation::System(SystemOperation::Transfer {
-                    owner: AccountOwner::Chain,
+                None => Operation::system(SystemOperation::Transfer {
+                    owner: AccountOwner::CHAIN,
                     recipient: Recipient::chain(previous_chain_id),
                     amount,
                 }),
@@ -618,10 +618,10 @@ where
     ) -> Operation {
         let target_account = fungible::Account {
             chain_id,
-            owner: AccountOwner::User(Owner::from(receiver)),
+            owner: AccountOwner::from(receiver),
         };
         let bytes = bcs::to_bytes(&fungible::Operation::Transfer {
-            owner: AccountOwner::User(Owner::from(sender)),
+            owner: AccountOwner::from(sender),
             amount,
             target_account,
         })

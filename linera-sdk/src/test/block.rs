@@ -7,11 +7,9 @@
 
 use linera_base::{
     abi::ContractAbi,
-    data_types::{Amount, ApplicationPermissions, Round, Timestamp},
+    data_types::{Amount, ApplicationPermissions, Blob, Round, Timestamp},
     hashed::Hashed,
-    identifiers::{
-        AccountOwner, ApplicationId, ChainId, ChannelFullName, GenericApplicationId, Owner,
-    },
+    identifiers::{AccountOwner, ApplicationId, ChainId},
     ownership::TimeoutConfig,
 };
 use linera_chain::{
@@ -23,7 +21,7 @@ use linera_chain::{
 };
 use linera_execution::{
     committee::Epoch,
-    system::{Recipient, SystemChannel, SystemOperation},
+    system::{Recipient, SystemOperation},
     Operation,
 };
 
@@ -51,7 +49,7 @@ impl BlockBuilder {
     /// block.
     pub(crate) fn new(
         chain_id: ChainId,
-        owner: Owner,
+        owner: AccountOwner,
         epoch: Epoch,
         previous_block: Option<&ConfirmedBlockCertificate>,
         validator: TestValidator,
@@ -111,8 +109,8 @@ impl BlockBuilder {
     /// Adds an operation to change this chain's ownership.
     pub fn with_owner_change(
         &mut self,
-        super_owners: Vec<Owner>,
-        owners: Vec<(Owner, u64)>,
+        super_owners: Vec<AccountOwner>,
+        owners: Vec<(AccountOwner, u64)>,
         multi_leader_rounds: u32,
         open_multi_leader_rounds: bool,
         timeout_config: TimeoutConfig,
@@ -179,19 +177,6 @@ impl BlockBuilder {
         self
     }
 
-    /// Receives all admin messages that were sent to this chain by the given certificate.
-    pub fn with_system_messages_from(
-        &mut self,
-        certificate: &ConfirmedBlockCertificate,
-        channel: SystemChannel,
-    ) -> &mut Self {
-        let medium = Medium::Channel(ChannelFullName {
-            application_id: GenericApplicationId::System,
-            name: channel.name(),
-        });
-        self.with_messages_from_by_medium(certificate, &medium, MessageAction::Accept)
-    }
-
     /// Receives all direct messages  that were sent to this chain by the given certificate.
     pub fn with_messages_from(&mut self, certificate: &ConfirmedBlockCertificate) -> &mut Self {
         self.with_messages_from_by_medium(certificate, &Medium::Direct, MessageAction::Accept)
@@ -220,11 +205,26 @@ impl BlockBuilder {
 
     /// Tries to sign the prepared block with the [`TestValidator`]'s keys and return the
     /// resulting [`Certificate`]. Returns an error if block execution fails.
-    pub(crate) async fn try_sign(self) -> anyhow::Result<ConfirmedBlockCertificate> {
+    pub(crate) async fn try_sign(
+        self,
+        blobs: &[Blob],
+    ) -> anyhow::Result<ConfirmedBlockCertificate> {
+        let published_blobs = self
+            .block
+            .published_blob_ids()
+            .into_iter()
+            .map(|blob_id| {
+                blobs
+                    .iter()
+                    .find(|blob| blob.id() == blob_id)
+                    .expect("missing published blob")
+                    .clone()
+            })
+            .collect();
         let (executed_block, _) = self
             .validator
             .worker()
-            .stage_block_execution(self.block, None)
+            .stage_block_execution(self.block, None, published_blobs)
             .await?;
 
         let value = Hashed::new(ConfirmedBlock::new(executed_block));

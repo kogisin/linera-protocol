@@ -10,8 +10,8 @@ use std::{
 use futures::{future::Either, stream, StreamExt as _, TryStreamExt as _};
 use linera_base::{
     crypto::ValidatorPublicKey,
-    data_types::{ArithmeticError, Blob, BlockHeight, UserApplicationDescription},
-    identifiers::{BlobId, ChainId, MessageId, UserApplicationId},
+    data_types::{ApplicationDescription, ArithmeticError, Blob, BlockHeight},
+    identifiers::{ApplicationId, BlobId, ChainId, MessageId},
 };
 use linera_chain::{
     data_types::{BlockProposal, ExecutedBlock, ProposedBlock},
@@ -176,8 +176,13 @@ where
         &self,
         block: ProposedBlock,
         round: Option<u32>,
+        published_blobs: Vec<Blob>,
     ) -> Result<(ExecutedBlock, ChainInfoResponse), LocalNodeError> {
-        Ok(self.node.state.stage_block_execution(block, round).await?)
+        Ok(self
+            .node
+            .state
+            .stage_block_execution(block, round, published_blobs)
+            .await?)
     }
 
     /// Reads blobs from storage.
@@ -279,8 +284,8 @@ where
     pub async fn describe_application(
         &self,
         chain_id: ChainId,
-        application_id: UserApplicationId,
-    ) -> Result<UserApplicationDescription, LocalNodeError> {
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, LocalNodeError> {
         let response = self
             .node
             .state

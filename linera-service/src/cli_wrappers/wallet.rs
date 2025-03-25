@@ -23,15 +23,12 @@ use linera_base::{
     command::{resolve_binary, CommandExt},
     crypto::CryptoHash,
     data_types::{Amount, Bytecode},
-    identifiers::{Account, ApplicationId, ChainId, MessageId, ModuleId, Owner},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId},
     vm::VmRuntime,
 };
 use linera_client::{client_options::ResourceControlPolicyConfig, wallet::Wallet};
 use linera_core::worker::Notification;
-use linera_execution::{
-    committee::{Committee, Epoch},
-    system::SystemChannel,
-};
+use linera_execution::committee::{Committee, Epoch};
 use linera_faucet::ClaimOutcome;
 use linera_faucet_client::Faucet;
 use serde::{de::DeserializeOwned, ser::Serialize};
@@ -254,7 +251,9 @@ impl ClientWrapper {
                 &policy_config.to_string().to_kebab_case(),
             ]);
         if let Some(allow_list) = http_allow_list {
-            command.arg("--http-allow-list").arg(allow_list.join(","));
+            command
+                .arg("--http-request-allow-list")
+                .arg(allow_list.join(","));
         }
         if let Some(seed) = self.testing_prng_seed {
             command.arg("--testing-prng-seed").arg(seed.to_string());
@@ -268,7 +267,7 @@ impl ClientWrapper {
         &self,
         chain_ids: &[ChainId],
         faucet: FaucetOption<'_>,
-    ) -> Result<Option<(ClaimOutcome, Owner)>> {
+    ) -> Result<Option<(ClaimOutcome, AccountOwner)>> {
         let mut command = self.command().await?;
         command.args(["wallet", "init"]);
         match faucet {
@@ -318,7 +317,7 @@ impl ClientWrapper {
         &self,
         faucet: &Faucet,
         set_default: bool,
-    ) -> Result<(ClaimOutcome, Owner)> {
+    ) -> Result<(ClaimOutcome, AccountOwner)> {
         let mut command = self.command().await?;
         command.args(["wallet", "request-chain", "--faucet", faucet.url()]);
         if set_default {
@@ -678,9 +677,9 @@ impl ClientWrapper {
     pub async fn open_chain(
         &self,
         from: ChainId,
-        owner: Option<Owner>,
+        owner: Option<AccountOwner>,
         initial_balance: Amount,
-    ) -> Result<(MessageId, ChainId, Owner)> {
+    ) -> Result<(MessageId, ChainId, AccountOwner)> {
         let mut command = self.command().await?;
         command
             .arg("open-chain")
@@ -695,7 +694,7 @@ impl ClientWrapper {
         let mut split = stdout.split('\n');
         let message_id: MessageId = split.next().context("no message ID in output")?.parse()?;
         let chain_id = ChainId::from_str(split.next().context("no chain ID in output")?)?;
-        let new_owner = Owner::from_str(split.next().context("no owner in output")?)?;
+        let new_owner = AccountOwner::from_str(split.next().context("no owner in output")?)?;
         if let Some(owner) = owner {
             assert_eq!(owner, new_owner);
         }
@@ -723,7 +722,7 @@ impl ClientWrapper {
     pub async fn open_multi_owner_chain(
         &self,
         from: ChainId,
-        owners: Vec<Owner>,
+        owners: Vec<AccountOwner>,
         weights: Vec<u64>,
         multi_leader_rounds: u32,
         balance: Amount,
@@ -734,7 +733,7 @@ impl ClientWrapper {
             .arg("open-multi-owner-chain")
             .args(["--from", &from.to_string()])
             .arg("--owners")
-            .args(owners.iter().map(Owner::to_string))
+            .args(owners.iter().map(AccountOwner::to_string))
             .args(["--base-timeout-ms", &base_timeout_ms.to_string()]);
         if !weights.is_empty() {
             command
@@ -756,8 +755,8 @@ impl ClientWrapper {
     pub async fn change_ownership(
         &self,
         chain_id: ChainId,
-        super_owners: Vec<Owner>,
-        owners: Vec<Owner>,
+        super_owners: Vec<AccountOwner>,
+        owners: Vec<AccountOwner>,
     ) -> Result<()> {
         let mut command = self.command().await?;
         command
@@ -766,12 +765,12 @@ impl ClientWrapper {
         if !super_owners.is_empty() {
             command
                 .arg("--super-owners")
-                .args(super_owners.iter().map(Owner::to_string));
+                .args(super_owners.iter().map(AccountOwner::to_string));
         }
         if !owners.is_empty() {
             command
                 .arg("--owners")
-                .args(owners.iter().map(Owner::to_string));
+                .args(owners.iter().map(AccountOwner::to_string));
         }
         command.spawn_and_wait_for_stdout().await?;
         Ok(())
@@ -854,7 +853,7 @@ impl ClientWrapper {
         &self.storage
     }
 
-    pub fn get_owner(&self) -> Option<Owner> {
+    pub fn get_owner(&self) -> Option<AccountOwner> {
         let wallet = self.load_wallet().ok()?;
         let chain_id = wallet.default_chain()?;
         let public_key = wallet.get(chain_id)?.key_pair.as_ref()?.public();
@@ -906,14 +905,14 @@ impl ClientWrapper {
     }
 
     /// Runs `linera keygen`.
-    pub async fn keygen(&self) -> Result<Owner> {
+    pub async fn keygen(&self) -> Result<AccountOwner> {
         let stdout = self
             .command()
             .await?
             .arg("keygen")
             .spawn_and_wait_for_stdout()
             .await?;
-        Ok(Owner::from_str(stdout.trim())?)
+        AccountOwner::from_str(stdout.trim())
     }
 
     /// Returns the default chain.
@@ -922,7 +921,7 @@ impl ClientWrapper {
     }
 
     /// Runs `linera assign`.
-    pub async fn assign(&self, owner: Owner, message_id: MessageId) -> Result<ChainId> {
+    pub async fn assign(&self, owner: AccountOwner, message_id: MessageId) -> Result<ChainId> {
         let stdout = self
             .command()
             .await?
@@ -1068,6 +1067,16 @@ fn truncate_query_output(input: &str) -> String {
         input.to_string()
     } else {
         format!("{} ...", input.get(..max_len).unwrap())
+    }
+}
+
+fn truncate_query_output_serialize<T: Serialize>(query: T) -> String {
+    let query = serde_json::to_string(&query).expect("Failed to serialize the failed query");
+    let max_len = 200;
+    if query.len() < max_len {
+        query
+    } else {
+        format!("{} ...", query.get(..max_len).unwrap())
     }
 }
 
@@ -1257,24 +1266,6 @@ impl NodeService {
             .with_abi())
     }
 
-    pub async fn subscribe(
-        &self,
-        subscriber_chain_id: ChainId,
-        publisher_chain_id: ChainId,
-        channel: SystemChannel,
-    ) -> Result<()> {
-        let query = format!(
-            "mutation {{ subscribe(\
-                 subscriberChainId: \"{subscriber_chain_id}\", \
-                 publisherChainId: \"{publisher_chain_id}\", \
-                 channel: \"{}\") \
-             }}",
-            channel.to_value(),
-        );
-        self.query_node(query).await?;
-        Ok(())
-    }
-
     /// Obtains the hash of the `chain`'s tip block, as known by this node service.
     pub async fn chain_tip_hash(&self, chain: ChainId) -> Result<Option<CryptoHash>> {
         let query = format!(r#"query {{ block(chainId: "{chain}") {{ hash }} }}"#);
@@ -1376,39 +1367,37 @@ pub struct ApplicationWrapper<A> {
 }
 
 impl<A> ApplicationWrapper<A> {
-    pub async fn raw_query(&self, query: impl AsRef<str>) -> Result<Value> {
+    pub async fn run_graphql_query(&self, query: impl AsRef<str>) -> Result<Value> {
+        let query = query.as_ref();
+        let value = self.run_json_query(json!({ "query": query })).await?;
+        Ok(value["data"].clone())
+    }
+
+    pub async fn run_json_query<T: Serialize>(&self, query: T) -> Result<Value> {
         const MAX_RETRIES: usize = 5;
 
         for i in 0.. {
-            let query = query.as_ref();
             let client = reqwest_client();
-            let result = client
-                .post(&self.uri)
-                .json(&json!({ "query": query }))
-                .send()
-                .await;
+            let result = client.post(&self.uri).json(&query).send().await;
             let response = match result {
                 Ok(response) => response,
                 Err(error) if i < MAX_RETRIES => {
                     warn!(
                         "Failed to post query \"{}\": {error}; retrying",
-                        truncate_query_output(query),
+                        truncate_query_output_serialize(&query),
                     );
                     continue;
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "raw_query: failed to post query={}",
-                            truncate_query_output(query)
-                        )
-                    });
+                    let query = truncate_query_output_serialize(&query);
+                    return Err(error)
+                        .with_context(|| format!("run_json_query: failed to post query={query}"));
                 }
             };
             anyhow::ensure!(
                 response.status().is_success(),
                 "Query \"{}\" failed: {}",
-                truncate_query_output(query),
+                truncate_query_output_serialize(&query),
                 response
                     .text()
                     .await
@@ -1418,18 +1407,19 @@ impl<A> ApplicationWrapper<A> {
             if let Some(errors) = value.get("errors") {
                 bail!(
                     "Query \"{}\" failed: {}",
-                    truncate_query_output(query),
+                    truncate_query_output_serialize(&query),
                     errors
                 );
             }
-            return Ok(value["data"].clone());
+            return Ok(value);
         }
         unreachable!()
     }
 
     pub async fn query(&self, query: impl AsRef<str>) -> Result<Value> {
         let query = query.as_ref();
-        self.raw_query(&format!("query {{ {query} }}")).await
+        self.run_graphql_query(&format!("query {{ {query} }}"))
+            .await
     }
 
     pub async fn query_json<T: DeserializeOwned>(&self, query: impl AsRef<str>) -> Result<T> {
@@ -1444,7 +1434,8 @@ impl<A> ApplicationWrapper<A> {
 
     pub async fn mutate(&self, mutation: impl AsRef<str>) -> Result<Value> {
         let mutation = mutation.as_ref();
-        self.raw_query(&format!("mutation {{ {mutation} }}")).await
+        self.run_graphql_query(&format!("mutation {{ {mutation} }}"))
+            .await
     }
 }
 

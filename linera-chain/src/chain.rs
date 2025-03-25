@@ -4,7 +4,7 @@
 #[cfg(with_metrics)]
 use std::sync::LazyLock;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -13,10 +13,14 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use linera_base::{
     crypto::{CryptoHash, ValidatorPublicKey},
     data_types::{
-        Amount, ArithmeticError, BlockHeight, OracleResponse, Timestamp, UserApplicationDescription,
+        Amount, ApplicationDescription, ArithmeticError, Blob, BlockHeight, OracleResponse,
+        Timestamp,
     },
     ensure,
-    identifiers::{ChainId, ChannelFullName, Destination, MessageId, Owner, UserApplicationId},
+    identifiers::{
+        AccountOwner, ApplicationId, BlobType, ChainId, ChannelFullName, Destination,
+        GenericApplicationId, MessageId,
+    },
     ownership::ChainOwnership,
 };
 use linera_execution::{
@@ -29,6 +33,7 @@ use linera_execution::{
 use linera_views::{
     context::Context,
     log_view::LogView,
+    map_view::MapView,
     queue_view::QueueView,
     reentrant_collection_view::ReentrantCollectionView,
     register_view::RegisterView,
@@ -168,7 +173,7 @@ static NUM_OUTBOXES: LazyLock<HistogramVec> = LazyLock::new(|| {
 });
 
 /// The BCS-serialized size of an empty [`Block`].
-const EMPTY_BLOCK_SIZE: usize = 93;
+const EMPTY_BLOCK_SIZE: usize = 94;
 
 /// An origin, cursor and timestamp of a unskippable bundle in our inbox.
 #[derive(Debug, Clone, Serialize, Deserialize, async_graphql::SimpleObject)]
@@ -220,7 +225,7 @@ where
     /// The incomplete set of blobs for the pending validated block.
     pub pending_validated_blobs: PendingBlobsView<C>,
     /// The incomplete sets of blobs for upcoming proposals.
-    pub pending_proposed_blobs: ReentrantCollectionView<C, Owner, PendingBlobsView<C>>,
+    pub pending_proposed_blobs: ReentrantCollectionView<C, AccountOwner, PendingBlobsView<C>>,
 
     /// Hashes of all certified blocks for this sender.
     /// This ends with `block_hash` and has length `usize::from(next_block_height)`.
@@ -236,6 +241,8 @@ where
     pub unskippable_bundles: QueueView<C, TimestampedBundleInInbox>,
     /// Unskippable bundles that have been removed but are still in the queue.
     pub removed_unskippable_bundles: SetView<C, BundleInInbox>,
+    /// The heights of previous blocks that sent messages to the same recipients.
+    pub previous_message_blocks: MapView<C, ChainId, BlockHeight>,
     /// Mailboxes used to send messages, indexed by their target.
     pub outboxes: ReentrantCollectionView<C, Target, OutboxStateView<C>>,
     /// Number of outgoing messages in flight for each block height.
@@ -367,8 +374,8 @@ where
 
     pub async fn describe_application(
         &mut self,
-        application_id: UserApplicationId,
-    ) -> Result<UserApplicationDescription, ChainError> {
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, ChainError> {
         self.execution_state
             .system
             .describe_application(application_id, None)
@@ -503,7 +510,7 @@ where
         bundle: MessageBundle,
         local_time: Timestamp,
         add_to_received_log: bool,
-    ) -> Result<bool, ChainError> {
+    ) -> Result<(), ChainError> {
         assert!(!bundle.messages.is_empty());
         let chain_id = self.chain_id();
         tracing::trace!(
@@ -514,8 +521,6 @@ where
             chain_id: origin.sender,
             height: bundle.height,
         };
-        let mut subscribe_names_and_ids = Vec::new();
-        let mut unsubscribe_names_and_ids = Vec::new();
 
         // Handle immediate messages.
         for posted_message in &bundle.messages {
@@ -525,48 +530,36 @@ where
                     self.execute_init_message(message_id, config, bundle.timestamp, local_time)
                         .await?;
                 }
-            } else if let Some((id, subscription)) = posted_message.message.matches_subscribe() {
-                let name = ChannelFullName::system(subscription.name.clone());
-                subscribe_names_and_ids.push((name, *id));
-            }
-            if let Some((id, subscription)) = posted_message.message.matches_unsubscribe() {
-                let name = ChannelFullName::system(subscription.name.clone());
-                unsubscribe_names_and_ids.push((name, *id));
             }
         }
-        self.process_unsubscribes(unsubscribe_names_and_ids).await?;
-        let new_outbox_entries = self.process_subscribes(subscribe_names_and_ids).await?;
-
-        if bundle.goes_to_inbox() {
-            // Process the inbox bundle and update the inbox state.
-            let mut inbox = self.inboxes.try_load_entry_mut(origin).await?;
-            #[cfg(with_metrics)]
-            NUM_INBOXES
-                .with_label_values(&[])
-                .observe(self.inboxes.count().await? as f64);
-            let entry = BundleInInbox::new(origin.clone(), &bundle);
-            let skippable = bundle.is_skippable();
-            let newly_added = inbox
-                .add_bundle(bundle)
-                .await
-                .map_err(|error| match error {
-                    InboxError::ViewError(error) => ChainError::ViewError(error),
-                    error => ChainError::InternalError(format!(
-                        "while processing messages in certified block: {error}"
-                    )),
-                })?;
-            if newly_added && !skippable {
-                let seen = local_time;
-                self.unskippable_bundles
-                    .push_back(TimestampedBundleInInbox { entry, seen });
-            }
+        // Process the inbox bundle and update the inbox state.
+        let mut inbox = self.inboxes.try_load_entry_mut(origin).await?;
+        #[cfg(with_metrics)]
+        NUM_INBOXES
+            .with_label_values(&[])
+            .observe(self.inboxes.count().await? as f64);
+        let entry = BundleInInbox::new(origin.clone(), &bundle);
+        let skippable = bundle.is_skippable();
+        let newly_added = inbox
+            .add_bundle(bundle)
+            .await
+            .map_err(|error| match error {
+                InboxError::ViewError(error) => ChainError::ViewError(error),
+                error => ChainError::InternalError(format!(
+                    "while processing messages in certified block: {error}"
+                )),
+            })?;
+        if newly_added && !skippable {
+            let seen = local_time;
+            self.unskippable_bundles
+                .push_back(TimestampedBundleInInbox { entry, seen });
         }
 
         // Remember the certificate for future validator/client synchronizations.
         if add_to_received_log {
             self.received_log.push(chain_and_height);
         }
-        Ok(new_outbox_entries)
+        Ok(())
     }
 
     /// Updates the `received_log` trackers.
@@ -728,6 +721,7 @@ where
         block: &ProposedBlock,
         local_time: Timestamp,
         round: Option<u32>,
+        published_blobs: &[Blob],
         replaying_oracle_responses: Option<Vec<Vec<OracleResponse>>>,
     ) -> Result<BlockExecutionOutcome, ChainError> {
         #[cfg(with_metrics)]
@@ -746,6 +740,14 @@ where
             tracker: ResourceTracker::default(),
             account: block.authenticated_signer,
         };
+        ensure!(
+            block.published_blob_ids()
+                == published_blobs
+                    .iter()
+                    .map(|blob| blob.id())
+                    .collect::<BTreeSet<_>>(),
+            ChainError::InternalError("published_blobs mismatch".to_string())
+        );
         resource_controller
             .track_block_size(EMPTY_BLOCK_SIZE)
             .with_execution_context(ChainExecutionContext::Block)?;
@@ -755,6 +757,20 @@ where
         resource_controller
             .track_executed_block_size_sequence_extension(0, block.operations.len())
             .with_execution_context(ChainExecutionContext::Block)?;
+        for blob in published_blobs {
+            let blob_type = blob.content().blob_type();
+            if blob_type == BlobType::Data
+                || blob_type == BlobType::ContractBytecode
+                || blob_type == BlobType::ServiceBytecode
+            {
+                resource_controller
+                    .with_state(&mut self.execution_state.system)
+                    .await?
+                    .track_blob_published(blob.content())
+                    .with_execution_context(ChainExecutionContext::Block)?;
+            }
+            self.execution_state.system.used_blobs.insert(&blob.id())?;
+        }
 
         if self.is_closed() {
             ensure!(
@@ -833,7 +849,7 @@ where
                     .await
                     .with_execution_context(chain_execution_context)?;
                     resource_controller
-                        .with_state(&mut self.execution_state)
+                        .with_state(&mut self.execution_state.system)
                         .await?
                         .track_operation(operation)
                         .with_execution_context(chain_execution_context)?;
@@ -861,7 +877,7 @@ where
             ) {
                 for message_out in &txn_outcome.outgoing_messages {
                     resource_controller
-                        .with_state(&mut self.execution_state)
+                        .with_state(&mut self.execution_state.system)
                         .await?
                         .track_message(&message_out.message)
                         .with_execution_context(chain_execution_context)?;
@@ -873,8 +889,18 @@ where
                     &txn_outcome.oracle_responses,
                     &txn_outcome.outgoing_messages,
                     &txn_outcome.events,
+                    &txn_outcome.blobs,
                 ))
                 .with_execution_context(chain_execution_context)?;
+            for blob in &txn_outcome.blobs {
+                if blob.content().blob_type() == BlobType::Data {
+                    resource_controller
+                        .with_state(&mut self.execution_state.system)
+                        .await?
+                        .track_blob_published(blob.content())
+                        .with_execution_context(chain_execution_context)?;
+                }
+            }
             resource_controller
                 .track_executed_block_size_sequence_extension(oracle_responses.len(), 1)
                 .with_execution_context(chain_execution_context)?;
@@ -883,6 +909,9 @@ where
                 .with_execution_context(chain_execution_context)?;
             resource_controller
                 .track_executed_block_size_sequence_extension(events.len(), 1)
+                .with_execution_context(chain_execution_context)?;
+            resource_controller
+                .track_executed_block_size_sequence_extension(blobs.len(), 1)
                 .with_execution_context(chain_execution_context)?;
             oracle_responses.push(txn_outcome.oracle_responses);
             messages.push(txn_outcome.outgoing_messages);
@@ -904,10 +933,31 @@ where
         // always be able to reject incoming messages.
         if !self.is_closed() {
             resource_controller
-                .with_state(&mut self.execution_state)
+                .with_state(&mut self.execution_state.system)
                 .await?
                 .track_block()
                 .with_execution_context(ChainExecutionContext::Block)?;
+        }
+
+        let recipients = messages
+            .iter()
+            .flatten()
+            .flat_map(|message| message.destination.recipient())
+            .collect::<BTreeSet<_>>();
+        let mut previous_message_blocks = BTreeMap::new();
+        for recipient in recipients {
+            if let Some(height) = self.previous_message_blocks.get(&recipient).await? {
+                let hash = self
+                    .confirmed_log
+                    .get(usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?)
+                    .await?
+                    .ok_or_else(|| {
+                        ChainError::InternalError("missing entry in confirmed_log".into())
+                    })?;
+                previous_message_blocks.insert(recipient, hash);
+            }
+            self.previous_message_blocks
+                .insert(&recipient, block.height)?;
         }
 
         // Recompute the state hash.
@@ -924,6 +974,7 @@ where
         );
         let outcome = BlockExecutionOutcome {
             messages,
+            previous_message_blocks,
             state_hash,
             oracle_responses,
             events,
@@ -945,7 +996,7 @@ where
         txn_index: u32,
         local_time: Timestamp,
         txn_tracker: &mut TransactionTracker,
-        resource_controller: &mut ResourceController<Option<Owner>>,
+        resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ChainError> {
         #[cfg(with_metrics)]
         let _message_latency = MESSAGE_EXECUTION_LATENCY.measure_latency();
@@ -1034,7 +1085,7 @@ where
     /// Verifies that the block is valid according to the chain's application permission settings.
     fn check_app_permissions(&self, block: &ProposedBlock) -> Result<(), ChainError> {
         let app_permissions = self.execution_state.system.application_permissions.get();
-        let mut mandatory = HashSet::<UserApplicationId>::from_iter(
+        let mut mandatory = HashSet::<ApplicationId>::from_iter(
             app_permissions.mandatory_applications.iter().cloned(),
         );
         for operation in &block.operations {
@@ -1128,8 +1179,15 @@ where
                         message.grant == Amount::ZERO,
                         ChainError::GrantUseOnBroadcast
                     );
+                    let GenericApplicationId::User(application_id) =
+                        message.message.application_id()
+                    else {
+                        return Err(ChainError::InternalError(
+                            "System messages cannot be sent to channels".to_string(),
+                        ));
+                    };
                     channel_broadcasts.insert(ChannelFullName {
-                        application_id: message.message.application_id(),
+                        application_id,
                         name: name.clone(),
                     });
                 }

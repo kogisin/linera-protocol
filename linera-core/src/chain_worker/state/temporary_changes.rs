@@ -6,15 +6,18 @@
 use std::collections::HashMap;
 
 use linera_base::{
-    data_types::{ArithmeticError, Timestamp, UserApplicationDescription},
+    data_types::{ApplicationDescription, ArithmeticError, Blob, Timestamp},
     ensure,
-    identifiers::{AccountOwner, ChannelFullName, GenericApplicationId, UserApplicationId},
+    identifiers::{AccountOwner, ApplicationId},
 };
-use linera_chain::data_types::{
-    BlockExecutionOutcome, ExecutedBlock, IncomingBundle, Medium, MessageAction, ProposalContent,
-    ProposedBlock,
+use linera_chain::{
+    data_types::{
+        BlockExecutionOutcome, BlockProposal, ExecutedBlock, IncomingBundle, MessageAction,
+        ProposalContent, ProposedBlock,
+    },
+    manager,
 };
-use linera_execution::{ChannelSubscription, Query, QueryOutcome};
+use linera_execution::{Query, QueryOutcome};
 use linera_storage::{Clock as _, Storage};
 use linera_views::views::{View, ViewError};
 #[cfg(with_testing)]
@@ -110,8 +113,8 @@ where
     /// Returns an application's description.
     pub(super) async fn describe_application(
         &mut self,
-        application_id: UserApplicationId,
-    ) -> Result<UserApplicationDescription, WorkerError> {
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, WorkerError> {
         self.0.ensure_is_active()?;
         let response = self.0.chain.describe_application(application_id).await?;
         Ok(response)
@@ -122,11 +125,17 @@ where
         &mut self,
         block: ProposedBlock,
         round: Option<u32>,
+        published_blobs: &[Blob],
     ) -> Result<(ExecutedBlock, ChainInfoResponse), WorkerError> {
         let local_time = self.0.storage.clock().current_time();
         let signer = block.authenticated_signer;
 
-        let executed_block = Box::pin(self.0.chain.execute_block(&block, local_time, round, None))
+        let executed_block =
+            Box::pin(
+                self.0
+                    .chain
+                    .execute_block(&block, local_time, round, published_blobs, None),
+            )
             .await?
             .with(block);
 
@@ -138,17 +147,60 @@ where
                 .execution_state
                 .system
                 .balances
-                .get(&AccountOwner::User(signer))
+                .get(&signer)
                 .await?;
         }
 
         Ok((executed_block, response))
     }
 
-    /// Validates a block proposed to extend this chain.
+    /// Validates a proposal's signatures; returns `manager::Outcome::Skip` if we already voted
+    /// for it.
+    pub(super) async fn check_proposed_block(
+        &self,
+        proposal: &BlockProposal,
+    ) -> Result<manager::Outcome, WorkerError> {
+        proposal
+            .check_invariants()
+            .map_err(|msg| WorkerError::InvalidBlockProposal(msg.to_string()))?;
+        proposal.check_signature()?;
+        let BlockProposal {
+            content,
+            public_key,
+            validated_block_certificate,
+            signature: _,
+        } = proposal;
+        let block = &content.block;
+
+        let owner = AccountOwner::from(*public_key);
+        let chain = &self.0.chain;
+        // Check the epoch.
+        let (epoch, committee) = chain.current_committee()?;
+        super::check_block_epoch(epoch, block.chain_id, block.epoch)?;
+        let policy = committee.policy().clone();
+        block.check_proposal_size(policy.maximum_block_proposal_size)?;
+        // Check the authentication of the block.
+        ensure!(
+            chain.manager.verify_owner(proposal),
+            WorkerError::InvalidOwner
+        );
+        if let Some(lite_certificate) = validated_block_certificate {
+            // Verify that this block has been validated by a quorum before.
+            lite_certificate.check(committee)?;
+        } else if let Some(signer) = block.authenticated_signer {
+            // Check the authentication of the operations in the new block.
+            ensure!(signer == owner, WorkerError::InvalidSigner(signer));
+        }
+        // Check if the chain is ready for this new block proposal.
+        chain.tip_state.get().verify_block_chaining(block)?;
+        Ok(chain.manager.check_proposed_block(proposal)?)
+    }
+
+    /// Validates and executes a block proposed to extend this chain.
     pub(super) async fn validate_proposal_content(
         &mut self,
         content: &ProposalContent,
+        published_blobs: &[Blob],
     ) -> Result<Option<(BlockExecutionOutcome, Timestamp)>, WorkerError> {
         let ProposalContent {
             block,
@@ -171,7 +223,14 @@ where
         let outcome = if let Some(outcome) = outcome {
             outcome.clone()
         } else {
-            Box::pin(chain.execute_block(block, local_time, round.multi_leader(), None)).await?
+            Box::pin(chain.execute_block(
+                block,
+                local_time,
+                round.multi_leader(),
+                published_blobs,
+                None,
+            ))
+            .await?
         };
 
         // Verify that no event values are overwritten.
@@ -219,14 +278,15 @@ where
         if query.request_committees {
             info.requested_committees = Some(chain.execution_state.system.committees.get().clone());
         }
-        match query.request_owner_balance {
-            owner @ AccountOwner::Application(_) | owner @ AccountOwner::User(_) => {
-                info.requested_owner_balance =
-                    chain.execution_state.system.balances.get(&owner).await?;
-            }
-            AccountOwner::Chain => {
-                info.requested_owner_balance = Some(*chain.execution_state.system.balance.get());
-            }
+        if query.request_owner_balance == AccountOwner::CHAIN {
+            info.requested_owner_balance = Some(*chain.execution_state.system.balance.get());
+        } else {
+            info.requested_owner_balance = chain
+                .execution_state
+                .system
+                .balances
+                .get(&query.request_owner_balance)
+                .await?;
         }
         if let Some(next_block_height) = query.test_next_block_height {
             ensure!(
@@ -245,21 +305,7 @@ where
             } else {
                 MessageAction::Accept
             };
-            let subscriptions = &chain.execution_state.system.subscriptions;
             for (origin, inbox) in pairs {
-                if let Medium::Channel(ChannelFullName {
-                    application_id: GenericApplicationId::System,
-                    name,
-                }) = &origin.medium
-                {
-                    let subscription = ChannelSubscription {
-                        chain_id: origin.sender,
-                        name: name.clone(),
-                    };
-                    if !subscriptions.contains(&subscription).await? {
-                        continue; // We are not subscribed to this channel.
-                    }
-                }
                 for bundle in inbox.added_bundles.elements().await? {
                     messages.push(IncomingBundle {
                         origin: origin.clone(),

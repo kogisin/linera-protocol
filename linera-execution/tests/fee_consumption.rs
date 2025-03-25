@@ -11,7 +11,7 @@ use linera_base::{
     crypto::{AccountPublicKey, CryptoHash},
     data_types::{Amount, BlockHeight, OracleResponse, Timestamp},
     http,
-    identifiers::{Account, AccountOwner, ChainDescription, ChainId, MessageId, Owner},
+    identifiers::{Account, AccountOwner, ChainDescription, ChainId, MessageId},
 };
 use linera_execution::{
     test_utils::{
@@ -112,7 +112,7 @@ use test_case::test_case;
     Some(Amount::from_tokens(1_000));
     "with execution and an empty read and with owner account and grant"
 )]
-#[cfg_attr(feature = "unstable-oracles", test_case(
+#[test_case(
     vec![
         FeeSpend::QueryServiceOracle,
     ],
@@ -120,8 +120,8 @@ use test_case::test_case;
     Some(Amount::from_tokens(1)),
     Some(Amount::from_tokens(1_000));
     "with only a service oracle call"
-))]
-#[cfg_attr(feature = "unstable-oracles", test_case(
+)]
+#[test_case(
     vec![
         FeeSpend::QueryServiceOracle,
         FeeSpend::QueryServiceOracle,
@@ -131,8 +131,8 @@ use test_case::test_case;
     Some(Amount::from_tokens(1)),
     Some(Amount::from_tokens(1_000));
     "with three service oracle calls"
-))]
-#[cfg_attr(feature = "unstable-oracles", test_case(
+)]
+#[test_case(
     vec![
         FeeSpend::Fuel(91),
         FeeSpend::QueryServiceOracle,
@@ -146,7 +146,7 @@ use test_case::test_case;
     Some(Amount::from_tokens(1_000)),
     None;
     "with service oracle calls, fuel consumption and a read operation"
-))]
+)]
 #[test_case(
     vec![FeeSpend::HttpRequest],
     Amount::from_tokens(2),
@@ -195,11 +195,10 @@ async fn test_fee_consumption(
 
     let mut oracle_responses = blob_oracle_responses(blobs.iter());
 
-    let signer = Owner::from(AccountPublicKey::test_key(0));
-    let owner = AccountOwner::User(signer);
+    let signer = AccountOwner::from(AccountPublicKey::test_key(0));
     view.system.balance.set(chain_balance);
     if let Some(owner_balance) = owner_balance {
-        view.system.balances.insert(&owner, owner_balance)?;
+        view.system.balances.insert(&signer, owner_balance)?;
     }
 
     let prices = ResourceControlPolicy {
@@ -225,8 +224,13 @@ async fn test_fee_consumption(
         maximum_block_proposal_size: 67,
         maximum_bytes_read_per_block: 71,
         maximum_bytes_written_per_block: 73,
-        maximum_http_response_bytes: 79,
-        http_request_timeout_ms: 83,
+        maximum_oracle_response_bytes: 79,
+        maximum_http_response_bytes: 83,
+        http_request_timeout_ms: 89,
+        blob_read: Amount::from_tokens(97),
+        blob_published: Amount::from_tokens(101),
+        blob_byte_read: Amount::from_tokens(103),
+        blob_byte_published: Amount::from_tokens(107),
         http_request_allow_list: BTreeSet::new(),
     };
 
@@ -265,7 +269,7 @@ async fn test_fee_consumption(
     let refund_grant_to = authenticated_signer
         .map(|owner| Account {
             chain_id: ChainId::root(0),
-            owner: AccountOwner::User(owner),
+            owner,
         })
         .or(None);
     let context = MessageContext {
@@ -320,7 +324,7 @@ async fn test_fee_consumption(
             };
             assert_eq!(*view.system.balance.get(), expected_chain_balance);
             assert_eq!(
-                view.system.balances.get(&owner).await?,
+                view.system.balances.get(&signer).await?,
                 expected_owner_balance
             );
             assert_eq!(grant, Amount::ZERO);
@@ -343,7 +347,7 @@ async fn test_fee_consumption(
             };
             assert_eq!(*view.system.balance.get(), chain_balance);
             assert_eq!(
-                view.system.balances.get(&owner).await?,
+                view.system.balances.get(&signer).await?,
                 expected_owner_balance
             );
             assert_eq!(grant, expected_grant);

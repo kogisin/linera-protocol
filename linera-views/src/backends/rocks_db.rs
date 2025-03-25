@@ -5,6 +5,7 @@
 
 use std::{
     ffi::OsString,
+    fmt::Display,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -48,8 +49,8 @@ const MAX_VALUE_SIZE: usize = 3221225072;
 // 8388608 and so for offset reason we decrease by 400
 const MAX_KEY_SIZE: usize = 8388208;
 
-const DB_CACHE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
-const DB_MAX_WRITE_BUFFER_NUMBER: i32 = 16;
+const DB_CACHE_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
+const DB_MAX_WRITE_BUFFER_NUMBER: i32 = 8;
 
 /// The RocksDB client that we use.
 type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
@@ -92,6 +93,15 @@ impl RocksDbSpawnMode {
                 tokio::task::spawn_blocking(move || f(input)).await??
             }
         })
+    }
+}
+
+impl Display for RocksDbSpawnMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            RocksDbSpawnMode::SpawnBlocking => write!(f, "spawn_blocking"),
+            RocksDbSpawnMode::BlockInPlace => write!(f, "block_in_place"),
+        }
     }
 }
 
@@ -257,7 +267,7 @@ pub struct RocksDbStoreInternal {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RocksDbStoreInternalConfig {
     /// The path to the storage containing the namespaces
-    path_with_guard: PathWithGuard,
+    pub path_with_guard: PathWithGuard,
     /// The chosen spawn mode
     spawn_mode: RocksDbSpawnMode,
     /// The common configuration of the key value store
@@ -297,6 +307,13 @@ impl RocksDbStoreInternal {
         options.set_write_buffer_size(DB_CACHE_SIZE);
         options.set_max_write_buffer_number(DB_MAX_WRITE_BUFFER_NUMBER);
         options.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        options.set_level_zero_slowdown_writes_trigger(-1);
+        options.set_level_zero_stop_writes_trigger(48);
+        options.set_stats_dump_period_sec(60);
+        options.enable_statistics();
+        options.increase_parallelism(num_cpus::get() as i32);
+        options.set_max_background_jobs(8);
+        options.set_level_compaction_dynamic_level_bytes(true);
 
         let db = DB::open(&options, path_buf)?;
         let executor = RocksDbStoreExecutor {
@@ -505,6 +522,9 @@ impl AdminKeyValueStore for RocksDbStoreInternal {
         Self::check_namespace(namespace)?;
         let mut path_buf = config.path_with_guard.path_buf.clone();
         path_buf.push(namespace);
+        if std::path::Path::exists(&path_buf) {
+            return Err(RocksDbStoreInternalError::StoreAlreadyExist);
+        }
         std::fs::create_dir_all(path_buf)?;
         Ok(())
     }
@@ -542,6 +562,10 @@ impl TestKeyValueStore for RocksDbStoreInternal {
 /// The error type for [`RocksDbStoreInternal`]
 #[derive(Error, Debug)]
 pub enum RocksDbStoreInternalError {
+    /// Already existing storage
+    #[error("Already existing storag")]
+    StoreAlreadyExist,
+
     /// Tokio join error in RocksDB.
     #[error("tokio join error: {0}")]
     TokioJoinError(#[from] tokio::task::JoinError),
@@ -603,6 +627,13 @@ impl PathWithGuard {
         PathWithGuard { path_buf, _dir }
     }
 }
+
+impl PartialEq for PathWithGuard {
+    fn eq(&self, other: &Self) -> bool {
+        self.path_buf == other.path_buf
+    }
+}
+impl Eq for PathWithGuard {}
 
 impl KeyValueStoreError for RocksDbStoreInternalError {
     const BACKEND: &'static str = "rocks_db";

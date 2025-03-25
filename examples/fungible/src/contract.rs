@@ -48,10 +48,9 @@ impl Contract for FungibleTokenContract {
         // If initial accounts are empty, creator gets 1M tokens to act like a faucet.
         if state.accounts.is_empty() {
             if let Some(owner) = self.runtime.authenticated_signer() {
-                state.accounts.insert(
-                    AccountOwner::User(owner),
-                    Amount::from_str("1000000").unwrap(),
-                );
+                state
+                    .accounts
+                    .insert(owner, Amount::from_str("1000000").unwrap());
             }
         }
         self.state.initialize_accounts(state).await;
@@ -74,7 +73,9 @@ impl Contract for FungibleTokenContract {
                 amount,
                 target_account,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Transfer operation");
                 self.state.debit(owner, amount).await;
                 self.finish_transfer_to_account(amount, target_account, owner)
                     .await;
@@ -86,7 +87,9 @@ impl Contract for FungibleTokenContract {
                 amount,
                 target_account,
             } => {
-                self.check_account_authentication(source_account.owner);
+                self.runtime
+                    .check_account_permission(source_account.owner)
+                    .expect("Permission for Claim operation");
                 self.claim(source_account, amount, target_account).await;
                 FungibleResponse::Ok
             }
@@ -112,7 +115,9 @@ impl Contract for FungibleTokenContract {
                 amount,
                 target_account,
             } => {
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for Withdraw message");
                 self.state.debit(owner, amount).await;
                 self.finish_transfer_to_account(amount, target_account, owner)
                     .await;
@@ -126,29 +131,6 @@ impl Contract for FungibleTokenContract {
 }
 
 impl FungibleTokenContract {
-    /// Verifies that a transfer is authenticated for this local account.
-    fn check_account_authentication(&mut self, owner: AccountOwner) {
-        match owner {
-            AccountOwner::User(address) => {
-                assert_eq!(
-                    self.runtime.authenticated_signer(),
-                    Some(address),
-                    "The requested transfer is not correctly authenticated."
-                )
-            }
-            AccountOwner::Application(id) => {
-                assert_eq!(
-                    self.runtime.authenticated_caller_id(),
-                    Some(id),
-                    "The requested transfer is not correctly authenticated."
-                )
-            }
-            AccountOwner::Chain => {
-                panic!("Chain account is not supported")
-            }
-        }
-    }
-
     async fn claim(&mut self, source_account: Account, amount: Amount, target_account: Account) {
         if source_account.chain_id == self.runtime.chain_id() {
             self.state.debit(source_account.owner, amount).await;

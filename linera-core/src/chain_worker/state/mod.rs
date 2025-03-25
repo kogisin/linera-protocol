@@ -14,15 +14,16 @@ use std::{
 
 use linera_base::{
     crypto::{CryptoHash, ValidatorPublicKey},
-    data_types::{Blob, BlockHeight, UserApplicationDescription},
+    data_types::{ApplicationDescription, Blob, BlockHeight},
     ensure,
     hashed::Hashed,
-    identifiers::{BlobId, ChainId, UserApplicationId},
+    identifiers::{ApplicationId, BlobId, ChainId},
 };
 use linera_chain::{
     data_types::{
         BlockProposal, ExecutedBlock, Medium, MessageBundle, Origin, ProposedBlock, Target,
     },
+    manager,
     types::{Block, ConfirmedBlockCertificate, TimeoutCertificate, ValidatedBlockCertificate},
     ChainError, ChainStateView,
 };
@@ -168,8 +169,8 @@ where
     /// Returns an application's description.
     pub(super) async fn describe_application(
         &mut self,
-        application_id: UserApplicationId,
-    ) -> Result<UserApplicationDescription, WorkerError> {
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, WorkerError> {
         ChainWorkerStateWithTemporaryChanges::new(self)
             .await
             .describe_application(application_id)
@@ -181,10 +182,11 @@ where
         &mut self,
         block: ProposedBlock,
         round: Option<u32>,
+        published_blobs: &[Blob],
     ) -> Result<(ExecutedBlock, ChainInfoResponse), WorkerError> {
         ChainWorkerStateWithTemporaryChanges::new(self)
             .await
-            .stage_block_execution(block, round)
+            .stage_block_execution(block, round, published_blobs)
             .await
     }
 
@@ -206,17 +208,23 @@ where
         proposal: BlockProposal,
     ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
         self.ensure_is_active()?;
-        proposal
-            .check_invariants()
-            .map_err(|msg| WorkerError::InvalidBlockProposal(msg.to_string()))?;
-        proposal.check_signature()?;
-        ChainWorkerStateWithAttemptedChanges::new(&mut *self)
+        if ChainWorkerStateWithTemporaryChanges::new(&mut *self)
             .await
-            .validate_block(&proposal)
+            .check_proposed_block(&proposal)
+            .await?
+            == manager::Outcome::Skip
+        {
+            // Skipping: We already voted for this block.
+            let info = ChainInfoResponse::new(&self.chain, self.config.key_pair());
+            return Ok((info, NetworkActions::default()));
+        };
+        let published_blobs = ChainWorkerStateWithAttemptedChanges::new(&mut *self)
+            .await
+            .load_proposal_blobs(&proposal)
             .await?;
         let validation_outcome = ChainWorkerStateWithTemporaryChanges::new(self)
             .await
-            .validate_proposal_content(&proposal.content)
+            .validate_proposal_content(&proposal.content, &published_blobs)
             .await?;
 
         let actions = if let Some((outcome, local_time)) = validation_outcome {
@@ -266,7 +274,7 @@ where
         &mut self,
         origin: Origin,
         bundles: Vec<(Epoch, MessageBundle)>,
-    ) -> Result<Option<(BlockHeight, NetworkActions)>, WorkerError> {
+    ) -> Result<Option<BlockHeight>, WorkerError> {
         ChainWorkerStateWithAttemptedChanges::new(self)
             .await
             .process_cross_chain_update(origin, bundles)
@@ -436,22 +444,10 @@ where
         let mut heights_by_recipient = BTreeMap::<_, BTreeMap<_, _>>::new();
         let mut targets = self.chain.outboxes.indices().await?;
         if let Some(tracked_chains) = self.tracked_chains.as_ref() {
-            let publishers = self
-                .chain
-                .execution_state
-                .system
-                .subscriptions
-                .indices()
-                .await?
-                .iter()
-                .map(|subscription| subscription.chain_id)
-                .collect::<HashSet<_>>();
             let tracked_chains = tracked_chains
                 .read()
                 .expect("Panics should not happen while holding a lock to `tracked_chains`");
-            targets.retain(|target| {
-                tracked_chains.contains(&target.recipient) || publishers.contains(&target.recipient)
-            });
+            targets.retain(|target| tracked_chains.contains(&target.recipient));
         }
         let outboxes = self.chain.outboxes.try_load_entries(&targets).await?;
         for (target, outbox) in targets.into_iter().zip(outboxes) {
@@ -536,20 +532,8 @@ where
         };
         let mut targets = self.chain.outboxes.indices().await?;
         {
-            let publishers = self
-                .chain
-                .execution_state
-                .system
-                .subscriptions
-                .indices()
-                .await?
-                .iter()
-                .map(|subscription| subscription.chain_id)
-                .collect::<HashSet<_>>();
             let tracked_chains = tracked_chains.read().unwrap();
-            targets.retain(|target| {
-                tracked_chains.contains(&target.recipient) || publishers.contains(&target.recipient)
-            });
+            targets.retain(|target| tracked_chains.contains(&target.recipient));
         }
         let outboxes = self.chain.outboxes.try_load_entries(&targets).await?;
         for outbox in outboxes {

@@ -17,7 +17,7 @@ use linera_base::prometheus_util::{
 use linera_base::{
     data_types::{Amount, ApplicationPermissions, BlobContent, BlockHeight, Timestamp},
     ensure, hex_debug, hex_vec_debug, http,
-    identifiers::{Account, AccountOwner, BlobId, ChainId, MessageId, Owner},
+    identifiers::{Account, AccountOwner, BlobId, BlobType, ChainId, MessageId},
     ownership::ChainOwnership,
 };
 use linera_views::{batch::Batch, context::Context, views::View};
@@ -29,9 +29,9 @@ use reqwest::{header::HeaderMap, Client, Url};
 use crate::{
     system::{CreateApplicationResult, OpenChainConfig, Recipient},
     util::RespondExt,
-    ExecutionError, ExecutionRuntimeContext, ExecutionStateView, ModuleId, RawExecutionOutcome,
-    RawOutgoingMessage, SystemMessage, TransactionTracker, UserApplicationDescription,
-    UserApplicationId, UserContractCode, UserServiceCode,
+    ApplicationDescription, ApplicationId, ExecutionError, ExecutionRuntimeContext,
+    ExecutionStateView, ModuleId, OutgoingMessage, ResourceController, TransactionTracker,
+    UserContractCode, UserServiceCode,
 };
 
 #[cfg(with_metrics)]
@@ -65,9 +65,9 @@ where
 {
     pub(crate) async fn load_contract(
         &mut self,
-        id: UserApplicationId,
+        id: ApplicationId,
         txn_tracker: &mut TransactionTracker,
-    ) -> Result<(UserContractCode, UserApplicationDescription), ExecutionError> {
+    ) -> Result<(UserContractCode, ApplicationDescription), ExecutionError> {
         #[cfg(with_metrics)]
         let _latency = LOAD_CONTRACT_LATENCY.measure_latency();
         let blob_id = id.description_blob_id();
@@ -92,9 +92,9 @@ where
 
     pub(crate) async fn load_service(
         &mut self,
-        id: UserApplicationId,
+        id: ApplicationId,
         txn_tracker: Option<&mut TransactionTracker>,
-    ) -> Result<(UserServiceCode, UserApplicationDescription), ExecutionError> {
+    ) -> Result<(UserServiceCode, ApplicationDescription), ExecutionError> {
         #[cfg(with_metrics)]
         let _latency = LOAD_SERVICE_LATENCY.measure_latency();
         let blob_id = id.description_blob_id();
@@ -120,6 +120,7 @@ where
     pub(crate) async fn handle_request(
         &mut self,
         request: ExecutionRequest,
+        resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ExecutionError> {
         use ExecutionRequest::*;
         match request {
@@ -169,10 +170,8 @@ where
                 signer,
                 application_id,
                 callback,
-            } => {
-                let mut execution_outcome = RawExecutionOutcome::default();
-                let message = self
-                    .system
+            } => callback.respond(
+                self.system
                     .transfer(
                         signer,
                         Some(application_id),
@@ -180,13 +179,8 @@ where
                         Recipient::Account(destination),
                         amount,
                     )
-                    .await?;
-
-                if let Some(message) = message {
-                    execution_outcome.messages.push(message);
-                }
-                callback.respond(execution_outcome);
-            }
+                    .await?,
+            ),
 
             Claim {
                 source,
@@ -195,10 +189,8 @@ where
                 signer,
                 application_id,
                 callback,
-            } => {
-                let mut execution_outcome = RawExecutionOutcome::default();
-                let message = self
-                    .system
+            } => callback.respond(
+                self.system
                     .claim(
                         signer,
                         Some(application_id),
@@ -207,11 +199,8 @@ where
                         Recipient::Account(destination),
                         amount,
                     )
-                    .await?;
-
-                execution_outcome.messages.push(message);
-                callback.respond(execution_outcome);
-            }
+                    .await?,
+            ),
 
             SystemTimestamp { callback } => {
                 let timestamp = *self.system.timestamp.get();
@@ -311,8 +300,7 @@ where
                     balance,
                     application_permissions,
                 };
-                let messages = self.system.open_chain(config, next_message_id).await?;
-                callback.respond(messages)
+                callback.respond(self.system.open_chain(config, next_message_id).await?);
             }
 
             CloseChain {
@@ -323,8 +311,7 @@ where
                 if !app_permissions.can_close_chain(&application_id) {
                     callback.respond(Err(ExecutionError::UnauthorizedApplication(application_id)));
                 } else {
-                    let chain_id = self.context().extra().chain_id();
-                    self.system.close_chain(chain_id).await?;
+                    self.system.close_chain().await?;
                     callback.respond(Ok(()));
                 }
             }
@@ -368,7 +355,11 @@ where
                 callback.respond(Ok(create_application_result));
             }
 
-            PerformHttpRequest { request, callback } => {
+            PerformHttpRequest {
+                request,
+                http_responses_are_oracle_responses,
+                callback,
+            } => {
                 let headers = request
                     .headers
                     .into_iter()
@@ -405,7 +396,12 @@ where
 
                 let response = request.send().await?;
 
-                let response_size_limit = committee.policy().maximum_http_response_bytes;
+                let mut response_size_limit = committee.policy().maximum_http_response_bytes;
+
+                if http_responses_are_oracle_responses {
+                    response_size_limit =
+                        response_size_limit.min(committee.policy().maximum_oracle_response_bytes);
+                }
 
                 callback.respond(
                     self.receive_http_response(response, response_size_limit)
@@ -415,12 +411,25 @@ where
 
             ReadBlobContent { blob_id, callback } => {
                 let blob = self.system.read_blob_content(blob_id).await?;
+                if blob_id.blob_type == BlobType::Data {
+                    resource_controller
+                        .with_state(&mut self.system)
+                        .await?
+                        .track_blob_read(blob.bytes().len() as u64)?;
+                }
                 let is_new = self.system.blob_used(None, blob_id).await?;
                 callback.respond((blob, is_new))
             }
 
             AssertBlobExists { blob_id, callback } => {
                 self.system.assert_blob_exists(blob_id).await?;
+                // Treating this as reading a size-0 blob for fee purposes.
+                if blob_id.blob_type == BlobType::Data {
+                    resource_controller
+                        .with_state(&mut self.system)
+                        .await?
+                        .track_blob_read(0)?;
+                }
                 callback.respond(self.system.blob_used(None, blob_id).await?)
             }
 
@@ -504,26 +513,18 @@ where
 pub enum ExecutionRequest {
     #[cfg(not(web))]
     LoadContract {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(skip)]
-        callback: Sender<(
-            UserContractCode,
-            UserApplicationDescription,
-            TransactionTracker,
-        )>,
+        callback: Sender<(UserContractCode, ApplicationDescription, TransactionTracker)>,
         #[debug(skip)]
         txn_tracker: TransactionTracker,
     },
 
     #[cfg(not(web))]
     LoadService {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(skip)]
-        callback: Sender<(
-            UserServiceCode,
-            UserApplicationDescription,
-            TransactionTracker,
-        )>,
+        callback: Sender<(UserServiceCode, ApplicationDescription, TransactionTracker)>,
         #[debug(skip)]
         txn_tracker: TransactionTracker,
     },
@@ -554,10 +555,10 @@ pub enum ExecutionRequest {
         destination: Account,
         amount: Amount,
         #[debug(skip_if = Option::is_none)]
-        signer: Option<Owner>,
-        application_id: UserApplicationId,
+        signer: Option<AccountOwner>,
+        application_id: ApplicationId,
         #[debug(skip)]
-        callback: Sender<RawExecutionOutcome<SystemMessage>>,
+        callback: Sender<Option<OutgoingMessage>>,
     },
 
     Claim {
@@ -565,10 +566,10 @@ pub enum ExecutionRequest {
         destination: Account,
         amount: Amount,
         #[debug(skip_if = Option::is_none)]
-        signer: Option<Owner>,
-        application_id: UserApplicationId,
+        signer: Option<AccountOwner>,
+        application_id: ApplicationId,
         #[debug(skip)]
-        callback: Sender<RawExecutionOutcome<SystemMessage>>,
+        callback: Sender<OutgoingMessage>,
     },
 
     SystemTimestamp {
@@ -582,7 +583,7 @@ pub enum ExecutionRequest {
     },
 
     ReadValueBytes {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_debug)]
         key: Vec<u8>,
         #[debug(skip)]
@@ -590,21 +591,21 @@ pub enum ExecutionRequest {
     },
 
     ContainsKey {
-        id: UserApplicationId,
+        id: ApplicationId,
         key: Vec<u8>,
         #[debug(skip)]
         callback: Sender<bool>,
     },
 
     ContainsKeys {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_vec_debug)]
         keys: Vec<Vec<u8>>,
         callback: Sender<Vec<bool>>,
     },
 
     ReadMultiValuesBytes {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_vec_debug)]
         keys: Vec<Vec<u8>>,
         #[debug(skip)]
@@ -612,7 +613,7 @@ pub enum ExecutionRequest {
     },
 
     FindKeysByPrefix {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_debug)]
         key_prefix: Vec<u8>,
         #[debug(skip)]
@@ -620,7 +621,7 @@ pub enum ExecutionRequest {
     },
 
     FindKeyValuesByPrefix {
-        id: UserApplicationId,
+        id: ApplicationId,
         #[debug(with = hex_debug)]
         key_prefix: Vec<u8>,
         #[debug(skip)]
@@ -628,7 +629,7 @@ pub enum ExecutionRequest {
     },
 
     WriteBatch {
-        id: UserApplicationId,
+        id: ApplicationId,
         batch: Batch,
         #[debug(skip)]
         callback: Sender<()>,
@@ -641,17 +642,17 @@ pub enum ExecutionRequest {
         next_message_id: MessageId,
         application_permissions: ApplicationPermissions,
         #[debug(skip)]
-        callback: Sender<RawOutgoingMessage<SystemMessage, Amount>>,
+        callback: Sender<OutgoingMessage>,
     },
 
     CloseChain {
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         #[debug(skip)]
         callback: Sender<Result<(), ExecutionError>>,
     },
 
     ChangeApplicationPermissions {
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         application_permissions: ApplicationPermissions,
         #[debug(skip)]
         callback: Sender<Result<(), ExecutionError>>,
@@ -662,7 +663,7 @@ pub enum ExecutionRequest {
         block_height: BlockHeight,
         module_id: ModuleId,
         parameters: Vec<u8>,
-        required_application_ids: Vec<UserApplicationId>,
+        required_application_ids: Vec<ApplicationId>,
         #[debug(skip)]
         txn_tracker: TransactionTracker,
         #[debug(skip)]
@@ -671,6 +672,7 @@ pub enum ExecutionRequest {
 
     PerformHttpRequest {
         request: http::Request,
+        http_responses_are_oracle_responses: bool,
         #[debug(skip)]
         callback: Sender<http::Response>,
     },

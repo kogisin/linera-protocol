@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use linera_base::{
     crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
     data_types::{Amount, ApplicationPermissions, TimeDelta},
-    identifiers::{Account, ApplicationId, ChainId, MessageId, ModuleId, Owner, UserApplicationId},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId},
     ownership::{ChainOwnership, TimeoutConfig},
     time::Duration,
     vm::VmRuntime,
@@ -332,7 +332,7 @@ pub enum ClientCommand {
 
         /// The new owner (otherwise create a key pair and remember it)
         #[arg(long = "owner")]
-        owner: Option<Owner>,
+        owner: Option<AccountOwner>,
 
         /// The initial balance of the new chain. This is subtracted from the parent chain's
         /// balance.
@@ -531,6 +531,22 @@ pub enum ClientCommand {
         #[arg(long)]
         byte_written: Option<Amount>,
 
+        /// Set the base price to read a blob.
+        #[arg(long)]
+        blob_read: Option<Amount>,
+
+        /// Set the base price to publish a blob.
+        #[arg(long)]
+        blob_published: Option<Amount>,
+
+        /// Set the price to read a blob, per byte.
+        #[arg(long)]
+        blob_byte_read: Option<Amount>,
+
+        /// The price to publish a blob, per byte.
+        #[arg(long)]
+        blob_byte_published: Option<Amount>,
+
         /// Set the price per byte stored.
         #[arg(long)]
         byte_stored: Option<Amount>,
@@ -551,9 +567,21 @@ pub enum ClientCommand {
         #[arg(long)]
         message_byte: Option<Amount>,
 
+        /// Set the price per query to a service as an oracle.
+        #[arg(long)]
+        service_as_oracle_query: Option<Amount>,
+
+        /// Set the price for performing an HTTP request.
+        #[arg(long)]
+        http_request: Option<Amount>,
+
         /// Set the maximum amount of fuel per block.
         #[arg(long)]
         maximum_fuel_per_block: Option<u64>,
+
+        /// Set the maximum time in milliseconds that a block can spend executing services as oracles.
+        #[arg(long)]
+        maximum_service_oracle_execution_ms: Option<u64>,
 
         /// Set the maximum size of an executed block, in bytes.
         #[arg(long)]
@@ -583,6 +611,22 @@ pub enum ClientCommand {
         /// Set the maximum write data per block.
         #[arg(long)]
         maximum_bytes_written_per_block: Option<u64>,
+
+        /// Set the maximum size of oracle responses.
+        #[arg(long)]
+        maximum_oracle_response_bytes: Option<u64>,
+
+        /// Set the maximum size in bytes of a received HTTP response.
+        #[arg(long)]
+        maximum_http_response_bytes: Option<u64>,
+
+        /// Set the maximum amount of time allowed to wait for an HTTP response.
+        #[arg(long)]
+        http_request_timeout_ms: Option<u64>,
+
+        /// Set the list of hosts that contracts and services can send HTTP requests to.
+        #[arg(long)]
+        http_request_allow_list: Option<Vec<String>>,
     },
 
     /// Send one transfer per chain in bulk mode
@@ -691,6 +735,26 @@ pub enum ClientCommand {
         #[arg(long)]
         byte_written_price: Option<Amount>,
 
+        /// Set the base price to read a blob.
+        /// (This will overwrite value from `--policy-config`)
+        #[arg(long)]
+        blob_read_price: Option<Amount>,
+
+        /// Set the base price to publish a blob.
+        /// (This will overwrite value from `--policy-config`)
+        #[arg(long)]
+        blob_published_price: Option<Amount>,
+
+        /// Set the price to read a blob, per byte.
+        /// (This will overwrite value from `--policy-config`)
+        #[arg(long)]
+        blob_byte_read_price: Option<Amount>,
+
+        /// Set the price to publish a blob, per byte.
+        /// (This will overwrite value from `--policy-config`)
+        #[arg(long)]
+        blob_byte_published_price: Option<Amount>,
+
         /// Set the price per byte stored.
         /// (This will overwrite value from `--policy-config`)
         #[arg(long)]
@@ -716,10 +780,22 @@ pub enum ClientCommand {
         #[arg(long)]
         message_byte_price: Option<Amount>,
 
+        /// Set the price per query to a service as an oracle.
+        #[arg(long)]
+        service_as_oracle_query_price: Option<Amount>,
+
+        /// Set the price for performing an HTTP request.
+        #[arg(long)]
+        http_request_price: Option<Amount>,
+
         /// Set the maximum amount of fuel per block.
         /// (This will overwrite value from `--policy-config`)
         #[arg(long)]
         maximum_fuel_per_block: Option<u64>,
+
+        /// Set the maximum time in milliseconds that a block can spend executing services as oracles.
+        #[arg(long)]
+        maximum_service_oracle_execution_ms: Option<u64>,
 
         /// Set the maximum size of an executed block.
         /// (This will overwrite value from `--policy-config`)
@@ -757,9 +833,22 @@ pub enum ClientCommand {
         #[arg(long)]
         maximum_bytes_written_per_block: Option<u64>,
 
+        /// Set the maximum size of oracle responses.
+        /// (This will overwrite value from `--policy-config`)
+        #[arg(long)]
+        maximum_oracle_response_bytes: Option<u64>,
+
+        /// Set the maximum size in bytes of a received HTTP response.
+        #[arg(long)]
+        maximum_http_response_bytes: Option<u64>,
+
+        /// Set the maximum amount of time allowed to wait for an HTTP response.
+        #[arg(long)]
+        http_request_timeout_ms: Option<u64>,
+
         /// Set the list of hosts that contracts and services can send HTTP requests to.
         #[arg(long)]
-        http_allow_list: Option<Vec<String>>,
+        http_request_allow_list: Option<Vec<String>>,
 
         /// Force this wallet to generate keys using a PRNG and a given seed. USE FOR
         /// TESTING ONLY.
@@ -878,7 +967,7 @@ pub enum ClientCommand {
 
         /// The list of required dependencies of application, if any.
         #[arg(long, num_args(0..))]
-        required_application_ids: Option<Vec<UserApplicationId>>,
+        required_application_ids: Option<Vec<ApplicationId>>,
     },
 
     /// Create an application, and publish the required module.
@@ -915,7 +1004,7 @@ pub enum ClientCommand {
 
         /// The list of required dependencies of application, if any.
         #[arg(long, num_args(0..))]
-        required_application_ids: Option<Vec<UserApplicationId>>,
+        required_application_ids: Option<Vec<ApplicationId>>,
     },
 
     /// Create an unassigned key pair.
@@ -925,7 +1014,7 @@ pub enum ClientCommand {
     Assign {
         /// The owner to assign.
         #[arg(long)]
-        owner: Owner,
+        owner: AccountOwner,
 
         /// The ID of the message that created the chain. (This uniquely describes the
         /// chain and where it was created.)
@@ -1327,7 +1416,7 @@ pub enum ProjectCommand {
 
         /// The list of required dependencies of application, if any.
         #[arg(long, num_args(0..))]
-        required_application_ids: Option<Vec<UserApplicationId>>,
+        required_application_ids: Option<Vec<ApplicationId>>,
     },
 }
 
@@ -1335,11 +1424,11 @@ pub enum ProjectCommand {
 pub struct ChainOwnershipConfig {
     /// The new super owners.
     #[arg(long, num_args(0..))]
-    super_owners: Vec<Owner>,
+    super_owners: Vec<AccountOwner>,
 
     /// The new regular owners.
     #[arg(long, num_args(0..))]
-    owners: Vec<Owner>,
+    owners: Vec<AccountOwner>,
 
     /// Weights for the new owners.
     ///

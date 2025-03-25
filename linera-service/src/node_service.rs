@@ -12,9 +12,9 @@ use axum::{extract::Path, http::StatusCode, response, response::IntoResponse, Ex
 use futures::{lock::Mutex, Future};
 use linera_base::{
     crypto::{CryptoError, CryptoHash},
-    data_types::{Amount, ApplicationPermissions, Bytecode, TimeDelta, UserApplicationDescription},
+    data_types::{Amount, ApplicationDescription, ApplicationPermissions, Bytecode, TimeDelta},
     hashed::Hashed,
-    identifiers::{AccountOwner, ApplicationId, ChainId, ModuleId, Owner, UserApplicationId},
+    identifiers::{AccountOwner, ApplicationId, ChainId, ModuleId},
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
     BcsHexParseError,
@@ -31,7 +31,7 @@ use linera_core::{
 };
 use linera_execution::{
     committee::{Committee, Epoch},
-    system::{AdminOperation, Recipient, SystemChannel},
+    system::{AdminOperation, Recipient},
     Operation, Query, QueryOutcome, QueryResponse, SystemOperation,
 };
 use linera_sdk::linera_base_types::BlobContent;
@@ -132,7 +132,7 @@ where
     ) -> Result<CryptoHash, Error> {
         let certificate = self
             .apply_client_command(&chain_id, move |client| {
-                let operation = Operation::System(system_operation.clone());
+                let operation = Operation::system(system_operation.clone());
                 async move {
                     let result = client
                         .execute_operation(operation)
@@ -219,7 +219,7 @@ where
     }
 
     /// Transfers `amount` units of value from the given owner's account to the recipient.
-    /// If no owner is given, try to take the units out of the unattributed account.
+    /// If no owner is given, try to take the units out of the chain account.
     async fn transfer(
         &self,
         chain_id: ChainId,
@@ -244,7 +244,7 @@ where
     async fn claim(
         &self,
         chain_id: ChainId,
-        owner: Owner,
+        owner: AccountOwner,
         target_id: ChainId,
         recipient: Recipient,
         amount: Amount,
@@ -284,7 +284,7 @@ where
     async fn open_chain(
         &self,
         chain_id: ChainId,
-        owner: Owner,
+        owner: AccountOwner,
         balance: Option<Amount>,
     ) -> Result<ChainId, Error> {
         let ownership = ChainOwnership::single(owner);
@@ -312,7 +312,7 @@ where
         &self,
         chain_id: ChainId,
         application_permissions: Option<ApplicationPermissions>,
-        owners: Vec<Owner>,
+        owners: Vec<AccountOwner>,
         weights: Option<Vec<u64>>,
         multi_leader_rounds: Option<u32>,
         balance: Option<Amount>,
@@ -389,7 +389,11 @@ where
     }
 
     /// Changes the authentication key of the chain.
-    async fn change_owner(&self, chain_id: ChainId, new_owner: Owner) -> Result<CryptoHash, Error> {
+    async fn change_owner(
+        &self,
+        chain_id: ChainId,
+        new_owner: AccountOwner,
+    ) -> Result<CryptoHash, Error> {
         let operation = SystemOperation::ChangeOwnership {
             super_owners: vec![new_owner],
             owners: Vec::new(),
@@ -405,7 +409,7 @@ where
     async fn change_multiple_owners(
         &self,
         chain_id: ChainId,
-        new_owners: Vec<Owner>,
+        new_owners: Vec<AccountOwner>,
         new_weights: Vec<u64>,
         multi_leader_rounds: u32,
         open_multi_leader_rounds: bool,
@@ -490,36 +494,6 @@ where
             .hash())
     }
 
-    /// Subscribes to a system channel.
-    async fn subscribe(
-        &self,
-        subscriber_chain_id: ChainId,
-        publisher_chain_id: ChainId,
-        channel: SystemChannel,
-    ) -> Result<CryptoHash, Error> {
-        let operation = SystemOperation::Subscribe {
-            chain_id: publisher_chain_id,
-            channel,
-        };
-        self.execute_system_operation(operation, subscriber_chain_id)
-            .await
-    }
-
-    /// Unsubscribes from a system channel.
-    async fn unsubscribe(
-        &self,
-        subscriber_chain_id: ChainId,
-        publisher_chain_id: ChainId,
-        channel: SystemChannel,
-    ) -> Result<CryptoHash, Error> {
-        let operation = SystemOperation::Unsubscribe {
-            chain_id: publisher_chain_id,
-            channel,
-        };
-        self.execute_system_operation(operation, subscriber_chain_id)
-            .await
-    }
-
     /// (admin chain only) Removes a committee. Once this message is accepted by a chain,
     /// blocks from the retired epoch will not be accepted until they are followed (hence
     /// re-certified) by a block certified by a recent committee.
@@ -575,7 +549,7 @@ where
         module_id: ModuleId,
         parameters: String,
         instantiation_argument: String,
-        required_application_ids: Vec<UserApplicationId>,
+        required_application_ids: Vec<ApplicationId>,
     ) -> Result<ApplicationId, Error> {
         self.apply_client_command(&chain_id, move |client| {
             let parameters = parameters.as_bytes().to_vec();
@@ -761,15 +735,15 @@ where
 
 #[derive(SimpleObject)]
 pub struct ApplicationOverview {
-    id: UserApplicationId,
-    description: UserApplicationDescription,
+    id: ApplicationId,
+    description: ApplicationDescription,
     link: String,
 }
 
 impl ApplicationOverview {
     fn new(
-        id: UserApplicationId,
-        description: UserApplicationDescription,
+        id: ApplicationId,
+        description: ApplicationDescription,
         port: NonZeroU16,
         chain_id: ChainId,
     ) -> Self {
@@ -889,7 +863,7 @@ where
     /// Handles service queries for user applications (including mutations).
     async fn handle_service_request(
         &self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         request: Vec<u8>,
         chain_id: ChainId,
     ) -> Result<Vec<u8>, NodeServiceError> {
@@ -932,7 +906,7 @@ where
     /// Queries a user application, returning the raw [`QueryOutcome`].
     async fn query_user_application(
         &self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         bytes: Vec<u8>,
         chain_id: ChainId,
     ) -> Result<QueryOutcome<Vec<u8>>, NodeServiceError> {
@@ -982,7 +956,7 @@ where
         request: String,
     ) -> Result<Vec<u8>, NodeServiceError> {
         let chain_id: ChainId = chain_id.parse().map_err(NodeServiceError::InvalidChainId)?;
-        let application_id: UserApplicationId = application_id.parse()?;
+        let application_id: ApplicationId = application_id.parse()?;
 
         debug!(
             "Processing request for application {application_id} on chain {chain_id}:\n{:?}",

@@ -6,10 +6,11 @@ use linera_base::{
     crypto::CryptoHash,
     data_types::{Amount, Blob, BlockHeight, OracleResponse, Round, Timestamp},
     identifiers::{
-        Account, AccountOwner, BlobId, ChainDescription, ChainId, ChannelName, Destination,
-        GenericApplicationId, Owner, StreamName,
+        Account, AccountOwner, BlobId, ChainDescription, ChainId, Destination,
+        GenericApplicationId, StreamName,
     },
 };
+use thiserror::Error;
 
 pub type JSONObject = serde_json::Value;
 
@@ -32,7 +33,7 @@ mod types {
     pub type Operation = Value;
     pub type Origin = Value;
     pub type Target = Value;
-    pub type UserApplicationDescription = Value;
+    pub type ApplicationDescription = Value;
     pub type OperationResult = Value;
 
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -62,8 +63,7 @@ mod types {
 #[cfg(not(target_arch = "wasm32"))]
 mod types {
     pub use linera_base::{
-        data_types::UserApplicationDescription, identifiers::ChannelFullName,
-        ownership::ChainOwnership,
+        data_types::ApplicationDescription, identifiers::ChannelFullName, ownership::ChainOwnership,
     };
     pub use linera_chain::{
         data_types::{MessageAction, MessageBundle, OperationResult, Origin, Target},
@@ -131,6 +131,14 @@ pub struct Notifications;
     response_derives = "Debug, Serialize, Clone"
 )]
 pub struct Transfer;
+
+#[derive(Error, Debug)]
+pub enum ConversionError {
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
+    #[error("Unexpected certificate type: {0}")]
+    UnexpectedCertificateType(String),
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 mod from {
@@ -221,8 +229,10 @@ mod from {
         }
     }
 
-    impl From<block::BlockBlockValueBlock> for ExecutedBlock {
-        fn from(val: block::BlockBlockValueBlock) -> Self {
+    impl TryFrom<block::BlockBlockValueBlock> for ExecutedBlock {
+        type Error = serde_json::Error;
+
+        fn try_from(val: block::BlockBlockValueBlock) -> Result<Self, Self::Error> {
             let block::BlockBlockValueBlock { header, body } = val;
             let block::BlockBlockValueBlockHeader {
                 chain_id,
@@ -234,6 +244,7 @@ mod from {
                 state_hash,
                 bundles_hash,
                 messages_hash,
+                previous_message_blocks_hash,
                 operations_hash,
                 oracle_responses_hash,
                 events_hash,
@@ -243,6 +254,7 @@ mod from {
             let block::BlockBlockValueBlockBody {
                 incoming_bundles,
                 messages,
+                previous_message_blocks,
                 operations,
                 oracle_responses,
                 events,
@@ -260,6 +272,7 @@ mod from {
                 state_hash,
                 bundles_hash,
                 messages_hash,
+                previous_message_blocks_hash,
                 operations_hash,
                 oracle_responses_hash,
                 events_hash,
@@ -275,6 +288,7 @@ mod from {
                     .into_iter()
                     .map(|messages| messages.into_iter().map(Into::into).collect())
                     .collect::<Vec<Vec<_>>>(),
+                previous_message_blocks: serde_json::from_value(previous_message_blocks)?,
                 operations,
                 oracle_responses: oracle_responses.into_iter().map(Into::into).collect(),
                 events: events
@@ -288,11 +302,11 @@ mod from {
                 operation_results,
             };
 
-            Block {
+            Ok(Block {
                 header: block_header,
                 body: block_body,
             }
-            .into()
+            .into())
         }
     }
 
@@ -316,11 +330,12 @@ mod from {
     }
 
     impl TryFrom<block::BlockBlock> for Hashed<ConfirmedBlock> {
-        type Error = String;
+        type Error = ConversionError;
+
         fn try_from(val: block::BlockBlock) -> Result<Self, Self::Error> {
             match (val.value.status.as_str(), val.value.block) {
-                ("confirmed", block) => Ok(Hashed::new(ConfirmedBlock::new(block.into()))),
-                _ => Err(val.value.status),
+                ("confirmed", block) => Ok(Hashed::new(ConfirmedBlock::new(block.try_into()?))),
+                _ => Err(ConversionError::UnexpectedCertificateType(val.value.status)),
             }
         }
     }

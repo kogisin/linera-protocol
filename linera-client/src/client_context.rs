@@ -10,7 +10,7 @@ use futures::Future;
 use linera_base::{
     crypto::{AccountSecretKey, CryptoHash, ValidatorPublicKey},
     data_types::{BlockHeight, Timestamp},
-    identifiers::{Account, ChainId, MessageId, Owner},
+    identifiers::{Account, AccountOwner, ChainId, MessageId},
     ownership::ChainOwnership,
     time::{Duration, Instant},
 };
@@ -395,7 +395,7 @@ where
         &mut self,
         chain_id: ChainId,
         message_id: MessageId,
-        owner: Owner,
+        owner: AccountOwner,
         validators: Option<Vec<(ValidatorPublicKey, String)>>,
     ) -> Result<(), Error>
     where
@@ -885,7 +885,7 @@ where
             balance,
             application_permissions: Default::default(),
         };
-        let operations = iter::repeat(Operation::System(SystemOperation::OpenChain(config)))
+        let operations = iter::repeat(Operation::system(SystemOperation::OpenChain(config)))
             .take(num_new_chains)
             .collect();
         info!("Executing {} OpenChain operations", num_new_chains);

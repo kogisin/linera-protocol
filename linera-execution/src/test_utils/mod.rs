@@ -15,9 +15,7 @@ use std::{collections::BTreeMap, sync::Arc, thread, vec};
 use linera_base::{
     crypto::{BcsSignable, CryptoHash},
     data_types::{Amount, Blob, BlockHeight, CompressedBytecode, OracleResponse, Timestamp},
-    identifiers::{
-        AccountOwner, ApplicationId, BlobId, BlobType, ChainId, MessageId, ModuleId, Owner,
-    },
+    identifiers::{AccountOwner, ApplicationId, BlobId, BlobType, ChainId, MessageId, ModuleId},
     vm::VmRuntime,
 };
 use linera_views::{
@@ -32,16 +30,15 @@ pub use self::{
     system_execution_state::SystemExecutionState,
 };
 use crate::{
-    ExecutionRequest, ExecutionRuntimeContext, ExecutionStateView, MessageContext,
-    OperationContext, QueryContext, ServiceRuntimeEndpoint, ServiceRuntimeRequest,
+    ApplicationDescription, ExecutionRequest, ExecutionRuntimeContext, ExecutionStateView,
+    MessageContext, OperationContext, QueryContext, ServiceRuntimeEndpoint, ServiceRuntimeRequest,
     ServiceSyncRuntime, SystemExecutionStateView, TestExecutionRuntimeContext,
-    UserApplicationDescription, UserApplicationId,
 };
 
-/// Creates a dummy [`UserApplicationDescription`] for use in tests.
+/// Creates a dummy [`ApplicationDescription`] for use in tests.
 pub fn create_dummy_user_application_description(
     index: u32,
-) -> (UserApplicationDescription, Blob, Blob) {
+) -> (ApplicationDescription, Blob, Blob) {
     let chain_id = ChainId::root(1);
     let mut contract_bytes = b"contract".to_vec();
     let mut service_bytes = b"service".to_vec();
@@ -56,7 +53,7 @@ pub fn create_dummy_user_application_description(
 
     let vm_runtime = VmRuntime::Wasm;
     (
-        UserApplicationDescription {
+        ApplicationDescription {
             module_id: ModuleId::new(contract_blob.id().hash, service_blob.id().hash, vm_runtime),
             creator_chain_id: chain_id,
             block_height: 0.into(),
@@ -82,7 +79,7 @@ pub fn create_dummy_operation_context() -> OperationContext {
 }
 
 /// Creates a dummy [`MessageContext`] to use in tests.
-pub fn create_dummy_message_context(authenticated_signer: Option<Owner>) -> MessageContext {
+pub fn create_dummy_message_context(authenticated_signer: Option<AccountOwner>) -> MessageContext {
     MessageContext {
         chain_id: ChainId::root(0),
         is_bouncing: false,
@@ -116,12 +113,12 @@ pub trait RegisterMockApplication {
     /// This is included in the mocked [`ApplicationId`].
     fn creator_chain_id(&self) -> ChainId;
 
-    /// Registers a new [`MockApplication`] and returns it with the [`UserApplicationId`] that was
+    /// Registers a new [`MockApplication`] and returns it with the [`ApplicationId`] that was
     /// used for it.
     async fn register_mock_application(
         &mut self,
         index: u32,
-    ) -> anyhow::Result<(UserApplicationId, MockApplication, [BlobId; 3])> {
+    ) -> anyhow::Result<(ApplicationId, MockApplication, [BlobId; 3])> {
         let (description, contract, service) = create_dummy_user_application_description(index);
         let description_blob_id = Blob::new_application_description(&description).id();
         let contract_blob_id = contract.id();
@@ -137,14 +134,14 @@ pub trait RegisterMockApplication {
         ))
     }
 
-    /// Registers a new [`MockApplication`] associated with a [`UserApplicationDescription`] and
+    /// Registers a new [`MockApplication`] associated with a [`ApplicationDescription`] and
     /// its bytecode [`Blob`]s.
     async fn register_mock_application_with(
         &mut self,
-        description: UserApplicationDescription,
+        description: ApplicationDescription,
         contract: Blob,
         service: Blob,
-    ) -> anyhow::Result<(UserApplicationId, MockApplication)>;
+    ) -> anyhow::Result<(ApplicationId, MockApplication)>;
 }
 
 impl<C> RegisterMockApplication for ExecutionStateView<C>
@@ -158,10 +155,10 @@ where
 
     async fn register_mock_application_with(
         &mut self,
-        description: UserApplicationDescription,
+        description: ApplicationDescription,
         contract: Blob,
         service: Blob,
-    ) -> anyhow::Result<(UserApplicationId, MockApplication)> {
+    ) -> anyhow::Result<(ApplicationId, MockApplication)> {
         self.system
             .register_mock_application_with(description, contract, service)
             .await
@@ -181,10 +178,10 @@ where
 
     async fn register_mock_application_with(
         &mut self,
-        description: UserApplicationDescription,
+        description: ApplicationDescription,
         contract: Blob,
         service: Blob,
-    ) -> anyhow::Result<(UserApplicationId, MockApplication)> {
+    ) -> anyhow::Result<(ApplicationId, MockApplication)> {
         let id = From::from(&description);
         let extra = self.context().extra();
         let mock_application = MockApplication::default();
@@ -209,7 +206,7 @@ where
 
 pub async fn create_dummy_user_application_registrations(
     count: u32,
-) -> anyhow::Result<Vec<(UserApplicationId, UserApplicationDescription, Blob, Blob)>> {
+) -> anyhow::Result<Vec<(ApplicationId, ApplicationDescription, Blob, Blob)>> {
     let mut ids = Vec::with_capacity(count as usize);
 
     for index in 0..count {

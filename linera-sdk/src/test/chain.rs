@@ -15,9 +15,7 @@ use std::{
 use cargo_toml::Manifest;
 use linera_base::{
     crypto::{AccountPublicKey, AccountSecretKey},
-    data_types::{
-        Amount, Blob, BlockHeight, Bytecode, CompressedBytecode, UserApplicationDescription,
-    },
+    data_types::{Amount, ApplicationDescription, Blob, BlockHeight, Bytecode, CompressedBytecode},
     identifiers::{AccountOwner, ApplicationId, ChainDescription, ChainId, ModuleId},
     vm::VmRuntime,
 };
@@ -266,7 +264,7 @@ impl ActiveChain {
         block_builder(&mut block);
 
         // TODO(#2066): Remove boxing once call-stack is shallower
-        let certificate = Box::pin(block.try_sign()).await?;
+        let certificate = Box::pin(block.try_sign(&blobs)).await?;
 
         let result = self
             .validator
@@ -505,7 +503,7 @@ impl ActiveChain {
         assert_eq!(block.messages().len(), 1);
         assert!(block.messages()[0].is_empty());
 
-        let description = UserApplicationDescription {
+        let description = ApplicationDescription {
             module_id: module_id.forget_abi(),
             creator_chain_id: block.header.chain_id,
             block_height: block.header.height,
@@ -629,7 +627,7 @@ impl ActiveChain {
                         block.with_raw_operation(application_id, bytes);
                     }
                     Operation::System(system_operation) => {
-                        block.with_system_operation(system_operation);
+                        block.with_system_operation(*system_operation);
                     }
                 }
             }

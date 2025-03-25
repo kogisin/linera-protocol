@@ -10,7 +10,7 @@ use linera_base::{
     crypto::ValidatorPublicKey,
     data_types::{Blob, BlockHeight, Timestamp},
     ensure,
-    identifiers::{ChainId, Owner},
+    identifiers::{AccountOwner, ChainId},
 };
 use linera_chain::{
     data_types::{
@@ -117,11 +117,14 @@ where
         Ok((info, actions))
     }
 
-    /// Validates a proposal's signatures and blobs.
-    pub(super) async fn validate_block(
+    /// Tries to load all blobs published in this proposal.
+    ///
+    /// If they cannot be found, it creates an entry in `pending_proposed_blobs` so they can be
+    /// submitted one by one.
+    pub(super) async fn load_proposal_blobs(
         &mut self,
         proposal: &BlockProposal,
-    ) -> Result<(), WorkerError> {
+    ) -> Result<Vec<Blob>, WorkerError> {
         let BlockProposal {
             content:
                 ProposalContent {
@@ -134,31 +137,8 @@ where
             signature: _,
         } = proposal;
 
-        let owner: Owner = public_key.into();
-        let chain = &self.state.chain;
-        // Check the epoch.
-        let (epoch, committee) = chain.current_committee()?;
-        check_block_epoch(epoch, block.chain_id, block.epoch)?;
-        let policy = committee.policy().clone();
-        block.check_proposal_size(policy.maximum_block_proposal_size)?;
-        // Check the authentication of the block.
-        ensure!(
-            chain.manager.verify_owner(proposal),
-            WorkerError::InvalidOwner
-        );
-        if let Some(lite_certificate) = validated_block_certificate {
-            // Verify that this block has been validated by a quorum before.
-            lite_certificate.check(committee)?;
-        } else if let Some(signer) = block.authenticated_signer {
-            // Check the authentication of the operations in the new block.
-            ensure!(signer == owner, WorkerError::InvalidSigner(signer));
-        }
-        // Check if the chain is ready for this new block proposal.
-        chain.tip_state.get().verify_block_chaining(block)?;
-        if chain.manager.check_proposed_block(proposal)? == manager::Outcome::Skip {
-            return Ok(());
-        }
-        let maybe_blobs = self
+        let owner = AccountOwner::from(*public_key);
+        let mut maybe_blobs = self
             .state
             .maybe_get_required_blobs(proposal.required_blob_ids(), None)
             .await?;
@@ -178,7 +158,12 @@ where
             self.save().await?;
             return Err(WorkerError::BlobsNotFound(missing_blob_ids));
         }
-        Ok(())
+        let published_blobs = block
+            .published_blob_ids()
+            .iter()
+            .filter_map(|blob_id| maybe_blobs.remove(blob_id).flatten())
+            .collect::<Vec<_>>();
+        Ok(published_blobs)
     }
 
     /// Votes for a block proposal for the next block for this chain.
@@ -367,7 +352,15 @@ where
             .storage
             .maybe_write_blob_states(&blob_ids, blob_state, overwrite)
             .await?;
-        blobs_result?;
+        let mut blobs = blobs_result?
+            .into_iter()
+            .map(|blob| (blob.id(), blob))
+            .collect::<BTreeMap<_, _>>();
+        let published_blobs = block
+            .published_blob_ids()
+            .iter()
+            .filter_map(|blob_id| blobs.remove(blob_id))
+            .collect::<Vec<_>>();
 
         // Execute the block and update inboxes.
         self.state
@@ -378,7 +371,7 @@ where
         let verified_outcome = self
             .state
             .chain
-            .execute_block(block, local_time, None, oracle_responses)
+            .execute_block(block, local_time, None, &published_blobs, oracle_responses)
             .await?;
         // We should always agree on the messages and state hash.
         ensure!(
@@ -447,7 +440,7 @@ where
         &mut self,
         origin: Origin,
         bundles: Vec<(Epoch, MessageBundle)>,
-    ) -> Result<Option<(BlockHeight, NetworkActions)>, WorkerError> {
+    ) -> Result<Option<BlockHeight>, WorkerError> {
         // Only process certificates with relevant heights and epochs.
         let next_height_to_receive = self
             .state
@@ -474,19 +467,14 @@ where
         // Process the received messages in certificates.
         let local_time = self.state.storage.clock().current_time();
         let mut previous_height = None;
-        let mut new_outbox_entries = false;
         for bundle in bundles {
             let add_to_received_log = previous_height != Some(bundle.height);
             previous_height = Some(bundle.height);
             // Update the staged chain state with the received block.
-            if self
-                .state
+            self.state
                 .chain
                 .receive_message_bundle(&origin, bundle, local_time, add_to_received_log)
-                .await?
-            {
-                new_outbox_entries = true;
-            }
+                .await?;
         }
         if !self.state.config.allow_inactive_chains && !self.state.chain.is_active() {
             // Refuse to create a chain state if the chain is still inactive by
@@ -498,15 +486,9 @@ where
             );
             return Ok(None);
         }
-        let actions = if new_outbox_entries {
-            self.state.create_network_actions().await?
-        } else {
-            // Don't create network actions, so that old entries don't cause retry loops.
-            NetworkActions::default()
-        };
         // Save the chain.
         self.save().await?;
-        Ok(Some((last_updated_height, actions)))
+        Ok(Some(last_updated_height))
     }
 
     /// Handles the cross-chain request confirming that the recipient was updated.

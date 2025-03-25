@@ -14,11 +14,12 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use linera_base::{
     crypto::CryptoHash,
     data_types::{
-        Amount, Blob, BlockHeight, CompressedBytecode, TimeDelta, Timestamp,
-        UserApplicationDescription,
+        Amount, ApplicationDescription, Blob, BlockHeight, CompressedBytecode, TimeDelta, Timestamp,
     },
     hashed::Hashed,
-    identifiers::{BlobId, BlobType, ChainDescription, ChainId, EventId, Owner, UserApplicationId},
+    identifiers::{
+        AccountOwner, ApplicationId, BlobId, BlobType, ChainDescription, ChainId, EventId,
+    },
     ownership::ChainOwnership,
     vm::VmRuntime,
 };
@@ -52,6 +53,9 @@ pub use crate::db_storage::{
 pub use crate::db_storage::{
     READ_CERTIFICATE_COUNTER, READ_HASHED_CONFIRMED_BLOCK_COUNTER, WRITE_CERTIFICATE_COUNTER,
 };
+
+/// The default namespace to be used when none is specified
+pub const DEFAULT_NAMESPACE: &str = "table_linera";
 
 /// Communicate with a persistent storage using the "views" abstraction.
 #[cfg_attr(not(web), async_trait)]
@@ -213,7 +217,7 @@ pub trait Storage: Sized {
         committee: Committee,
         admin_id: ChainId,
         description: ChainDescription,
-        owner: Owner,
+        owner: AccountOwner,
         balance: Amount,
         timestamp: Timestamp,
     ) -> Result<(), ChainError>
@@ -254,7 +258,7 @@ pub trait Storage: Sized {
     /// by the `application_description`.
     async fn load_contract(
         &self,
-        application_description: &UserApplicationDescription,
+        application_description: &ApplicationDescription,
     ) -> Result<UserContractCode, ExecutionError> {
         let contract_bytecode_blob_id = BlobId::new(
             application_description.module_id.contract_blob_hash,
@@ -314,7 +318,7 @@ pub trait Storage: Sized {
     /// by the `application_description`.
     async fn load_service(
         &self,
-        application_description: &UserApplicationDescription,
+        application_description: &ApplicationDescription,
     ) -> Result<UserServiceCode, ExecutionError> {
         let service_bytecode_blob_id = BlobId::new(
             application_description.module_id.service_blob_hash,
@@ -375,8 +379,8 @@ pub struct ChainRuntimeContext<S> {
     storage: S,
     chain_id: ChainId,
     execution_runtime_config: ExecutionRuntimeConfig,
-    user_contracts: Arc<DashMap<UserApplicationId, UserContractCode>>,
-    user_services: Arc<DashMap<UserApplicationId, UserServiceCode>>,
+    user_contracts: Arc<DashMap<ApplicationId, UserContractCode>>,
+    user_services: Arc<DashMap<ApplicationId, UserServiceCode>>,
 }
 
 #[cfg_attr(not(web), async_trait)]
@@ -393,17 +397,17 @@ where
         self.execution_runtime_config
     }
 
-    fn user_contracts(&self) -> &Arc<DashMap<UserApplicationId, UserContractCode>> {
+    fn user_contracts(&self) -> &Arc<DashMap<ApplicationId, UserContractCode>> {
         &self.user_contracts
     }
 
-    fn user_services(&self) -> &Arc<DashMap<UserApplicationId, UserServiceCode>> {
+    fn user_services(&self) -> &Arc<DashMap<ApplicationId, UserServiceCode>> {
         &self.user_services
     }
 
     async fn get_user_contract(
         &self,
-        description: &UserApplicationDescription,
+        description: &ApplicationDescription,
     ) -> Result<UserContractCode, ExecutionError> {
         match self.user_contracts.entry(description.into()) {
             Entry::Occupied(entry) => Ok(entry.get().clone()),
@@ -417,7 +421,7 @@ where
 
     async fn get_user_service(
         &self,
-        description: &UserApplicationDescription,
+        description: &ApplicationDescription,
     ) -> Result<UserServiceCode, ExecutionError> {
         match self.user_services.entry(description.into()) {
             Entry::Occupied(entry) => Ok(entry.get().clone()),

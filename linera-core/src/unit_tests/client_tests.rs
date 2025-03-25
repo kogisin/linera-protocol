@@ -11,7 +11,7 @@ use futures::StreamExt;
 use linera_base::{
     crypto::AccountSecretKey,
     data_types::*,
-    identifiers::{Account, AccountOwner, ChainId, MessageId, Owner},
+    identifiers::{Account, AccountOwner, ChainId, MessageId},
     ownership::{ChainOwnership, TimeoutConfig},
 };
 use linera_chain::{
@@ -104,7 +104,7 @@ where
     {
         let certificate = sender
             .transfer_to_account(
-                AccountOwner::Chain,
+                AccountOwner::CHAIN,
                 Amount::from_tokens(3),
                 Account::chain(ChainId::root(2)),
             )
@@ -149,25 +149,24 @@ where
         .await?
         .with_policy(ResourceControlPolicy::fuel_and_block());
     let sender = builder.add_root_chain(1, Amount::from_tokens(4)).await?;
-    let owner_identity = sender.identity().await?;
-    let owner = AccountOwner::User(owner_identity);
+    let owner = sender.identity().await?;
     let receiver = builder.add_root_chain(2, Amount::ZERO).await?;
     let receiver_id = receiver.chain_id();
     let friend = receiver.identity().await?;
     sender
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(3),
-            Account::owner(receiver_id, owner),
+            Account::new(receiver_id, owner),
         )
         .await
         .unwrap()
         .unwrap();
     let cert = sender
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_millis(100),
-            Account::owner(receiver_id, friend),
+            Account::new(receiver_id, friend),
         )
         .await
         .unwrap()
@@ -182,10 +181,7 @@ where
     assert_eq!(receiver.process_inbox().await?.0.len(), 1);
     // The friend paid to receive the message.
     assert_eq!(
-        receiver
-            .local_owner_balance(AccountOwner::User(friend))
-            .await
-            .unwrap(),
+        receiver.local_owner_balance(friend).await.unwrap(),
         Amount::from_millis(99)
     );
     // The received amount is not in the unprotected balance.
@@ -211,7 +207,7 @@ where
     // First attempt that should be rejected.
     sender
         .claim(
-            owner_identity,
+            owner,
             receiver_id,
             Recipient::root(1),
             Amount::from_tokens(5),
@@ -221,7 +217,7 @@ where
     // Second attempt with a correct amount.
     let cert = sender
         .claim(
-            owner_identity,
+            owner,
             receiver_id,
             Recipient::root(1),
             Amount::from_tokens(2),
@@ -273,7 +269,7 @@ where
         .with_policy(ResourceControlPolicy::fuel_and_block());
     let sender = builder.add_root_chain(1, Amount::from_tokens(4)).await?;
     let new_key_pair = AccountSecretKey::generate();
-    let new_owner = Owner::from(new_key_pair.public());
+    let new_owner = AccountOwner::from(new_key_pair.public());
     let certificate = sender.rotate_key_pair(new_key_pair).await.unwrap().unwrap();
     assert_eq!(sender.next_block_height(), BlockHeight::from(1));
     assert!(sender.pending_proposal().is_none());
@@ -292,7 +288,7 @@ where
     sender.synchronize_from_validators().await.unwrap();
     // Can still use the chain.
     sender
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await
         .unwrap();
     Ok(())
@@ -339,7 +335,7 @@ where
     // Cannot use the chain any more.
     assert_matches!(
         sender
-            .burn(AccountOwner::Chain, Amount::from_tokens(3))
+            .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
             .await,
         Err(ChainClientError::CannotFindKeyForChain(_))
     );
@@ -382,7 +378,7 @@ where
     sender.synchronize_from_validators().await.unwrap();
     // Can still use the chain with the old client.
     sender
-        .burn(AccountOwner::Chain, Amount::from_tokens(2))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(2))
         .await
         .unwrap();
     assert_eq!(sender.next_block_height(), BlockHeight::from(2));
@@ -409,7 +405,7 @@ where
 
     // We need at least three validators for making an operation.
     builder.set_fault_type([0, 1], FaultType::Offline).await;
-    let result = client.burn(AccountOwner::Chain, Amount::ONE).await;
+    let result = client.burn(AccountOwner::CHAIN, Amount::ONE).await;
     assert_matches!(
         result,
         Err(ChainClientError::CommunicationError(
@@ -419,7 +415,7 @@ where
     builder.set_fault_type([0, 1], FaultType::Honest).await;
     builder.set_fault_type([2, 3], FaultType::Offline).await;
     assert_matches!(
-        sender.burn(AccountOwner::Chain, Amount::ONE).await,
+        sender.burn(AccountOwner::CHAIN, Amount::ONE).await,
         Err(ChainClientError::CommunicationError(
             CommunicationError::Trusted(ClientIoError { .. })
         ))
@@ -438,7 +434,7 @@ where
     );
     client.clear_pending_proposal();
     client
-        .burn(AccountOwner::Chain, Amount::ONE)
+        .burn(AccountOwner::CHAIN, Amount::ONE)
         .await
         .unwrap()
         .unwrap();
@@ -448,7 +444,7 @@ where
     sender.process_inbox().await.unwrap();
     assert_eq!(sender.local_balance().await.unwrap(), Amount::ONE);
     sender.clear_pending_proposal();
-    sender.burn(AccountOwner::Chain, Amount::ONE).await.unwrap();
+    sender.burn(AccountOwner::CHAIN, Amount::ONE).await.unwrap();
 
     // That's it, we spent all our money on this test!
     assert_eq!(sender.local_balance().await.unwrap(), Amount::ZERO);
@@ -535,7 +531,7 @@ where
     // Transfer before creating the chain. The validators will ignore the cross-chain messages.
     sender
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(2),
             Account::chain(new_id),
         )
@@ -558,8 +554,9 @@ where
     assert!(sender.pending_proposal().is_none());
     assert!(sender.key_pair().await.is_ok());
     assert_matches!(
-        certificate.block().body.operations[open_chain_message_id.index as usize],
-        Operation::System(SystemOperation::OpenChain(_)),
+        certificate.block().body.operations[open_chain_message_id.index as usize]
+            .as_system_operation(),
+        Some(SystemOperation::OpenChain(_)),
         "Unexpected certificate value",
     );
     assert_eq!(
@@ -581,7 +578,7 @@ where
     // process the cross-chain messages.
     let certificate2 = sender
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(1),
             Account::chain(new_id),
         )
@@ -597,7 +594,7 @@ where
         Amount::from_tokens(3)
     );
     client
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await
         .unwrap();
     Ok(())
@@ -626,7 +623,7 @@ where
     // Transfer before creating the chain.
     sender
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(3),
             Account::chain(new_id),
         )
@@ -648,8 +645,9 @@ where
     assert!(sender.pending_proposal().is_none());
     assert!(sender.key_pair().await.is_ok());
     assert_matches!(
-        certificate.block().body.operations[open_chain_message_id.index as usize],
-        Operation::System(SystemOperation::OpenChain(_)),
+        certificate.block().body.operations[open_chain_message_id.index as usize]
+            .as_system_operation(),
+        Some(SystemOperation::OpenChain(_)),
         "Unexpected certificate value",
     );
     assert_eq!(
@@ -668,7 +666,7 @@ where
         .await
         .unwrap();
     let result = client
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await;
     assert_matches!(
         result,
@@ -710,7 +708,7 @@ where
     // Transfer after creating the chain.
     let transfer_certificate = sender
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(3),
             Account::chain(new_id),
         )
@@ -739,7 +737,7 @@ where
         Amount::from_tokens(3)
     );
     client
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await
         .unwrap();
     assert_eq!(client.local_balance().await.unwrap(), Amount::ZERO);
@@ -763,9 +761,14 @@ where
     let client2 = builder.add_root_chain(2, Amount::from_tokens(4)).await?;
 
     let certificate = client1.close_chain().await.unwrap().unwrap().unwrap();
+    assert_eq!(
+        certificate.block().body.operations.len(),
+        1,
+        "Unexpected operations in certificate"
+    );
     assert_matches!(
-        certificate.block().body.operations[..],
-        [Operation::System(SystemOperation::CloseChain)],
+        certificate.block().body.operations[0].as_system_operation(),
+        Some(SystemOperation::CloseChain),
         "Unexpected certificate value",
     );
     assert_eq!(client1.next_block_height(), BlockHeight::from(1));
@@ -780,7 +783,7 @@ where
     );
     // Cannot use the chain for operations any more.
     let result = client1
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await;
     assert!(
         matches!(
@@ -796,7 +799,7 @@ where
     // Incoming messages now get rejected.
     client2
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(3),
             Account::chain(client1.chain_id()),
         )
@@ -854,7 +857,7 @@ where
     let sender = builder.add_root_chain(1, Amount::from_tokens(4)).await?;
     let result = sender
         .transfer_to_account_unsafe_unconfirmed(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(3),
             Account::chain(ChainId::root(2)),
         )
@@ -904,7 +907,7 @@ where
     );
     let certificate = client1
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(3),
             Account::chain(client2.chain_id),
         )
@@ -953,7 +956,7 @@ where
     assert_eq!(client2.next_block_height(), BlockHeight::ZERO);
     client2
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::ONE,
             Account::chain(client1.chain_id),
         )
@@ -999,7 +1002,7 @@ where
     let client2 = builder.add_root_chain(2, Amount::ZERO).await?;
     let certificate = client1
         .transfer_to_account_unsafe_unconfirmed(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(2),
             Account::chain(client2.chain_id),
         )
@@ -1049,7 +1052,7 @@ where
     // Confirming to a quorum of nodes only at the end.
     client1
         .transfer_to_account_unsafe_unconfirmed(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::ONE,
             Account::chain(client2.chain_id),
         )
@@ -1057,7 +1060,7 @@ where
         .unwrap();
     client1
         .transfer_to_account_unsafe_unconfirmed(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::ONE,
             Account::chain(client2.chain_id),
         )
@@ -1077,7 +1080,7 @@ where
     // Sending money from client2 fails, as a consequence.
     let obtained_error = client2
         .transfer_to_account_unsafe_unconfirmed(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(2),
             Account::chain(client3.chain_id),
         )
@@ -1094,7 +1097,7 @@ where
     client2.synchronize_from_validators().await.unwrap();
     let certificate = client2
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(2),
             Account::chain(client3.chain_id),
         )
@@ -1132,8 +1135,21 @@ async fn test_change_voting_rights<B>(storage_builder: B) -> anyhow::Result<()>
 where
     B: StorageBuilder,
 {
-    let mut builder = TestBuilder::new(storage_builder, 4, 1).await?;
-    let admin = builder.add_root_chain(0, Amount::from_tokens(3)).await?;
+    // To test that no fees are paid for reading or publishing committee blobs, we set the price
+    // higher than the chain balance.
+    let initial_balance = Amount::from_tokens(3);
+    let mut builder =
+        TestBuilder::new(storage_builder, 4, 1)
+            .await?
+            .with_policy(ResourceControlPolicy {
+                maximum_fuel_per_block: 30_000,
+                blob_read: initial_balance + Amount::ONE,
+                blob_published: initial_balance + Amount::ONE,
+                blob_byte_read: initial_balance + Amount::ONE,
+                blob_byte_published: initial_balance + Amount::ONE,
+                ..ResourceControlPolicy::default()
+            });
+    let admin = builder.add_root_chain(0, initial_balance).await?;
     let user = builder.add_root_chain(1, Amount::ZERO).await?;
     let validators = builder.initial_committee.validators().clone();
 
@@ -1157,7 +1173,7 @@ where
     // Sending money from the admin chain is supported.
     let cert = admin
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(2),
             Account::chain(user.chain_id()),
         )
@@ -1166,7 +1182,7 @@ where
         .unwrap();
     admin
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::ONE,
             Account::chain(user.chain_id()),
         )
@@ -1192,7 +1208,7 @@ where
     // Try to make a transfer back to the admin chain.
     let cert = user
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_tokens(2),
             Account::chain(admin.chain_id()),
         )
@@ -1208,7 +1224,7 @@ where
     // Try again to make a transfer back to the admin chain.
     let cert = user
         .transfer_to_account(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::ONE,
             Account::chain(admin.chain_id()),
         )
@@ -1238,12 +1254,12 @@ where
     let sender = builder.add_root_chain(1, Amount::from_tokens(3)).await?;
 
     let obtained_error = sender
-        .burn(AccountOwner::Chain, Amount::from_tokens(4))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(4))
         .await;
     assert_insufficient_funding_during_operation(obtained_error, 0);
 
     let obtained_error = sender
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await;
     assert_insufficient_funding_fees(obtained_error);
     Ok(())
@@ -1303,7 +1319,7 @@ where
 
     // Try to read a blob without publishing it first, should fail
     let result = client1_a
-        .execute_operation(SystemOperation::ReadBlob { blob_id: blob0_id }.into())
+        .execute_operation(SystemOperation::ReadBlob { blob_id: blob0_id })
         .await;
     assert_matches!(
         result,
@@ -1332,7 +1348,7 @@ where
     // and cache locally the blobs that were published by `client_a`. So this will succeed.
     client1_b.prepare_chain().await?;
     let certificate = client1_b
-        .execute_operation(SystemOperation::ReadBlob { blob_id: blob0_id }.into())
+        .execute_operation(SystemOperation::ReadBlob { blob_id: blob0_id })
         .await?
         .unwrap();
     assert_eq!(certificate.round, Round::MultiLeader(0));
@@ -1351,8 +1367,8 @@ where
     let blob1_hash = blob1.id().hash;
 
     let blob_0_1_operations = vec![
-        Operation::System(SystemOperation::ReadBlob { blob_id: blob0_id }),
-        Operation::System(SystemOperation::PublishDataBlob {
+        Operation::system(SystemOperation::ReadBlob { blob_id: blob0_id }),
+        Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob1_hash,
         }),
     ];
@@ -1408,7 +1424,7 @@ where
         *info2_b.manager.requested_locking.unwrap()
     );
     let bt_certificate = client2_b
-        .burn(AccountOwner::Chain, Amount::from_tokens(1))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(1))
         .await
         .unwrap()
         .unwrap();
@@ -1424,8 +1440,8 @@ where
         .block()
         .body
         .operations
-        .contains(&Operation::System(SystemOperation::Transfer {
-            owner: AccountOwner::Chain,
+        .contains(&Operation::system(SystemOperation::Transfer {
+            owner: AccountOwner::CHAIN,
             recipient: Recipient::Burn,
             amount: Amount::from_tokens(1),
         })));
@@ -1453,10 +1469,10 @@ where
     let client1 = builder.add_root_chain(1, Amount::ZERO).await?;
     let client2_a = builder.add_root_chain(2, Amount::from_tokens(10)).await?;
     let chain_id2 = client2_a.chain_id();
-    let owner2_a = Owner::from(client2_a.public_key().await.unwrap());
+    let owner2_a = AccountOwner::from(client2_a.public_key().await.unwrap());
     let key_pair2_b = AccountSecretKey::generate();
-    let owner2_b = Owner::from(key_pair2_b.public());
-    let owner_change_op = Operation::System(SystemOperation::ChangeOwnership {
+    let owner2_b = AccountOwner::from(key_pair2_b.public());
+    let owner_change_op = Operation::system(SystemOperation::ChangeOwnership {
         super_owners: Vec::new(),
         owners: vec![(owner2_a, 50), (owner2_b, 50)],
         multi_leader_rounds: 10,
@@ -1499,8 +1515,8 @@ where
     let blob1_hash = blob1.id().hash;
 
     let blob_0_1_operations = vec![
-        Operation::System(SystemOperation::ReadBlob { blob_id: blob0_id }),
-        Operation::System(SystemOperation::PublishDataBlob {
+        Operation::system(SystemOperation::ReadBlob { blob_id: blob0_id }),
+        Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob1_hash,
         }),
     ];
@@ -1535,7 +1551,7 @@ where
 
     client2_b.prepare_chain().await.unwrap();
     let bt_certificate = client2_b
-        .burn(AccountOwner::Chain, Amount::from_tokens(1))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(1))
         .await
         .unwrap()
         .unwrap();
@@ -1551,8 +1567,8 @@ where
         .block()
         .body
         .operations
-        .contains(&Operation::System(SystemOperation::Transfer {
-            owner: AccountOwner::Chain,
+        .contains(&Operation::system(SystemOperation::Transfer {
+            owner: AccountOwner::CHAIN,
             recipient: Recipient::Burn,
             amount: Amount::from_tokens(1),
         })));
@@ -1582,12 +1598,12 @@ where
     let client2 = builder.add_root_chain(2, Amount::ZERO).await?;
     let client3_a = builder.add_root_chain(3, Amount::from_tokens(10)).await?;
     let chain_id3 = client3_a.chain_id();
-    let owner3_a = Owner::from(client3_a.public_key().await.unwrap());
+    let owner3_a = AccountOwner::from(client3_a.public_key().await.unwrap());
     let key_pair3_b = AccountSecretKey::generate();
-    let owner3_b = Owner::from(key_pair3_b.public());
+    let owner3_b = AccountOwner::from(key_pair3_b.public());
     let key_pair3_c = AccountSecretKey::generate();
-    let owner3_c = Owner::from(key_pair3_c.public());
-    let owner_change_op = Operation::System(SystemOperation::ChangeOwnership {
+    let owner3_c = AccountOwner::from(key_pair3_c.public());
+    let owner_change_op = Operation::system(SystemOperation::ChangeOwnership {
         super_owners: Vec::new(),
         owners: vec![(owner3_a, 50), (owner3_b, 50), (owner3_c, 50)],
         multi_leader_rounds: 10,
@@ -1654,8 +1670,8 @@ where
     let blob1_hash = blob1.id().hash;
 
     let blob_0_1_operations = vec![
-        Operation::System(SystemOperation::ReadBlob { blob_id: blob0_id }),
-        Operation::System(SystemOperation::PublishDataBlob {
+        Operation::system(SystemOperation::ReadBlob { blob_id: blob0_id }),
+        Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob1_hash,
         }),
     ];
@@ -1722,8 +1738,8 @@ where
     let blob3_hash = blob3.id().hash;
 
     let blob_2_3_operations = vec![
-        Operation::System(SystemOperation::ReadBlob { blob_id: blob2_id }),
-        Operation::System(SystemOperation::PublishDataBlob {
+        Operation::system(SystemOperation::ReadBlob { blob_id: blob2_id }),
+        Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob3_hash,
         }),
     ];
@@ -1794,7 +1810,7 @@ where
         .block()
         .body
         .operations
-        .contains(&Operation::System(SystemOperation::PublishDataBlob {
+        .contains(&Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob4.id().hash
         })));
 
@@ -1884,7 +1900,7 @@ where
 
     // The other owner is leader now. Trying to submit a block should return `WaitForTimeout`.
     let result = client
-        .transfer(AccountOwner::Chain, Amount::ONE, Recipient::root(2))
+        .transfer(AccountOwner::CHAIN, Amount::ONE, Recipient::root(2))
         .await
         .unwrap();
     let timeout = match result {
@@ -1911,7 +1927,7 @@ where
 
     // Now we are the leader, and the transfer should succeed.
     let _certificate = client
-        .transfer(AccountOwner::Chain, Amount::ONE, Recipient::root(2))
+        .transfer(AccountOwner::CHAIN, Amount::ONE, Recipient::root(2))
         .await
         .unwrap()
         .unwrap();
@@ -1969,7 +1985,7 @@ where
         .set_fault_type([2], FaultType::OfflineWithInfo)
         .await;
     let result = client0
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await;
     assert!(result.is_err());
 
@@ -2012,7 +2028,7 @@ where
     // Client 0 now only tries to burn 1 token. Before that, they automatically finalize the
     // pending block, which publishes the blob, leaving 10 - 1 = 9.
     client0
-        .burn(AccountOwner::Chain, Amount::from_tokens(1))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(1))
         .await
         .unwrap();
     client0.synchronize_from_validators().await.unwrap();
@@ -2026,7 +2042,7 @@ where
     // Burn another token so Client 1 sees that the blob is already published
     client1.prepare_chain().await.unwrap();
     client1
-        .burn(AccountOwner::Chain, Amount::from_tokens(1))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(1))
         .await
         .unwrap();
     client1.synchronize_from_validators().await.unwrap();
@@ -2058,7 +2074,7 @@ where
         .set_fault_type([2], FaultType::OfflineWithInfo)
         .await;
     let result = client
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await;
     assert!(result.is_err());
 
@@ -2067,7 +2083,7 @@ where
 
     // The client tries to burn another token. Before that, they automatically finalize the
     // pending block, which burns 3 tokens, leaving 10 - 3 - 1 = 6.
-    client.burn(AccountOwner::Chain, Amount::ONE).await.unwrap();
+    client.burn(AccountOwner::CHAIN, Amount::ONE).await.unwrap();
     client.synchronize_from_validators().await.unwrap();
     client.process_inbox().await.unwrap();
     assert_eq!(
@@ -2118,7 +2134,7 @@ where
         .await;
     builder.set_fault_type([3], FaultType::Offline).await;
     let result = client0
-        .burn(AccountOwner::Chain, Amount::from_tokens(3))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await;
     assert!(result.is_err());
     let manager = client0
@@ -2156,7 +2172,7 @@ where
     assert!(manager.requested_locking.is_none());
     assert_eq!(manager.current_round, Round::MultiLeader(0));
     let result = client1
-        .burn(AccountOwner::Chain, Amount::from_tokens(2))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(2))
         .await;
     assert!(result.is_err());
 
@@ -2177,7 +2193,7 @@ where
     assert_eq!(manager.current_round, Round::MultiLeader(1));
     assert!(client1.pending_proposal().is_some());
     client1
-        .burn(AccountOwner::Chain, Amount::from_tokens(4))
+        .burn(AccountOwner::CHAIN, Amount::from_tokens(4))
         .await
         .unwrap();
 
@@ -2204,7 +2220,7 @@ where
     let mut receiver = builder.add_root_chain(2, Amount::ZERO).await?;
     let recipient = Recipient::chain(receiver.chain_id());
     let cert = sender
-        .transfer(AccountOwner::Chain, Amount::ONE, recipient)
+        .transfer(AccountOwner::CHAIN, Amount::ONE, recipient)
         .await
         .unwrap()
         .unwrap();
@@ -2290,7 +2306,7 @@ where
     // Send a message from chain 2 to chain 3.
     let certificate = client2
         .transfer(
-            AccountOwner::Chain,
+            AccountOwner::CHAIN,
             Amount::from_millis(1),
             Recipient::chain(chain_id3),
         )
@@ -2305,7 +2321,7 @@ where
 
     // Client 3 should be able to update validator 3 about the blob and the message.
     let certificate = client3
-        .execute_operation(SystemOperation::ReadBlob { blob_id }.into())
+        .execute_operation(SystemOperation::ReadBlob { blob_id })
         .await
         .unwrap()
         .unwrap();
@@ -2334,10 +2350,51 @@ where
 
     assert_matches!(
         client1.publish_data_blob(large_blob_bytes).await,
-        Err(ChainClientError::ChainError(ChainError::ExecutionError(
+        Err(ChainClientError::LocalNodeError(
+            LocalNodeError::WorkerError(WorkerError::ChainError(chain_error))
+        )) if matches!(&*chain_error, ChainError::ExecutionError(
             error, ChainExecutionContext::Block
-        ))) if matches!(*error, ExecutionError::BlobTooLarge)
+        ) if matches!(**error, ExecutionError::BlobTooLarge))
     );
 
+    Ok(())
+}
+
+#[test_case(MemoryStorageBuilder::default(); "memory")]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[test_log::test(tokio::test)]
+async fn test_blob_fees<B>(storage_builder: B) -> anyhow::Result<()>
+where
+    B: StorageBuilder,
+{
+    let policy = ResourceControlPolicy {
+        blob_read: Amount::from_nanos(10_000),
+        blob_published: Amount::from_attos(1_000_000),
+        blob_byte_read: Amount::from_nanos(1),
+        blob_byte_published: Amount::from_attos(100),
+        ..ResourceControlPolicy::default()
+    };
+    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+        .await?
+        .with_policy(policy.clone());
+    let mut expected_balance = Amount::ONE;
+    let client = builder.add_root_chain(0, expected_balance).await?;
+    let bytes: &[u8] = b"twelve bytes";
+    let blob = Blob::new(BlobContent::new_data(bytes));
+    let blob_id = blob.id();
+    client
+        .publish_data_blob(bytes.to_vec())
+        .await
+        .unwrap()
+        .unwrap();
+    expected_balance = expected_balance
+        - policy.blob_published
+        - policy.blob_byte_published * (blob.bytes().len() as u128);
+    assert_eq!(client.local_balance().await.unwrap(), expected_balance);
+
+    client.read_data_blob(blob_id.hash).await.unwrap().unwrap();
+    expected_balance =
+        expected_balance - policy.blob_read - policy.blob_byte_read * (blob.bytes().len() as u128);
+    assert_eq!(client.local_balance().await.unwrap(), expected_balance);
     Ok(())
 }

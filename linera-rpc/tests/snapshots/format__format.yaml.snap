@@ -11,15 +11,12 @@ Account:
 AccountOwner:
   ENUM:
     0:
-      User:
-        NEWTYPE:
-          TYPENAME: Owner
+      Reserved:
+        NEWTYPE: U8
     1:
-      Application:
+      Address32:
         NEWTYPE:
-          TYPENAME: ApplicationId
-    2:
-      Chain: UNIT
+          TYPENAME: CryptoHash
 AccountPublicKey:
   ENUM:
     0:
@@ -43,13 +40,18 @@ AccountSignature:
 AdminOperation:
   ENUM:
     0:
+      PublishCommitteeBlob:
+        STRUCT:
+          - blob_hash:
+              TYPENAME: CryptoHash
+    1:
       CreateCommittee:
         STRUCT:
           - epoch:
               TYPENAME: Epoch
           - blob_hash:
               TYPENAME: CryptoHash
-    1:
+    2:
       RemoveCommittee:
         STRUCT:
           - epoch:
@@ -124,6 +126,12 @@ BlockBody:
         SEQ:
           SEQ:
             TYPENAME: OutgoingMessage
+    - previous_message_blocks:
+        MAP:
+          KEY:
+            TYPENAME: ChainId
+          VALUE:
+            TYPENAME: CryptoHash
     - oracle_responses:
         SEQ:
           SEQ:
@@ -145,6 +153,12 @@ BlockExecutionOutcome:
         SEQ:
           SEQ:
             TYPENAME: OutgoingMessage
+    - previous_message_blocks:
+        MAP:
+          KEY:
+            TYPENAME: ChainId
+          VALUE:
+            TYPENAME: CryptoHash
     - state_hash:
         TYPENAME: CryptoHash
     - oracle_responses:
@@ -179,7 +193,7 @@ BlockHeader:
           TYPENAME: CryptoHash
     - authenticated_signer:
         OPTION:
-          TYPENAME: Owner
+          TYPENAME: AccountOwner
 BlockHeight:
   NEWTYPESTRUCT: U64
 BlockHeightRange:
@@ -341,7 +355,7 @@ ChainManagerInfo:
         TYPENAME: Round
     - leader:
         OPTION:
-          TYPENAME: Owner
+          TYPENAME: AccountOwner
     - round_timeout:
         OPTION:
           TYPENAME: Timestamp
@@ -349,11 +363,11 @@ ChainOwnership:
   STRUCT:
     - super_owners:
         SEQ:
-          TYPENAME: Owner
+          TYPENAME: AccountOwner
     - owners:
         MAP:
           KEY:
-            TYPENAME: Owner
+            TYPENAME: AccountOwner
           VALUE: U64
     - multi_leader_rounds: U32
     - open_multi_leader_rounds: BOOL
@@ -362,17 +376,11 @@ ChainOwnership:
 ChannelFullName:
   STRUCT:
     - application_id:
-        TYPENAME: GenericApplicationId
+        TYPENAME: ApplicationId
     - name:
         TYPENAME: ChannelName
 ChannelName:
   NEWTYPESTRUCT: BYTES
-ChannelSubscription:
-  STRUCT:
-    - chain_id:
-        TYPENAME: ChainId
-    - name:
-        TYPENAME: ChannelName
 Committee:
   STRUCT:
     - validators:
@@ -772,7 +780,7 @@ OutgoingMessage:
         TYPENAME: Destination
     - authenticated_signer:
         OPTION:
-          TYPENAME: Owner
+          TYPENAME: AccountOwner
     - grant:
         TYPENAME: Amount
     - refund_grant_to:
@@ -782,14 +790,11 @@ OutgoingMessage:
         TYPENAME: MessageKind
     - message:
         TYPENAME: Message
-Owner:
-  NEWTYPESTRUCT:
-    TYPENAME: CryptoHash
 PostedMessage:
   STRUCT:
     - authenticated_signer:
         OPTION:
-          TYPENAME: Owner
+          TYPENAME: AccountOwner
     - grant:
         TYPENAME: Amount
     - refund_grant_to:
@@ -827,7 +832,7 @@ ProposedBlock:
         TYPENAME: Timestamp
     - authenticated_signer:
         OPTION:
-          TYPENAME: Owner
+          TYPENAME: AccountOwner
     - previous_block_hash:
         OPTION:
           TYPENAME: CryptoHash
@@ -853,6 +858,14 @@ ResourceControlPolicy:
         TYPENAME: Amount
     - byte_written:
         TYPENAME: Amount
+    - blob_read:
+        TYPENAME: Amount
+    - blob_published:
+        TYPENAME: Amount
+    - blob_byte_read:
+        TYPENAME: Amount
+    - blob_byte_published:
+        TYPENAME: Amount
     - byte_stored:
         TYPENAME: Amount
     - operation:
@@ -876,6 +889,7 @@ ResourceControlPolicy:
     - maximum_block_proposal_size: U64
     - maximum_bytes_read_per_block: U64
     - maximum_bytes_written_per_block: U64
+    - maximum_oracle_response_bytes: U64
     - maximum_http_response_bytes: U64
     - http_request_timeout_ms: U64
     - http_request_allow_list:
@@ -1040,10 +1054,6 @@ StreamId:
         TYPENAME: StreamName
 StreamName:
   NEWTYPESTRUCT: BYTES
-SystemChannel:
-  ENUM:
-    0:
-      Admin: UNIT
 SystemMessage:
   ENUM:
     0:
@@ -1069,20 +1079,6 @@ SystemMessage:
         NEWTYPE:
           TYPENAME: OpenChainConfig
     3:
-      Subscribe:
-        STRUCT:
-          - id:
-              TYPENAME: ChainId
-          - subscription:
-              TYPENAME: ChannelSubscription
-    4:
-      Unsubscribe:
-        STRUCT:
-          - id:
-              TYPENAME: ChainId
-          - subscription:
-              TYPENAME: ChannelSubscription
-    5:
       ApplicationCreated: UNIT
 SystemOperation:
   ENUM:
@@ -1099,7 +1095,7 @@ SystemOperation:
       Claim:
         STRUCT:
           - owner:
-              TYPENAME: Owner
+              TYPENAME: AccountOwner
           - target_id:
               TYPENAME: ChainId
           - recipient:
@@ -1117,11 +1113,11 @@ SystemOperation:
         STRUCT:
           - super_owners:
               SEQ:
-                TYPENAME: Owner
+                TYPENAME: AccountOwner
           - owners:
               SEQ:
                 TUPLE:
-                  - TYPENAME: Owner
+                  - TYPENAME: AccountOwner
                   - U64
           - multi_leader_rounds: U32
           - open_multi_leader_rounds: BOOL
@@ -1132,40 +1128,21 @@ SystemOperation:
         NEWTYPE:
           TYPENAME: ApplicationPermissions
     6:
-      Subscribe:
-        STRUCT:
-          - chain_id:
-              TYPENAME: ChainId
-          - channel:
-              TYPENAME: SystemChannel
-    7:
-      Unsubscribe:
-        STRUCT:
-          - chain_id:
-              TYPENAME: ChainId
-          - channel:
-              TYPENAME: SystemChannel
-    8:
       PublishModule:
         STRUCT:
           - module_id:
               TYPENAME: ModuleId
-    9:
-      PublishCommitteeBlob:
-        STRUCT:
-          - blob_hash:
-              TYPENAME: CryptoHash
-    10:
+    7:
       PublishDataBlob:
         STRUCT:
           - blob_hash:
               TYPENAME: CryptoHash
-    11:
+    8:
       ReadBlob:
         STRUCT:
           - blob_id:
               TYPENAME: BlobId
-    12:
+    9:
       CreateApplication:
         STRUCT:
           - module_id:
@@ -1175,15 +1152,15 @@ SystemOperation:
           - required_application_ids:
               SEQ:
                 TYPENAME: ApplicationId
-    13:
+    10:
       Admin:
         NEWTYPE:
           TYPENAME: AdminOperation
-    14:
+    11:
       ProcessNewEpoch:
         NEWTYPE:
           TYPENAME: Epoch
-    15:
+    12:
       ProcessRemovedEpoch:
         NEWTYPE:
           TYPENAME: Epoch

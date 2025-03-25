@@ -20,7 +20,7 @@ use async_graphql::Request;
 use counter::CounterAbi;
 use linera_base::{
     data_types::{Amount, Bytecode, Event, OracleResponse},
-    identifiers::{AccountOwner, ApplicationId, Owner, StreamId, StreamName},
+    identifiers::{AccountOwner, ApplicationId, BlobId, BlobType, StreamId, StreamName},
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
 };
@@ -29,6 +29,7 @@ use linera_execution::{
     ExecutionError, Message, MessageKind, Operation, QueryOutcome, ResourceControlPolicy,
     SystemMessage, WasmRuntime,
 };
+use linera_storage::Storage as _;
 use serde_json::json;
 use test_case::test_case;
 
@@ -40,9 +41,13 @@ use crate::client::client_tests::RocksDbStorageBuilder;
 use crate::client::client_tests::ScyllaDbStorageBuilder;
 #[cfg(feature = "storage-service")]
 use crate::client::client_tests::ServiceStorageBuilder;
-use crate::client::{
-    client_tests::{MemoryStorageBuilder, StorageBuilder, TestBuilder},
-    ChainClientError,
+use crate::{
+    client::{
+        client_tests::{MemoryStorageBuilder, StorageBuilder, TestBuilder},
+        ChainClientError,
+    },
+    local_node::LocalNodeError,
+    worker::WorkerError,
 };
 
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer ; "wasmer"))]
@@ -165,18 +170,22 @@ where
         .await;
     assert_matches!(
         result,
-        Err(ChainClientError::ChainError(ChainError::ExecutionError(
+        Err(ChainClientError::LocalNodeError(
+            LocalNodeError::WorkerError(WorkerError::ChainError(chain_error))
+        )) if matches!(&*chain_error, ChainError::ExecutionError(
             error, ChainExecutionContext::Block
-        ))) if matches!(*error, ExecutionError::BytecodeTooLarge)
+        ) if matches!(**error, ExecutionError::BytecodeTooLarge))
     );
     let result = publisher
         .publish_module(small_bytecode, large_bytecode, vm_runtime)
         .await;
     assert_matches!(
         result,
-        Err(ChainClientError::ChainError(ChainError::ExecutionError(
+        Err(ChainClientError::LocalNodeError(
+            LocalNodeError::WorkerError(WorkerError::ChainError(chain_error))
+        )) if matches!(&*chain_error, ChainError::ExecutionError(
             error, ChainExecutionContext::Block
-        ))) if matches!(*error, ExecutionError::BytecodeTooLarge)
+        ) if matches!(**error, ExecutionError::BytecodeTooLarge))
     );
 
     Ok(())
@@ -345,8 +354,7 @@ where
         }]]
     );
 
-    let query_service = cfg!(feature = "unstable-oracles");
-    let mut operation = meta_counter::Operation::increment(receiver_id, 5, query_service);
+    let mut operation = meta_counter::Operation::increment(receiver_id, 5, true);
     operation.fuel_grant = 1000000;
     let cert = creator
         .execute_operation(Operation::user(application_id2, &operation)?)
@@ -358,16 +366,12 @@ where
     let [_, responses] = &responses[..] else {
         panic!("Unexpected oracle responses: {:?}", responses);
     };
-    if cfg!(feature = "unstable-oracles") {
-        let [OracleResponse::Service(json)] = &responses[..] else {
-            assert_eq!(&responses[..], &[]);
-            panic!("Unexpected oracle responses: {:?}", responses);
-        };
-        let response_json = serde_json::from_slice::<serde_json::Value>(json).unwrap();
-        assert_eq!(response_json["data"], json!({"value": 10}));
-    } else {
-        assert!(responses.is_empty());
-    }
+    let [OracleResponse::Service(json)] = &responses[..] else {
+        assert_eq!(&responses[..], &[]);
+        panic!("Unexpected oracle responses: {:?}", responses);
+    };
+    let response_json = serde_json::from_slice::<serde_json::Value>(json).unwrap();
+    assert_eq!(response_json["data"], json!({"value": 10}));
 
     receiver.synchronize_from_validators().await.unwrap();
     receiver
@@ -550,9 +554,9 @@ where
     let module_id = module_id
         .with_abi::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>();
 
-    let sender_owner = AccountOwner::User(Owner::from(sender.key_pair().await?.public()));
-    let receiver_owner = AccountOwner::User(Owner::from(receiver.key_pair().await?.public()));
-    let receiver2_owner = AccountOwner::User(Owner::from(receiver2.key_pair().await?.public()));
+    let sender_owner = AccountOwner::from(sender.key_pair().await?.public());
+    let receiver_owner = AccountOwner::from(receiver.key_pair().await?.public());
+    let receiver2_owner = AccountOwner::from(receiver2.key_pair().await?.public());
 
     let accounts = BTreeMap::from_iter([(sender_owner, Amount::from_tokens(1_000_000))]);
     let state = fungible::InitialState { accounts };
@@ -752,7 +756,7 @@ where
     let _certs = sender.process_inbox().await.unwrap();
 
     // Make a post.
-    let text = "Please like and comment!.".to_string();
+    let text = "Please like and comment!".to_string();
     let post = social::Operation::Post {
         text: text.clone(),
         image_url: None,
@@ -861,19 +865,24 @@ async fn test_memory_fuel_limit(wasm_runtime: WasmRuntime) -> anyhow::Result<()>
     let vm_runtime = VmRuntime::Wasm;
     let storage_builder = MemoryStorageBuilder::with_wasm_runtime(wasm_runtime);
     // Set a fuel limit that is enough to instantiate the application and do one increment
-    // operation, but not ten.
-    let mut builder =
-        TestBuilder::new(storage_builder, 4, 1)
-            .await?
-            .with_policy(ResourceControlPolicy {
-                maximum_fuel_per_block: 30_000,
-                ..ResourceControlPolicy::default()
-            });
+    // operation, but not ten. We also verify blob fees for the bytecode.
+    let policy = ResourceControlPolicy {
+        maximum_fuel_per_block: 30_000,
+        blob_read: Amount::from_tokens(10), // Should not be charged.
+        blob_published: Amount::from_attos(100),
+        blob_byte_read: Amount::from_tokens(10), // Should not be charged.
+        blob_byte_published: Amount::from_attos(1),
+        ..ResourceControlPolicy::default()
+    };
+    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+        .await?
+        .with_policy(policy.clone());
     let publisher = builder.add_root_chain(0, Amount::from_tokens(3)).await?;
 
     let (contract_path, service_path) =
         linera_execution::wasm_test::get_example_bytecode_paths("counter")?;
 
+    let mut expected_balance = publisher.local_balance().await?;
     let (module_id, _cert) = publisher
         .publish_module(
             Bytecode::load_from_file(contract_path).await?,
@@ -884,6 +893,21 @@ async fn test_memory_fuel_limit(wasm_runtime: WasmRuntime) -> anyhow::Result<()>
         .unwrap()
         .unwrap();
     let module_id = module_id.with_abi::<counter::CounterAbi, (), u64>();
+    let mut blobs = publisher
+        .storage_client()
+        .read_blobs(&[
+            BlobId::new(module_id.contract_blob_hash, BlobType::ContractBytecode),
+            BlobId::new(module_id.service_blob_hash, BlobType::ServiceBytecode),
+        ])
+        .await?
+        .into_iter()
+        .flatten();
+    expected_balance = expected_balance
+        - policy.blob_published * 2
+        - policy.blob_byte_published
+            * (blobs.next().unwrap().bytes().len() as u128
+                + blobs.next().unwrap().bytes().len() as u128);
+    assert_eq!(publisher.local_balance().await?, expected_balance);
 
     let initial_value = 10_u64;
     let (application_id, _) = publisher

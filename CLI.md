@@ -456,12 +456,19 @@ View or update the resource control policy
 * `--write-operation <WRITE_OPERATION>` — Set the price per write operation
 * `--byte-read <BYTE_READ>` — Set the price per byte read
 * `--byte-written <BYTE_WRITTEN>` — Set the price per byte written
+* `--blob-read <BLOB_READ>` — Set the base price to read a blob
+* `--blob-published <BLOB_PUBLISHED>` — Set the base price to publish a blob
+* `--blob-byte-read <BLOB_BYTE_READ>` — Set the price to read a blob, per byte
+* `--blob-byte-published <BLOB_BYTE_PUBLISHED>` — The price to publish a blob, per byte
 * `--byte-stored <BYTE_STORED>` — Set the price per byte stored
 * `--operation <OPERATION>` — Set the base price of sending an operation from a block..
 * `--operation-byte <OPERATION_BYTE>` — Set the additional price for each byte in the argument of a user operation
 * `--message <MESSAGE>` — Set the base price of sending a message from a block..
 * `--message-byte <MESSAGE_BYTE>` — Set the additional price for each byte in the argument of a user message
+* `--service-as-oracle-query <SERVICE_AS_ORACLE_QUERY>` — Set the price per query to a service as an oracle
+* `--http-request <HTTP_REQUEST>` — Set the price for performing an HTTP request
 * `--maximum-fuel-per-block <MAXIMUM_FUEL_PER_BLOCK>` — Set the maximum amount of fuel per block
+* `--maximum-service-oracle-execution-ms <MAXIMUM_SERVICE_ORACLE_EXECUTION_MS>` — Set the maximum time in milliseconds that a block can spend executing services as oracles
 * `--maximum-executed-block-size <MAXIMUM_EXECUTED_BLOCK_SIZE>` — Set the maximum size of an executed block, in bytes
 * `--maximum-blob-size <MAXIMUM_BLOB_SIZE>` — Set the maximum size of data blobs, compressed bytecode and other binary blobs, in bytes
 * `--maximum-published-blobs <MAXIMUM_PUBLISHED_BLOBS>` — Set the maximum number of published blobs per block
@@ -469,6 +476,10 @@ View or update the resource control policy
 * `--maximum-block-proposal-size <MAXIMUM_BLOCK_PROPOSAL_SIZE>` — Set the maximum size of a block proposal, in bytes
 * `--maximum-bytes-read-per-block <MAXIMUM_BYTES_READ_PER_BLOCK>` — Set the maximum read data per block
 * `--maximum-bytes-written-per-block <MAXIMUM_BYTES_WRITTEN_PER_BLOCK>` — Set the maximum write data per block
+* `--maximum-oracle-response-bytes <MAXIMUM_ORACLE_RESPONSE_BYTES>` — Set the maximum size of oracle responses
+* `--maximum-http-response-bytes <MAXIMUM_HTTP_RESPONSE_BYTES>` — Set the maximum size in bytes of a received HTTP response
+* `--http-request-timeout-ms <HTTP_REQUEST_TIMEOUT_MS>` — Set the maximum amount of time allowed to wait for an HTTP response
+* `--http-request-allow-list <HTTP_REQUEST_ALLOW_LIST>` — Set the list of hosts that contracts and services can send HTTP requests to
 
 
 
@@ -505,12 +516,19 @@ Create genesis configuration for a Linera deployment. Create initial user chains
 * `--write-operation-price <WRITE_OPERATION_PRICE>` — Set the price per write operation. (This will overwrite value from `--policy-config`)
 * `--byte-read-price <BYTE_READ_PRICE>` — Set the price per byte read. (This will overwrite value from `--policy-config`)
 * `--byte-written-price <BYTE_WRITTEN_PRICE>` — Set the price per byte written. (This will overwrite value from `--policy-config`)
+* `--blob-read-price <BLOB_READ_PRICE>` — Set the base price to read a blob. (This will overwrite value from `--policy-config`)
+* `--blob-published-price <BLOB_PUBLISHED_PRICE>` — Set the base price to publish a blob. (This will overwrite value from `--policy-config`)
+* `--blob-byte-read-price <BLOB_BYTE_READ_PRICE>` — Set the price to read a blob, per byte. (This will overwrite value from `--policy-config`)
+* `--blob-byte-published-price <BLOB_BYTE_PUBLISHED_PRICE>` — Set the price to publish a blob, per byte. (This will overwrite value from `--policy-config`)
 * `--byte-stored-price <BYTE_STORED_PRICE>` — Set the price per byte stored. (This will overwrite value from `--policy-config`)
 * `--operation-price <OPERATION_PRICE>` — Set the base price of sending an operation from a block.. (This will overwrite value from `--policy-config`)
 * `--operation-byte-price <OPERATION_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user operation. (This will overwrite value from `--policy-config`)
 * `--message-price <MESSAGE_PRICE>` — Set the base price of sending a message from a block.. (This will overwrite value from `--policy-config`)
 * `--message-byte-price <MESSAGE_BYTE_PRICE>` — Set the additional price for each byte in the argument of a user message. (This will overwrite value from `--policy-config`)
+* `--service-as-oracle-query-price <SERVICE_AS_ORACLE_QUERY_PRICE>` — Set the price per query to a service as an oracle
+* `--http-request-price <HTTP_REQUEST_PRICE>` — Set the price for performing an HTTP request
 * `--maximum-fuel-per-block <MAXIMUM_FUEL_PER_BLOCK>` — Set the maximum amount of fuel per block. (This will overwrite value from `--policy-config`)
+* `--maximum-service-oracle-execution-ms <MAXIMUM_SERVICE_ORACLE_EXECUTION_MS>` — Set the maximum time in milliseconds that a block can spend executing services as oracles
 * `--maximum-executed-block-size <MAXIMUM_EXECUTED_BLOCK_SIZE>` — Set the maximum size of an executed block. (This will overwrite value from `--policy-config`)
 * `--maximum-bytecode-size <MAXIMUM_BYTECODE_SIZE>` — Set the maximum size of decompressed contract or service bytecode, in bytes. (This will overwrite value from `--policy-config`)
 * `--maximum-blob-size <MAXIMUM_BLOB_SIZE>` — Set the maximum size of data blobs, compressed bytecode and other binary blobs, in bytes. (This will overwrite value from `--policy-config`)
@@ -518,7 +536,10 @@ Create genesis configuration for a Linera deployment. Create initial user chains
 * `--maximum-block-proposal-size <MAXIMUM_BLOCK_PROPOSAL_SIZE>` — Set the maximum size of a block proposal, in bytes. (This will overwrite value from `--policy-config`)
 * `--maximum-bytes-read-per-block <MAXIMUM_BYTES_READ_PER_BLOCK>` — Set the maximum read data per block. (This will overwrite value from `--policy-config`)
 * `--maximum-bytes-written-per-block <MAXIMUM_BYTES_WRITTEN_PER_BLOCK>` — Set the maximum write data per block. (This will overwrite value from `--policy-config`)
-* `--http-allow-list <HTTP_ALLOW_LIST>` — Set the list of hosts that contracts and services can send HTTP requests to
+* `--maximum-oracle-response-bytes <MAXIMUM_ORACLE_RESPONSE_BYTES>` — Set the maximum size of oracle responses. (This will overwrite value from `--policy-config`)
+* `--maximum-http-response-bytes <MAXIMUM_HTTP_RESPONSE_BYTES>` — Set the maximum size in bytes of a received HTTP response
+* `--http-request-timeout-ms <HTTP_REQUEST_TIMEOUT_MS>` — Set the maximum amount of time allowed to wait for an HTTP response
+* `--http-request-allow-list <HTTP_REQUEST_ALLOW_LIST>` — Set the list of hosts that contracts and services can send HTTP requests to
 * `--testing-prng-seed <TESTING_PRNG_SEED>` — Force this wallet to generate keys using a PRNG and a given seed. USE FOR TESTING ONLY
 * `--network-name <NETWORK_NAME>` — A unique name to identify this network
 

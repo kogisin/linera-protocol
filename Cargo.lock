@@ -2081,6 +2081,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "counter-no-graphql"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "linera-sdk",
+ "serde",
+]
+
+[[package]]
 name = "cpp_demangle"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4455,6 +4464,7 @@ version = "0.14.0"
 dependencies = [
  "alloy-primitives",
  "anyhow",
+ "assert_matches",
  "async-graphql",
  "async-graphql-derive",
  "async-trait",
@@ -4509,6 +4519,7 @@ dependencies = [
  "assert_matches",
  "async-graphql",
  "async-trait",
+ "axum",
  "bcs",
  "cfg_aliases",
  "custom_debug_derive",
@@ -4983,6 +4994,7 @@ dependencies = [
  "comfy-table",
  "convert_case",
  "counter",
+ "counter-no-graphql",
  "criterion",
  "crowd-funding",
  "current_platform",
@@ -5179,6 +5191,7 @@ dependencies = [
  "linera-views-derive",
  "linera-witty",
  "linked-hash-map",
+ "num_cpus",
  "prometheus",
  "rand",
  "rocksdb",

@@ -39,10 +39,10 @@ fn expected_application_id(
     context: &OperationContext,
     module_id: &ModuleId,
     parameters: Vec<u8>,
-    required_application_ids: Vec<UserApplicationId>,
+    required_application_ids: Vec<ApplicationId>,
     application_index: u32,
-) -> UserApplicationId {
-    let description = UserApplicationDescription {
+) -> ApplicationId {
+    let description = ApplicationDescription {
         module_id: *module_id,
         creator_chain_id: context.chain_id,
         block_height: context.height,
@@ -76,7 +76,12 @@ async fn application_message_index() -> anyhow::Result<()> {
         .await?;
     let new_application = view
         .system
-        .execute_operation(context, operation, &mut txn_tracker)
+        .execute_operation(
+            context,
+            operation,
+            &mut txn_tracker,
+            &mut ResourceController::default(),
+        )
         .await?;
     let id = expected_application_id(&context, &module_id, vec![], vec![], 0);
     assert_eq!(new_application, Some((id, vec![])));
@@ -104,7 +109,12 @@ async fn open_chain_message_index() {
     let operation = SystemOperation::OpenChain(config.clone());
     let new_application = view
         .system
-        .execute_operation(context, operation, &mut txn_tracker)
+        .execute_operation(
+            context,
+            operation,
+            &mut txn_tracker,
+            &mut ResourceController::default(),
+        )
         .await
         .unwrap();
     assert_eq!(new_application, None);
@@ -118,7 +128,7 @@ async fn open_chain_message_index() {
 /// Tests if an account is removed from storage if it is drained.
 #[tokio::test]
 async fn empty_accounts_are_removed() -> anyhow::Result<()> {
-    let owner = AccountOwner::User(Owner(CryptoHash::test_hash("account owner")));
+    let owner = AccountOwner::from(CryptoHash::test_hash("account owner"));
     let amount = Amount::from_tokens(99);
 
     let mut view = SystemExecutionState {

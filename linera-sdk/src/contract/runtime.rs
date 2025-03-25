@@ -8,12 +8,14 @@ use linera_base::{
     data_types::{
         Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, Timestamp,
     },
-    http,
+    ensure, http,
     identifiers::{
         Account, AccountOwner, ApplicationId, ChainId, ChannelName, Destination, MessageId,
-        ModuleId, Owner, StreamName,
+        ModuleId, StreamName,
     },
-    ownership::{ChainOwnership, ChangeApplicationPermissionsError, CloseChainError},
+    ownership::{
+        AccountPermissionError, ChainOwnership, ChangeApplicationPermissionsError, CloseChainError,
+    },
 };
 use serde::Serialize;
 
@@ -32,7 +34,7 @@ where
     application_id: Option<ApplicationId<Application::Abi>>,
     application_creator_chain_id: Option<ChainId>,
     chain_id: Option<ChainId>,
-    authenticated_signer: Option<Option<Owner>>,
+    authenticated_signer: Option<Option<AccountOwner>>,
     block_height: Option<BlockHeight>,
     message_is_bouncing: Option<Option<bool>>,
     message_id: Option<Option<MessageId>>,
@@ -172,10 +174,10 @@ where
     Application: Contract,
 {
     /// Returns the authenticated signer for this execution, if there is one.
-    pub fn authenticated_signer(&mut self) -> Option<Owner> {
+    pub fn authenticated_signer(&mut self) -> Option<AccountOwner> {
         *self
             .authenticated_signer
-            .get_or_insert_with(|| contract_wit::authenticated_signer().map(Owner::from))
+            .get_or_insert_with(|| contract_wit::authenticated_signer().map(AccountOwner::from))
     }
 
     /// Returns the ID of the incoming message that is being handled, or [`None`] if not executing
@@ -202,6 +204,19 @@ where
             .get_or_insert_with(|| contract_wit::authenticated_caller_id().map(ApplicationId::from))
     }
 
+    /// Verifies that the current execution context authorizes operations on a given account.
+    pub fn check_account_permission(
+        &mut self,
+        owner: AccountOwner,
+    ) -> Result<(), AccountPermissionError> {
+        ensure!(
+            self.authenticated_signer() == Some(owner)
+                || self.authenticated_caller_id().map(AccountOwner::from) == Some(owner),
+            AccountPermissionError::NotPermitted(owner)
+        );
+        Ok(())
+    }
+
     /// Schedules a message to be sent to this application on another chain.
     pub fn send_message(
         &mut self,
@@ -224,7 +239,7 @@ where
         contract_wit::subscribe(chain.into(), &channel.into());
     }
 
-    /// Unsubscribes to a message channel from another chain.
+    /// Unsubscribes from a message channel from another chain.
     pub fn unsubscribe(&mut self, chain: ChainId, channel: ChannelName) {
         contract_wit::unsubscribe(chain.into(), &channel.into());
     }

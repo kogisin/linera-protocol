@@ -11,7 +11,7 @@ use linera_base::{
     crypto::CryptoHash,
     data_types::{Blob, TimeDelta, Timestamp},
     hashed::Hashed,
-    identifiers::{BlobId, ChainId, EventId, UserApplicationId},
+    identifiers::{ApplicationId, BlobId, ChainId, EventId},
 };
 use linera_chain::{
     types::{ConfirmedBlock, ConfirmedBlockCertificate, LiteCertificate},
@@ -263,8 +263,8 @@ pub struct DbStorage<Store, Clock> {
     store: Arc<Store>,
     clock: Clock,
     wasm_runtime: Option<WasmRuntime>,
-    user_contracts: Arc<DashMap<UserApplicationId, UserContractCode>>,
-    user_services: Arc<DashMap<UserApplicationId, UserServiceCode>>,
+    user_contracts: Arc<DashMap<ApplicationId, UserContractCode>>,
+    user_services: Arc<DashMap<ApplicationId, UserServiceCode>>,
     execution_runtime_config: ExecutionRuntimeConfig,
 }
 
@@ -349,10 +349,14 @@ pub async fn list_all_chain_ids<S: AdminKeyValueStore>(
 
 /// An implementation of [`DualStoreRootKeyAssignment`] that stores the
 /// chain states into the first store.
+#[derive(Clone, Copy)]
 pub struct ChainStatesFirstAssignment;
 
 impl DualStoreRootKeyAssignment for ChainStatesFirstAssignment {
     fn assigned_store(root_key: &[u8]) -> Result<StoreInUse, bcs::Error> {
+        if root_key.is_empty() {
+            return Ok(StoreInUse::Second);
+        }
         let store = match bcs::from_bytes(root_key)? {
             BaseKey::ChainState(_) => StoreInUse::First,
             _ => StoreInUse::Second,

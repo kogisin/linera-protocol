@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
 };
 
@@ -19,7 +19,10 @@ use linera_base::{
     doc_scalar, ensure,
     hashed::Hashed,
     hex_debug,
-    identifiers::{Account, BlobId, ChainId, ChannelFullName, Destination, MessageId, Owner},
+    identifiers::{
+        Account, AccountOwner, BlobId, ChainId, ChannelFullName, Destination, GenericApplicationId,
+        MessageId,
+    },
 };
 use linera_execution::{
     committee::{Committee, Epoch},
@@ -71,7 +74,7 @@ pub struct ProposedBlock {
     /// the default account of the chain is used. This value is also used as recipient of
     /// potential refunds for the message grants created by the operations.
     #[debug(skip_if = Option::is_none)]
-    pub authenticated_signer: Option<Owner>,
+    pub authenticated_signer: Option<AccountOwner>,
     /// Certified hash (see `Certificate` below) of the previous block in the
     /// chain, if any.
     pub previous_block_hash: Option<CryptoHash>,
@@ -288,7 +291,7 @@ pub struct BlockProposal {
 pub struct PostedMessage {
     /// The user authentication carried by the message, if any.
     #[debug(skip_if = Option::is_none)]
-    pub authenticated_signer: Option<Owner>,
+    pub authenticated_signer: Option<AccountOwner>,
     /// A grant to pay for the message execution.
     #[debug(skip_if = Amount::is_zero)]
     pub grant: Amount,
@@ -328,7 +331,10 @@ impl OutgoingMessageExt for OutgoingMessage {
                     application_id,
                     name,
                 }),
-            ) => *application_id == self.message.application_id() && name == dest_name,
+            ) => {
+                GenericApplicationId::User(*application_id) == self.message.application_id()
+                    && name == dest_name
+            }
         }
     }
 
@@ -381,6 +387,8 @@ pub struct ExecutedBlock {
 pub struct BlockExecutionOutcome {
     /// The list of outgoing messages for each transaction.
     pub messages: Vec<Vec<OutgoingMessage>>,
+    /// The hashes of previous blocks that sent messages to the same recipients.
+    pub previous_message_blocks: BTreeMap<ChainId, CryptoHash>,
     /// The hash of the chain's execution state after this block.
     pub state_hash: CryptoHash,
     /// The record of oracle responses for each transaction.
@@ -549,15 +557,6 @@ impl MessageBundle {
 
     pub fn is_protected(&self) -> bool {
         self.messages.iter().any(PostedMessage::is_protected)
-    }
-
-    /// Returns whether this bundle must be added to the inbox.
-    ///
-    /// If this is `false`, it gets handled immediately and should never be received in a block.
-    pub fn goes_to_inbox(&self) -> bool {
-        self.messages
-            .iter()
-            .any(|posted_message| posted_message.message.goes_to_inbox())
     }
 }
 

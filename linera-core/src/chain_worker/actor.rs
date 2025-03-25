@@ -12,9 +12,9 @@ use std::{
 use custom_debug_derive::Debug;
 use linera_base::{
     crypto::{CryptoHash, ValidatorPublicKey},
-    data_types::{Blob, BlockHeight, Timestamp, UserApplicationDescription},
+    data_types::{ApplicationDescription, Blob, BlockHeight, Timestamp},
     hashed::Hashed,
-    identifiers::{BlobId, ChainId, UserApplicationId},
+    identifiers::{ApplicationId, BlobId, ChainId},
 };
 use linera_chain::{
     data_types::{BlockProposal, ExecutedBlock, MessageBundle, Origin, ProposedBlock, Target},
@@ -76,15 +76,16 @@ where
 
     /// Describe an application.
     DescribeApplication {
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         #[debug(skip)]
-        callback: oneshot::Sender<Result<UserApplicationDescription, WorkerError>>,
+        callback: oneshot::Sender<Result<ApplicationDescription, WorkerError>>,
     },
 
     /// Execute a block but discard any changes to the chain state.
     StageBlockExecution {
         block: ProposedBlock,
         round: Option<u32>,
+        published_blobs: Vec<Blob>,
         #[debug(skip)]
         callback: oneshot::Sender<Result<(ExecutedBlock, ChainInfoResponse), WorkerError>>,
     },
@@ -124,7 +125,7 @@ where
         origin: Origin,
         bundles: Vec<(Epoch, MessageBundle)>,
         #[debug(skip)]
-        callback: oneshot::Sender<Result<Option<(BlockHeight, NetworkActions)>, WorkerError>>,
+        callback: oneshot::Sender<Result<Option<BlockHeight>, WorkerError>>,
     },
 
     /// Handle cross-chain request to confirm that the recipient was updated.
@@ -308,7 +309,7 @@ where
     }
 
     /// Runs the worker until there are no more incoming requests.
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request))]
     pub async fn handle_request(&mut self, request: ChainWorkerRequest<StorageClient::Context>) {
         // TODO(#2237): Spawn concurrent tasks for read-only operations
         let responded = match request {
@@ -345,9 +346,14 @@ where
             ChainWorkerRequest::StageBlockExecution {
                 block,
                 round,
+                published_blobs,
                 callback,
             } => callback
-                .send(self.worker.stage_block_execution(block, round).await)
+                .send(
+                    self.worker
+                        .stage_block_execution(block, round, &published_blobs)
+                        .await,
+                )
                 .is_ok(),
             ChainWorkerRequest::ProcessTimeout {
                 certificate,

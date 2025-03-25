@@ -10,13 +10,13 @@
 #![allow(clippy::large_futures)]
 #![cfg(any(feature = "wasmer", feature = "wasmtime"))]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use assert_matches::assert_matches;
 use linera_base::{
     crypto::AccountSecretKey,
     data_types::{
-        Amount, Blob, BlockHeight, Bytecode, OracleResponse, Timestamp, UserApplicationDescription,
+        Amount, ApplicationDescription, Blob, BlockHeight, Bytecode, OracleResponse, Timestamp,
     },
     hashed::Hashed,
     identifiers::{ChainDescription, ChainId, ModuleId},
@@ -149,6 +149,7 @@ where
     let publish_block_proposal = Hashed::new(ConfirmedBlock::new(
         BlockExecutionOutcome {
             messages: vec![Vec::new()],
+            previous_message_blocks: BTreeMap::new(),
             events: vec![Vec::new()],
             blobs: vec![Vec::new()],
             state_hash: publisher_state_hash,
@@ -197,7 +198,7 @@ where
         instantiation_argument: initial_value_bytes.clone(),
         required_application_ids: vec![],
     };
-    let application_description = UserApplicationDescription {
+    let application_description = ApplicationDescription {
         module_id,
         creator_chain_id: creator_chain.into(),
         block_height: BlockHeight::from(0),
@@ -226,6 +227,7 @@ where
     let create_block_proposal = Hashed::new(ConfirmedBlock::new(
         BlockExecutionOutcome {
             messages: vec![vec![]],
+            previous_message_blocks: BTreeMap::new(),
             events: vec![Vec::new()],
             state_hash: creator_state.crypto_hash().await?,
             oracle_responses: vec![vec![
@@ -297,6 +299,7 @@ where
     let run_block_proposal = Hashed::new(ConfirmedBlock::new(
         BlockExecutionOutcome {
             messages: vec![Vec::new()],
+            previous_message_blocks: BTreeMap::new(),
             events: vec![Vec::new()],
             blobs: vec![Vec::new()],
             state_hash: creator_state.crypto_hash().await?,

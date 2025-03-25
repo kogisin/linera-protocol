@@ -18,8 +18,8 @@ use linera_base::{
     },
     ensure, http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, ChannelFullName,
-        ChannelName, MessageId, Owner, StreamId, StreamName,
+        Account, AccountOwner, BlobId, BlobType, ChainId, ChannelFullName, ChannelName,
+        GenericApplicationId, MessageId, StreamId, StreamName,
     },
     ownership::ChainOwnership,
 };
@@ -32,11 +32,11 @@ use crate::{
     resources::ResourceController,
     system::CreateApplicationResult,
     util::{ReceiverExt, UnboundedSenderExt},
-    BaseRuntime, ContractRuntime, ExecutionError, FinalizeContext, MessageContext, ModuleId,
-    Operation, OperationContext, QueryContext, QueryOutcome, RawExecutionOutcome,
-    RawOutgoingMessage, ServiceRuntime, TransactionTracker, UserApplicationDescription,
-    UserApplicationId, UserContractCode, UserContractInstance, UserServiceCode,
-    UserServiceInstance, MAX_EVENT_KEY_LEN, MAX_STREAM_NAME_LEN,
+    ApplicationDescription, ApplicationId, BaseRuntime, ContractRuntime, ExecutionError,
+    FinalizeContext, Message, MessageContext, MessageKind, ModuleId, Operation, OperationContext,
+    OutgoingMessage, QueryContext, QueryOutcome, ServiceRuntime, TransactionTracker,
+    UserContractCode, UserContractInstance, UserServiceCode, UserServiceInstance,
+    MAX_EVENT_KEY_LEN, MAX_STREAM_NAME_LEN,
 };
 
 #[cfg(test)]
@@ -73,7 +73,7 @@ pub struct SyncRuntimeInternal<UserInstance> {
     local_time: Timestamp,
     /// The authenticated signer of the operation or message, if any.
     #[debug(skip_if = Option::is_none)]
-    authenticated_signer: Option<Owner>,
+    authenticated_signer: Option<AccountOwner>,
     /// The current message being executed, if there is one.
     #[debug(skip_if = Option::is_none)]
     executing_message: Option<ExecutingMessage>,
@@ -86,21 +86,21 @@ pub struct SyncRuntimeInternal<UserInstance> {
     /// If [`true`], disables cross-application calls.
     is_finalizing: bool,
     /// Applications that need to be finalized.
-    applications_to_finalize: Vec<UserApplicationId>,
+    applications_to_finalize: Vec<ApplicationId>,
 
     /// Application instances loaded in this transaction.
-    loaded_applications: HashMap<UserApplicationId, LoadedApplication<UserInstance>>,
+    loaded_applications: HashMap<ApplicationId, LoadedApplication<UserInstance>>,
     /// The current stack of application descriptions.
     call_stack: Vec<ApplicationStatus>,
     /// The set of the IDs of the applications that are in the `call_stack`.
-    active_applications: HashSet<UserApplicationId>,
+    active_applications: HashSet<ApplicationId>,
     /// The tracking information for this transaction.
     transaction_tracker: TransactionTracker,
     /// The operations scheduled during this query.
     scheduled_operations: Vec<Operation>,
 
     /// Track application states based on views.
-    view_user_states: BTreeMap<UserApplicationId, ViewUserState>,
+    view_user_states: BTreeMap<ApplicationId, ViewUserState>,
 
     /// The deadline this runtime should finish executing.
     ///
@@ -118,25 +118,25 @@ pub struct SyncRuntimeInternal<UserInstance> {
 #[derive(Debug)]
 struct ApplicationStatus {
     /// The caller application ID, if forwarded during the call.
-    caller_id: Option<UserApplicationId>,
+    caller_id: Option<ApplicationId>,
     /// The application ID.
-    id: UserApplicationId,
+    id: ApplicationId,
     /// The application description.
-    description: UserApplicationDescription,
+    description: ApplicationDescription,
     /// The authenticated signer for the execution thread, if any.
-    signer: Option<Owner>,
+    signer: Option<AccountOwner>,
 }
 
 /// A loaded application instance.
 #[derive(Debug)]
 struct LoadedApplication<Instance> {
     instance: Arc<Mutex<Instance>>,
-    description: UserApplicationDescription,
+    description: ApplicationDescription,
 }
 
 impl<Instance> LoadedApplication<Instance> {
     /// Creates a new [`LoadedApplication`] entry from the `instance` and its `description`.
-    fn new(instance: Instance, description: UserApplicationDescription) -> Self {
+    fn new(instance: Instance, description: ApplicationDescription) -> Self {
         LoadedApplication {
             instance: Arc::new(Mutex::new(instance)),
             description,
@@ -294,7 +294,7 @@ impl<UserInstance> SyncRuntimeInternal<UserInstance> {
         height: BlockHeight,
         round: Option<u32>,
         local_time: Timestamp,
-        authenticated_signer: Option<Owner>,
+        authenticated_signer: Option<AccountOwner>,
         executing_message: Option<ExecutingMessage>,
         execution_state_sender: ExecutionStateSender,
         deadline: Option<Instant>,
@@ -366,7 +366,7 @@ impl<UserInstance> SyncRuntimeInternal<UserInstance> {
     /// Returns an error if there already is an entry for `application_id` in the call stack.
     fn check_for_reentrancy(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
     ) -> Result<(), ExecutionError> {
         ensure!(
             !self.active_applications.contains(&application_id),
@@ -381,7 +381,7 @@ impl SyncRuntimeInternal<UserContractInstance> {
     fn load_contract_instance(
         &mut self,
         this: SyncRuntimeHandle<UserContractInstance>,
-        id: UserApplicationId,
+        id: ApplicationId,
     ) -> Result<LoadedApplication<UserContractInstance>, ExecutionError> {
         match self.loaded_applications.entry(id) {
             // TODO(#2927): support dynamic loading of modules on the Web
@@ -421,7 +421,7 @@ impl SyncRuntimeInternal<UserContractInstance> {
         &mut self,
         this: ContractSyncRuntimeHandle,
         authenticated: bool,
-        callee_id: UserApplicationId,
+        callee_id: ApplicationId,
     ) -> Result<(Arc<Mutex<UserContractInstance>>, OperationContext), ExecutionError> {
         self.check_for_reentrancy(callee_id)?;
 
@@ -506,6 +506,9 @@ impl SyncRuntimeInternal<UserContractInstance> {
             operations,
         } = result?;
 
+        self.resource_controller
+            .track_service_oracle_response(response.len())?;
+
         self.scheduled_operations.extend(operations);
         Ok(response)
     }
@@ -516,7 +519,7 @@ impl SyncRuntimeInternal<UserServiceInstance> {
     fn load_service_instance(
         &mut self,
         this: ServiceSyncRuntimeHandle,
-        id: UserApplicationId,
+        id: ApplicationId,
     ) -> Result<LoadedApplication<UserServiceInstance>, ExecutionError> {
         match self.loaded_applications.entry(id) {
             // TODO(#2927): support dynamic loading of modules on the Web
@@ -576,7 +579,10 @@ impl<UserInstance> SyncRuntimeHandle<UserInstance> {
     }
 }
 
-impl<UserInstance> BaseRuntime for SyncRuntimeHandle<UserInstance> {
+impl<UserInstance> BaseRuntime for SyncRuntimeHandle<UserInstance>
+where
+    Self: ContractOrServiceRuntime,
+{
     type Read = ();
     type ReadValueBytes = u32;
     type ContainsKey = u32;
@@ -593,7 +599,7 @@ impl<UserInstance> BaseRuntime for SyncRuntimeHandle<UserInstance> {
         Ok(self.inner().height)
     }
 
-    fn application_id(&mut self) -> Result<UserApplicationId, ExecutionError> {
+    fn application_id(&mut self) -> Result<ApplicationId, ExecutionError> {
         Ok(self.inner().current_application().id)
     }
 
@@ -862,6 +868,8 @@ impl<UserInstance> BaseRuntime for SyncRuntimeHandle<UserInstance> {
                 this.execution_state_sender
                     .send_request(|callback| ExecutionRequest::PerformHttpRequest {
                         request,
+                        http_responses_are_oracle_responses:
+                            Self::LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE,
                         callback,
                     })?
                     .recv_response()?
@@ -918,6 +926,25 @@ impl<UserInstance> BaseRuntime for SyncRuntimeHandle<UserInstance> {
     }
 }
 
+/// An extension trait to determine in compile time the different behaviors between contract and
+/// services in the implementation of [`BaseRuntime`].
+trait ContractOrServiceRuntime {
+    /// Configured to `true` if the HTTP response size should be limited to the oracle response
+    /// size.
+    ///
+    /// This is `false` for services, potentially allowing them to receive a larger HTTP response
+    /// and only storing in the block a shorter oracle response.
+    const LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE: bool;
+}
+
+impl ContractOrServiceRuntime for ContractSyncRuntimeHandle {
+    const LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE: bool = true;
+}
+
+impl ContractOrServiceRuntime for ServiceSyncRuntimeHandle {
+    const LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE: bool = false;
+}
+
 impl<UserInstance> Clone for SyncRuntimeHandle<UserInstance> {
     fn clone(&self) -> Self {
         SyncRuntimeHandle(self.0.clone())
@@ -957,9 +984,9 @@ impl ContractSyncRuntime {
 
     pub(crate) fn preload_contract(
         &self,
-        id: UserApplicationId,
+        id: ApplicationId,
         code: UserContractCode,
-        description: UserApplicationDescription,
+        description: ApplicationDescription,
     ) -> Result<(), ExecutionError> {
         let this = self
             .0
@@ -982,7 +1009,7 @@ impl ContractSyncRuntime {
     /// Main entry point to start executing a user action.
     pub(crate) fn run_action(
         mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         chain_id: ChainId,
         action: UserAction,
     ) -> Result<(Option<Vec<u8>>, ResourceController, TransactionTracker), ExecutionError> {
@@ -1003,7 +1030,7 @@ impl ContractSyncRuntime {
 impl ContractSyncRuntimeHandle {
     fn run_action(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         chain_id: ChainId,
         action: UserAction,
     ) -> Result<Option<Vec<u8>>, ExecutionError> {
@@ -1060,8 +1087,8 @@ impl ContractSyncRuntimeHandle {
     /// Executes a `closure` with the contract code for the `application_id`.
     fn execute(
         &mut self,
-        application_id: UserApplicationId,
-        signer: Option<Owner>,
+        application_id: ApplicationId,
+        signer: Option<AccountOwner>,
         closure: impl FnOnce(&mut UserContractInstance) -> Result<Option<Vec<u8>>, ExecutionError>,
     ) -> Result<Option<Vec<u8>>, ExecutionError> {
         let contract = {
@@ -1100,7 +1127,7 @@ impl ContractSyncRuntimeHandle {
 }
 
 impl ContractRuntime for ContractSyncRuntimeHandle {
-    fn authenticated_signer(&mut self) -> Result<Option<Owner>, ExecutionError> {
+    fn authenticated_signer(&mut self) -> Result<Option<AccountOwner>, ExecutionError> {
         Ok(self.inner().authenticated_signer)
     }
 
@@ -1115,7 +1142,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             .map(|metadata| metadata.is_bouncing))
     }
 
-    fn authenticated_caller_id(&mut self) -> Result<Option<UserApplicationId>, ExecutionError> {
+    fn authenticated_caller_id(&mut self) -> Result<Option<ApplicationId>, ExecutionError> {
         let this = self.inner();
         if this.call_stack.len() <= 1 {
             return Ok(None);
@@ -1135,20 +1162,37 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
     fn send_message(&mut self, message: SendMessageRequest<Vec<u8>>) -> Result<(), ExecutionError> {
         let mut this = self.inner();
         let application = this.current_application();
-        let authenticated_signer = application.signer;
         let application_id = application.id;
+        let authenticated_signer = application.signer;
+        let mut refund_grant_to = this.refund_grant_to;
 
-        let message =
-            RawOutgoingMessage::from(message).into_priced(&this.resource_controller.policy)?;
-        this.resource_controller.track_grant(message.grant)?;
-
-        let outcome = RawExecutionOutcome {
-            authenticated_signer,
-            refund_grant_to: this.refund_grant_to,
-            messages: vec![message],
+        let grant = this
+            .resource_controller
+            .policy
+            .total_price(&message.grant)?;
+        if grant.is_zero() {
+            refund_grant_to = None;
+        } else {
+            this.resource_controller.track_grant(grant)?;
+        }
+        let kind = if message.is_tracked {
+            MessageKind::Tracked
+        } else {
+            MessageKind::Simple
         };
+
         this.transaction_tracker
-            .add_user_outcome(application_id, outcome)?;
+            .add_outgoing_message(OutgoingMessage {
+                destination: message.destination,
+                authenticated_signer,
+                refund_grant_to,
+                grant,
+                kind,
+                message: Message::User {
+                    application_id,
+                    bytes: message.message,
+                },
+            })?;
 
         Ok(())
     }
@@ -1156,7 +1200,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
     fn subscribe(&mut self, chain: ChainId, name: ChannelName) -> Result<(), ExecutionError> {
         let mut this = self.inner();
         let application_id = this.current_application().id;
-        let full_name = ChannelFullName::user(name, application_id);
+        let full_name = ChannelFullName::new(name, application_id);
         this.transaction_tracker.subscribe(full_name, chain);
 
         Ok(())
@@ -1165,7 +1209,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
     fn unsubscribe(&mut self, chain: ChainId, name: ChannelName) -> Result<(), ExecutionError> {
         let mut this = self.inner();
         let application_id = this.current_application().id;
-        let full_name = ChannelFullName::user(name, application_id);
+        let full_name = ChannelFullName::new(name, application_id);
         this.transaction_tracker.unsubscribe(full_name, chain);
 
         Ok(())
@@ -1182,7 +1226,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         let application_id = current_application.id;
         let signer = current_application.signer;
 
-        let execution_outcome = this
+        let maybe_message = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::Transfer {
                 source,
@@ -1195,7 +1239,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             .recv_response()?;
 
         this.transaction_tracker
-            .add_system_outcome(execution_outcome)?;
+            .add_outgoing_messages(maybe_message)?;
         Ok(())
     }
 
@@ -1210,7 +1254,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         let application_id = current_application.id;
         let signer = current_application.signer;
 
-        let execution_outcome = this
+        let message = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::Claim {
                 source,
@@ -1220,17 +1264,15 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
                 application_id,
                 callback,
             })?
-            .recv_response()?
-            .with_authenticated_signer(signer);
-        this.transaction_tracker
-            .add_system_outcome(execution_outcome)?;
+            .recv_response()?;
+        this.transaction_tracker.add_outgoing_message(message)?;
         Ok(())
     }
 
     fn try_call_application(
         &mut self,
         authenticated: bool,
-        callee_id: UserApplicationId,
+        callee_id: ApplicationId,
         argument: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError> {
         let (contract, context) =
@@ -1262,7 +1304,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             stream_name.0.len() <= MAX_STREAM_NAME_LEN,
             ExecutionError::StreamNameTooLong
         );
-        let application_id = this.current_application().id.into();
+        let application_id = GenericApplicationId::User(this.current_application().id);
         let stream_id = StreamId {
             stream_name,
             application_id,
@@ -1276,11 +1318,6 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         application_id: ApplicationId,
         query: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError> {
-        ensure!(
-            cfg!(feature = "unstable-oracles"),
-            ExecutionError::UnstableOracle
-        );
-
         let mut this = self.inner();
 
         let app_permissions = this
@@ -1334,8 +1371,8 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
                 callback,
             })?
             .recv_response()?;
-        let outcome = RawExecutionOutcome::default().with_message(open_chain_message);
-        this.transaction_tracker.add_system_outcome(outcome)?;
+        this.transaction_tracker
+            .add_outgoing_message(open_chain_message)?;
         Ok((message_id, chain_id))
     }
 
@@ -1370,8 +1407,8 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         module_id: ModuleId,
         parameters: Vec<u8>,
         argument: Vec<u8>,
-        required_application_ids: Vec<UserApplicationId>,
-    ) -> Result<UserApplicationId, ExecutionError> {
+        required_application_ids: Vec<ApplicationId>,
+    ) -> Result<ApplicationId, ExecutionError> {
         let chain_id = self.inner().chain_id;
         let block_height = self.block_height()?;
 
@@ -1492,9 +1529,9 @@ impl ServiceSyncRuntime {
     /// Loads a service into the runtime's memory.
     pub(crate) fn preload_service(
         &self,
-        id: UserApplicationId,
+        id: ApplicationId,
         code: UserServiceCode,
-        description: UserApplicationDescription,
+        description: ApplicationDescription,
     ) -> Result<(), ExecutionError> {
         let this = self
             .runtime
@@ -1546,10 +1583,10 @@ impl ServiceSyncRuntime {
         }
     }
 
-    /// Queries an application specified by its [`UserApplicationId`].
+    /// Queries an application specified by its [`ApplicationId`].
     pub(crate) fn run_query(
         &mut self,
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         query: Vec<u8>,
     ) -> Result<QueryOutcome<Vec<u8>>, ExecutionError> {
         let this = self.handle_mut();
@@ -1574,7 +1611,7 @@ impl ServiceRuntime for ServiceSyncRuntimeHandle {
     /// Note that queries are not available from writable contexts.
     fn try_query_application(
         &mut self,
-        queried_id: UserApplicationId,
+        queried_id: ApplicationId,
         argument: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError> {
         let (query_context, service) = {
@@ -1629,7 +1666,7 @@ impl ServiceRuntime for ServiceSyncRuntimeHandle {
 /// A request to the service runtime actor.
 pub enum ServiceRuntimeRequest {
     Query {
-        application_id: UserApplicationId,
+        application_id: ApplicationId,
         context: QueryContext,
         query: Vec<u8>,
         callback: oneshot::Sender<Result<QueryOutcome<Vec<u8>>, ExecutionError>>,

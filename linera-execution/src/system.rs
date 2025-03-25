@@ -10,11 +10,9 @@ mod tests;
 use std::sync::LazyLock;
 use std::{
     collections::{BTreeMap, HashSet},
-    fmt::{self, Display, Formatter},
     mem,
 };
 
-use async_graphql::Enum;
 use custom_debug_derive::Debug;
 use linera_base::{
     crypto::CryptoHash,
@@ -23,8 +21,8 @@ use linera_base::{
     },
     ensure, hex_debug,
     identifiers::{
-        Account, AccountOwner, BlobId, BlobType, ChainDescription, ChainId, ChannelFullName,
-        EventId, MessageId, ModuleId, Owner, StreamId,
+        Account, AccountOwner, BlobId, BlobType, ChainDescription, ChainId, EventId, MessageId,
+        ModuleId, StreamId,
     },
     ownership::{ChainOwnership, TimeoutConfig},
 };
@@ -43,9 +41,9 @@ use {linera_base::prometheus_util::register_int_counter_vec, prometheus::IntCoun
 use crate::test_utils::SystemExecutionState;
 use crate::{
     committee::{Committee, Epoch},
-    ChannelName, ChannelSubscription, Destination, ExecutionError, ExecutionRuntimeContext,
-    MessageContext, MessageKind, OperationContext, QueryContext, QueryOutcome, RawExecutionOutcome,
-    RawOutgoingMessage, TransactionTracker, UserApplicationDescription, UserApplicationId,
+    ApplicationDescription, ApplicationId, ExecutionError, ExecutionRuntimeContext, MessageContext,
+    MessageKind, OperationContext, OutgoingMessage, QueryContext, QueryOutcome, ResourceController,
+    TransactionTracker,
 };
 
 /// The relative index of the `OpenChain` message created by the `OpenChain` operation.
@@ -74,8 +72,6 @@ pub struct SystemExecutionStateView<C> {
     pub epoch: HashedRegisterView<C, Option<Epoch>>,
     /// The admin of the chain.
     pub admin_id: HashedRegisterView<C, Option<ChainId>>,
-    /// Track the channels that we have subscribed to.
-    pub subscriptions: HashedSetView<C, ChannelSubscription>,
     /// The committees that we trust, indexed by epoch number.
     // Not using a `MapView` because the set active of committees is supposed to be
     // small. Plus, currently, we would create the `BTreeMap` anyway in various places
@@ -122,7 +118,7 @@ pub enum SystemOperation {
     /// `target` chain. Depending on its configuration, the `target` chain may refuse to
     /// process the message.
     Claim {
-        owner: Owner,
+        owner: AccountOwner,
         target_id: ChainId,
         recipient: Recipient,
         amount: Amount,
@@ -136,10 +132,10 @@ pub enum SystemOperation {
     ChangeOwnership {
         /// Super owners can propose fast blocks in the first round, and regular blocks in any round.
         #[debug(skip_if = Vec::is_empty)]
-        super_owners: Vec<Owner>,
+        super_owners: Vec<AccountOwner>,
         /// The regular owners, with their weights that determine how often they are round leader.
         #[debug(skip_if = Vec::is_empty)]
-        owners: Vec<(Owner, u64)>,
+        owners: Vec<(AccountOwner, u64)>,
         /// The number of initial rounds after 0 in which all owners are allowed to propose blocks.
         multi_leader_rounds: u32,
         /// Whether the multi-leader rounds are unrestricted, i.e. not limited to chain owners.
@@ -151,21 +147,8 @@ pub enum SystemOperation {
     },
     /// Changes the application permissions configuration on this chain.
     ChangeApplicationPermissions(ApplicationPermissions),
-    /// Subscribes to a system channel.
-    Subscribe {
-        chain_id: ChainId,
-        channel: SystemChannel,
-    },
-    /// Unsubscribes from a system channel.
-    Unsubscribe {
-        chain_id: ChainId,
-        channel: SystemChannel,
-    },
     /// Publishes a new application module.
     PublishModule { module_id: ModuleId },
-    /// Publishes a new committee as a blob. This can be assigned to an epoch using
-    /// [`AdminOperation::CreateCommittee`] in a later block.
-    PublishCommitteeBlob { blob_hash: CryptoHash },
     /// Publishes a new data blob.
     PublishDataBlob { blob_hash: CryptoHash },
     /// Reads a blob and discards the result.
@@ -181,7 +164,7 @@ pub enum SystemOperation {
         #[debug(with = "hex_debug", skip_if = Vec::is_empty)]
         instantiation_argument: Vec<u8>,
         #[debug(skip_if = Vec::is_empty)]
-        required_application_ids: Vec<UserApplicationId>,
+        required_application_ids: Vec<ApplicationId>,
     },
     /// Operations that are only allowed on the admin chain.
     Admin(AdminOperation),
@@ -194,6 +177,9 @@ pub enum SystemOperation {
 /// Operations that are only allowed on the admin chain.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub enum AdminOperation {
+    /// Publishes a new committee as a blob. This can be assigned to an epoch using
+    /// [`AdminOperation::CreateCommittee`] in a later block.
+    PublishCommitteeBlob { blob_hash: CryptoHash },
     /// Registers a new committee. Other chains can then migrate to the new epoch by executing
     /// [`SystemOperation::ProcessNewEpoch`].
     CreateCommittee { epoch: Epoch, blob_hash: CryptoHash },
@@ -223,16 +209,6 @@ pub enum SystemMessage {
     },
     /// Creates (or activates) a new chain.
     OpenChain(OpenChainConfig),
-    /// Subscribes to a channel.
-    Subscribe {
-        id: ChainId,
-        subscription: ChannelSubscription,
-    },
-    /// Unsubscribes from a channel.
-    Unsubscribe {
-        id: ChainId,
-        subscription: ChannelSubscription,
-    },
     /// Notifies that a new application was created.
     ApplicationCreated,
 }
@@ -246,39 +222,6 @@ pub struct SystemQuery;
 pub struct SystemResponse {
     pub chain_id: ChainId,
     pub balance: Amount,
-}
-
-/// The channels available in the system application.
-#[derive(
-    Enum, Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, clap::ValueEnum,
-)]
-pub enum SystemChannel {
-    /// Channel used to broadcast reconfigurations.
-    Admin,
-}
-
-impl SystemChannel {
-    /// The [`ChannelName`] of this [`SystemChannel`].
-    pub fn name(&self) -> ChannelName {
-        bcs::to_bytes(self)
-            .expect("`SystemChannel` can be serialized")
-            .into()
-    }
-
-    /// The [`ChannelFullName`] of this [`SystemChannel`].
-    pub fn full_name(&self) -> ChannelFullName {
-        ChannelFullName::system(self.name())
-    }
-}
-
-impl Display for SystemChannel {
-    fn fmt(&self, formatter: &mut Formatter) -> fmt::Result {
-        let display_name = match self {
-            SystemChannel::Admin => "Admin",
-        };
-
-        write!(formatter, "{display_name}")
-    }
 }
 
 /// The recipient of a transfer.
@@ -337,7 +280,7 @@ impl UserData {
 
 #[derive(Debug)]
 pub struct CreateApplicationResult {
-    pub app_id: UserApplicationId,
+    pub app_id: ApplicationId,
     pub txn_tracker: TransactionTracker,
 }
 
@@ -368,19 +311,15 @@ where
         context: OperationContext,
         operation: SystemOperation,
         txn_tracker: &mut TransactionTracker,
-    ) -> Result<Option<(UserApplicationId, Vec<u8>)>, ExecutionError> {
+        resource_controller: &mut ResourceController<Option<AccountOwner>>,
+    ) -> Result<Option<(ApplicationId, Vec<u8>)>, ExecutionError> {
         use SystemOperation::*;
-        let mut outcome = RawExecutionOutcome {
-            authenticated_signer: context.authenticated_signer,
-            refund_grant_to: context.refund_grant_to(),
-            ..RawExecutionOutcome::default()
-        };
         let mut new_application = None;
         match operation {
             OpenChain(config) => {
                 let next_message_id = context.next_message_id(txn_tracker.next_message_index());
                 let message = self.open_chain(config, next_message_id).await?;
-                outcome.messages.push(message);
+                txn_tracker.add_outgoing_message(message)?;
                 #[cfg(with_metrics)]
                 OPEN_CHAIN_COUNT.with_label_values(&[]).inc();
             }
@@ -402,23 +341,16 @@ where
             ChangeApplicationPermissions(application_permissions) => {
                 self.application_permissions.set(application_permissions);
             }
-            CloseChain => {
-                let messages = self.close_chain(context.chain_id).await?;
-                outcome.messages.extend(messages);
-            }
+            CloseChain => self.close_chain().await?,
             Transfer {
                 owner,
                 amount,
                 recipient,
-                ..
             } => {
-                let message = self
+                let maybe_message = self
                     .transfer(context.authenticated_signer, None, owner, recipient, amount)
                     .await?;
-
-                if let Some(message) = message {
-                    outcome.messages.push(message)
-                }
+                txn_tracker.add_outgoing_messages(maybe_message)?;
             }
             Claim {
                 owner,
@@ -430,14 +362,13 @@ where
                     .claim(
                         context.authenticated_signer,
                         None,
-                        AccountOwner::User(owner),
+                        owner,
                         target_id,
                         recipient,
                         amount,
                     )
                     .await?;
-
-                outcome.messages.push(message)
+                txn_tracker.add_outgoing_message(message)?;
             }
             Admin(admin_operation) => {
                 ensure!(
@@ -445,6 +376,9 @@ where
                     ExecutionError::AdminOperationOnNonAdminChain
                 );
                 match admin_operation {
+                    AdminOperation::PublishCommitteeBlob { blob_hash } => {
+                        self.blob_published(&BlobId::new(blob_hash, BlobType::Committee))?;
+                    }
                     AdminOperation::CreateCommittee { epoch, blob_hash } => {
                         self.check_next_epoch(epoch)?;
                         let blob_id = BlobId::new(blob_hash, BlobType::Committee);
@@ -471,54 +405,6 @@ where
                         );
                     }
                 }
-            }
-            Subscribe { chain_id, channel } => {
-                ensure!(
-                    context.chain_id != chain_id,
-                    ExecutionError::SelfSubscription(context.chain_id, channel)
-                );
-                let subscription = ChannelSubscription {
-                    chain_id,
-                    name: channel.name(),
-                };
-                ensure!(
-                    !self.subscriptions.contains(&subscription).await?,
-                    ExecutionError::AlreadySubscribedToChannel(context.chain_id, channel)
-                );
-                self.subscriptions.insert(&subscription)?;
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(chain_id),
-                    authenticated: false,
-                    grant: Amount::ZERO,
-                    kind: MessageKind::Protected,
-                    message: SystemMessage::Subscribe {
-                        id: context.chain_id,
-                        subscription,
-                    },
-                };
-                outcome.messages.push(message);
-            }
-            Unsubscribe { chain_id, channel } => {
-                let subscription = ChannelSubscription {
-                    chain_id,
-                    name: channel.name(),
-                };
-                ensure!(
-                    self.subscriptions.contains(&subscription).await?,
-                    ExecutionError::InvalidUnsubscription(context.chain_id, channel)
-                );
-                self.subscriptions.remove(&subscription)?;
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(chain_id),
-                    authenticated: false,
-                    grant: Amount::ZERO,
-                    kind: MessageKind::Protected,
-                    message: SystemMessage::Unsubscribe {
-                        id: context.chain_id,
-                        subscription,
-                    },
-                };
-                outcome.messages.push(message);
             }
             PublishModule { module_id } => {
                 self.blob_published(&BlobId::new(
@@ -556,11 +442,14 @@ where
             PublishDataBlob { blob_hash } => {
                 self.blob_published(&BlobId::new(blob_hash, BlobType::Data))?;
             }
-            PublishCommitteeBlob { blob_hash } => {
-                self.blob_published(&BlobId::new(blob_hash, BlobType::Committee))?;
-            }
             ReadBlob { blob_id } => {
-                self.read_blob_content(blob_id).await?;
+                let content = self.read_blob_content(blob_id).await?;
+                if blob_id.blob_type == BlobType::Data {
+                    resource_controller
+                        .with_state(self)
+                        .await?
+                        .track_blob_read(content.bytes().len() as u64)?;
+                }
                 self.blob_used(Some(txn_tracker), blob_id).await?;
             }
             ProcessNewEpoch(epoch) => {
@@ -617,7 +506,6 @@ where
             }
         }
 
-        txn_tracker.add_system_outcome(outcome)?;
         Ok(new_application)
     }
 
@@ -634,28 +522,27 @@ where
 
     pub async fn transfer(
         &mut self,
-        authenticated_signer: Option<Owner>,
-        authenticated_application_id: Option<UserApplicationId>,
+        authenticated_signer: Option<AccountOwner>,
+        authenticated_application_id: Option<ApplicationId>,
         source: AccountOwner,
         recipient: Recipient,
         amount: Amount,
-    ) -> Result<Option<RawOutgoingMessage<SystemMessage, Amount>>, ExecutionError> {
-        match (source, authenticated_signer, authenticated_application_id) {
-            (AccountOwner::User(owner), Some(signer), _) => ensure!(
-                signer == owner,
+    ) -> Result<Option<OutgoingMessage>, ExecutionError> {
+        if source == AccountOwner::CHAIN {
+            ensure!(
+                authenticated_signer.is_some()
+                    && self
+                        .ownership
+                        .get()
+                        .verify_owner(&authenticated_signer.unwrap()),
                 ExecutionError::UnauthenticatedTransferOwner
-            ),
-            (AccountOwner::Application(account_application), _, Some(authorized_application)) => {
-                ensure!(
-                    account_application == authorized_application,
-                    ExecutionError::UnauthenticatedTransferOwner
-                )
-            }
-            (AccountOwner::Chain, Some(signer), _) => ensure!(
-                self.ownership.get().verify_owner(&signer),
+            );
+        } else {
+            ensure!(
+                authenticated_signer == Some(source)
+                    || authenticated_application_id.map(AccountOwner::from) == Some(source),
                 ExecutionError::UnauthenticatedTransferOwner
-            ),
-            (_, _, _) => return Err(ExecutionError::UnauthenticatedTransferOwner),
+            );
         }
         ensure!(
             amount > Amount::ZERO,
@@ -664,19 +551,14 @@ where
         self.debit(&source, amount).await?;
         match recipient {
             Recipient::Account(account) => {
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(account.chain_id),
-                    authenticated: false,
-                    grant: Amount::ZERO,
-                    kind: MessageKind::Tracked,
-                    message: SystemMessage::Credit {
-                        amount,
-                        source,
-                        target: account.owner,
-                    },
+                let message = SystemMessage::Credit {
+                    amount,
+                    source,
+                    target: account.owner,
                 };
-
-                Ok(Some(message))
+                Ok(Some(
+                    OutgoingMessage::new(account.chain_id, message).with_kind(MessageKind::Tracked),
+                ))
             }
             Recipient::Burn => Ok(None),
         }
@@ -684,37 +566,29 @@ where
 
     pub async fn claim(
         &self,
-        authenticated_signer: Option<Owner>,
-        authenticated_application_id: Option<UserApplicationId>,
+        authenticated_signer: Option<AccountOwner>,
+        authenticated_application_id: Option<ApplicationId>,
         source: AccountOwner,
         target_id: ChainId,
         recipient: Recipient,
         amount: Amount,
-    ) -> Result<RawOutgoingMessage<SystemMessage, Amount>, ExecutionError> {
-        match source {
-            AccountOwner::User(owner) => ensure!(
-                authenticated_signer == Some(owner),
-                ExecutionError::UnauthenticatedClaimOwner
-            ),
-            AccountOwner::Application(owner) => ensure!(
-                authenticated_application_id == Some(owner),
-                ExecutionError::UnauthenticatedClaimOwner
-            ),
-            AccountOwner::Chain => unreachable!(),
-        }
+    ) -> Result<OutgoingMessage, ExecutionError> {
+        ensure!(
+            authenticated_signer == Some(source)
+                || authenticated_application_id.map(AccountOwner::from) == Some(source),
+            ExecutionError::UnauthenticatedClaimOwner
+        );
         ensure!(amount > Amount::ZERO, ExecutionError::IncorrectClaimAmount);
 
-        Ok(RawOutgoingMessage {
-            destination: Destination::Recipient(target_id),
-            authenticated: true,
-            grant: Amount::ZERO,
-            kind: MessageKind::Simple,
-            message: SystemMessage::Withdraw {
-                amount,
-                owner: source,
-                recipient,
-            },
-        })
+        let message = SystemMessage::Withdraw {
+            amount,
+            owner: source,
+            recipient,
+        };
+        Ok(
+            OutgoingMessage::new(target_id, message)
+                .with_authenticated_signer(authenticated_signer),
+        )
     }
 
     /// Debits an [`Amount`] of tokens from an account's balance.
@@ -723,26 +597,26 @@ where
         account: &AccountOwner,
         amount: Amount,
     ) -> Result<(), ExecutionError> {
-        let balance = match account {
-            AccountOwner::Chain => self.balance.get_mut(),
-            other => self.balances.get_mut(other).await?.ok_or_else(|| {
+        let balance = if account == &AccountOwner::CHAIN {
+            self.balance.get_mut()
+        } else {
+            self.balances.get_mut(account).await?.ok_or_else(|| {
                 ExecutionError::InsufficientFunding {
                     balance: Amount::ZERO,
+                    account: *account,
                 }
-            })?,
+            })?
         };
 
         balance
             .try_sub_assign(amount)
-            .map_err(|_| ExecutionError::InsufficientFunding { balance: *balance })?;
+            .map_err(|_| ExecutionError::InsufficientFunding {
+                balance: *balance,
+                account: *account,
+            })?;
 
-        match account {
-            AccountOwner::Chain => {}
-            other => {
-                if balance.is_zero() {
-                    self.balances.remove(other)?;
-                }
-            }
+        if account != &AccountOwner::CHAIN && balance.is_zero() {
+            self.balances.remove(account)?;
         }
 
         Ok(())
@@ -753,8 +627,8 @@ where
         &mut self,
         context: MessageContext,
         message: SystemMessage,
-    ) -> Result<RawExecutionOutcome<SystemMessage>, ExecutionError> {
-        let mut outcome = RawExecutionOutcome::default();
+    ) -> Result<Vec<OutgoingMessage>, ExecutionError> {
+        let mut outcome = Vec::new();
         use SystemMessage::*;
         match message {
             Credit {
@@ -763,15 +637,12 @@ where
                 target,
             } => {
                 let receiver = if context.is_bouncing { source } else { target };
-                match receiver {
-                    AccountOwner::Chain => {
-                        let new_balance = self.balance.get().saturating_add(amount);
-                        self.balance.set(new_balance);
-                    }
-                    other => {
-                        let balance = self.balances.get_mut_or_default(&other).await?;
-                        *balance = balance.saturating_add(amount);
-                    }
+                if receiver == AccountOwner::CHAIN {
+                    let new_balance = self.balance.get().saturating_add(amount);
+                    self.balance.set(new_balance);
+                } else {
+                    let balance = self.balances.get_mut_or_default(&receiver).await?;
+                    *balance = balance.saturating_add(amount);
                 }
             }
             Withdraw {
@@ -782,24 +653,21 @@ where
                 self.debit(&owner, amount).await?;
                 match recipient {
                     Recipient::Account(account) => {
-                        let message = RawOutgoingMessage {
-                            destination: Destination::Recipient(account.chain_id),
-                            authenticated: false,
-                            grant: Amount::ZERO,
-                            kind: MessageKind::Tracked,
-                            message: SystemMessage::Credit {
-                                amount,
-                                source: owner,
-                                target: account.owner,
-                            },
+                        let message = SystemMessage::Credit {
+                            amount,
+                            source: owner,
+                            target: account.owner,
                         };
-                        outcome.messages.push(message);
+                        outcome.push(
+                            OutgoingMessage::new(account.chain_id, message)
+                                .with_kind(MessageKind::Tracked),
+                        );
                     }
                     Recipient::Burn => (),
                 }
             }
             // These messages are executed immediately when cross-chain requests are received.
-            Subscribe { .. } | Unsubscribe { .. } | OpenChain(_) => {}
+            OpenChain(_) => {}
             // This message is only a placeholder: Its ID is part of the application ID.
             ApplicationCreated => {}
         }
@@ -857,7 +725,7 @@ where
         &mut self,
         config: OpenChainConfig,
         next_message_id: MessageId,
-    ) -> Result<RawOutgoingMessage<SystemMessage, Amount>, ExecutionError> {
+    ) -> Result<OutgoingMessage, ExecutionError> {
         let child_id = ChainId::child(next_message_id);
         ensure!(
             self.admin_id.get().as_ref() == Some(&config.admin_id),
@@ -874,39 +742,14 @@ where
                 epoch: config.epoch,
             }
         );
-        self.debit(&AccountOwner::Chain, config.balance).await?;
-        let open_chain_message = RawOutgoingMessage {
-            destination: Destination::Recipient(child_id),
-            authenticated: false,
-            grant: Amount::ZERO,
-            kind: MessageKind::Protected,
-            message: SystemMessage::OpenChain(config),
-        };
-        Ok(open_chain_message)
+        self.debit(&AccountOwner::CHAIN, config.balance).await?;
+        let message = SystemMessage::OpenChain(config);
+        Ok(OutgoingMessage::new(child_id, message).with_kind(MessageKind::Protected))
     }
 
-    pub async fn close_chain(
-        &mut self,
-        id: ChainId,
-    ) -> Result<Vec<RawOutgoingMessage<SystemMessage, Amount>>, ExecutionError> {
-        let mut messages = Vec::new();
-        // Unsubscribe from all channels.
-        self.subscriptions
-            .for_each_index(|subscription| {
-                let message = RawOutgoingMessage {
-                    destination: Destination::Recipient(subscription.chain_id),
-                    authenticated: false,
-                    grant: Amount::ZERO,
-                    kind: MessageKind::Protected,
-                    message: SystemMessage::Unsubscribe { id, subscription },
-                };
-                messages.push(message);
-                Ok(())
-            })
-            .await?;
-        self.subscriptions.clear();
+    pub async fn close_chain(&mut self) -> Result<(), ExecutionError> {
         self.closed.set(true);
-        Ok(messages)
+        Ok(())
     }
 
     pub async fn create_application(
@@ -915,7 +758,7 @@ where
         block_height: BlockHeight,
         module_id: ModuleId,
         parameters: Vec<u8>,
-        required_application_ids: Vec<UserApplicationId>,
+        required_application_ids: Vec<ApplicationId>,
         mut txn_tracker: TransactionTracker,
     ) -> Result<CreateApplicationResult, ExecutionError> {
         let application_index = txn_tracker.next_application_index();
@@ -929,7 +772,7 @@ where
         self.blob_used(Some(&mut txn_tracker), service_bytecode_blob_id)
             .await?;
 
-        let application_description = UserApplicationDescription {
+        let application_description = ApplicationDescription {
             module_id,
             creator_chain_id: chain_id,
             block_height,
@@ -943,14 +786,14 @@ where
         txn_tracker.add_created_blob(Blob::new_application_description(&application_description));
 
         Ok(CreateApplicationResult {
-            app_id: UserApplicationId::from(&application_description),
+            app_id: ApplicationId::from(&application_description),
             txn_tracker,
         })
     }
 
     async fn check_required_applications(
         &mut self,
-        application_description: &UserApplicationDescription,
+        application_description: &ApplicationDescription,
         mut txn_tracker: Option<&mut TransactionTracker>,
     ) -> Result<(), ExecutionError> {
         // Make sure that referenced applications IDs have been registered.
@@ -963,9 +806,9 @@ where
     /// Retrieves an application's description.
     pub async fn describe_application(
         &mut self,
-        id: UserApplicationId,
+        id: ApplicationId,
         mut txn_tracker: Option<&mut TransactionTracker>,
-    ) -> Result<UserApplicationDescription, ExecutionError> {
+    ) -> Result<ApplicationDescription, ExecutionError> {
         let blob_id = id.description_blob_id();
         let blob_content = match txn_tracker
             .as_ref()
@@ -975,7 +818,7 @@ where
             None => self.read_blob_content(blob_id).await?,
         };
         self.blob_used(txn_tracker.as_deref_mut(), blob_id).await?;
-        let description: UserApplicationDescription = bcs::from_bytes(blob_content.bytes())?;
+        let description: ApplicationDescription = bcs::from_bytes(blob_content.bytes())?;
 
         let (contract_bytecode_blob_id, service_bytecode_blob_id) =
             self.check_bytecode_blobs(&description.module_id).await?;
@@ -995,9 +838,9 @@ where
     /// Retrieves the recursive dependencies of applications and applies a topological sort.
     pub async fn find_dependencies(
         &mut self,
-        mut stack: Vec<UserApplicationId>,
+        mut stack: Vec<ApplicationId>,
         txn_tracker: &mut TransactionTracker,
-    ) -> Result<Vec<UserApplicationId>, ExecutionError> {
+    ) -> Result<Vec<ApplicationId>, ExecutionError> {
         // What we return at the end.
         let mut result = Vec::new();
         // The entries already inserted in `result`.

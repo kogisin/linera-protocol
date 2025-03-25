@@ -23,8 +23,7 @@ use linera_base::{
     data_types::*,
     hashed::Hashed,
     identifiers::{
-        Account, AccountOwner, ChainDescription, ChainId, Destination, EventId, MessageId, Owner,
-        StreamId,
+        Account, AccountOwner, ChainDescription, ChainId, Destination, EventId, MessageId, StreamId,
     },
     ownership::{ChainOwnership, TimeoutConfig},
 };
@@ -114,7 +113,7 @@ where
 /// Same as `init_worker` but also instantiates some initial chains.
 async fn init_worker_with_chains<S, I>(storage: S, balances: I) -> (Committee, WorkerState<S>)
 where
-    I: IntoIterator<Item = (ChainDescription, Owner, Amount)>,
+    I: IntoIterator<Item = (ChainDescription, AccountOwner, Amount)>,
     S: Storage + Clone + Send + Sync + 'static,
 {
     let (committee, worker) = init_worker(
@@ -141,7 +140,7 @@ where
 async fn init_worker_with_chain<S>(
     storage: S,
     description: ChainDescription,
-    owner: Owner,
+    owner: AccountOwner,
     balance: Amount,
 ) -> (Committee, WorkerState<S>)
 where
@@ -203,7 +202,7 @@ where
         chain_description,
         key_pair,
         Some(key_pair.public().into()),
-        AccountOwner::Chain,
+        AccountOwner::CHAIN,
         Recipient::chain(target_id),
         amount,
         incoming_bundles,
@@ -221,7 +220,7 @@ where
 async fn make_transfer_certificate<S>(
     chain_description: ChainDescription,
     key_pair: &AccountSecretKey,
-    authenticated_signer: Option<Owner>,
+    authenticated_signer: Option<AccountOwner>,
     source: AccountOwner,
     recipient: Recipient,
     amount: Amount,
@@ -253,11 +252,15 @@ where
     .await
 }
 
+/// Creates a certificate with a transfer.
+///
+/// This does not work for blocks with ancestors that sent a message to the same recipient, unless
+/// the `previous_confirmed_block` also did.
 #[expect(clippy::too_many_arguments)]
 async fn make_transfer_certificate_for_epoch<S>(
     chain_description: ChainDescription,
     key_pair: &AccountSecretKey,
-    authenticated_signer: Option<Owner>,
+    authenticated_signer: Option<AccountOwner>,
     source: AccountOwner,
     recipient: Recipient,
     amount: Amount,
@@ -341,9 +344,22 @@ where
         .take(block.operations.len())
         .collect();
     let state_hash = system_state.into_hash().await;
+    let previous_message_blocks = messages
+        .iter()
+        .flatten()
+        .flat_map(|message| message.destination.recipient())
+        .filter(|recipient| {
+            previous_confirmed_block
+                .iter()
+                .flat_map(|block| block.inner().block().body.messages.iter().flatten())
+                .any(|message| message.destination.recipient() == Some(*recipient))
+        })
+        .map(|recipient| (recipient, previous_confirmed_block.unwrap().hash()))
+        .collect();
     let value = Hashed::new(ConfirmedBlock::new(
         BlockExecutionOutcome {
             messages,
+            previous_message_blocks,
             events,
             blobs,
             state_hash,
@@ -372,28 +388,28 @@ fn direct_outgoing_message(
 
 fn system_credit_message(amount: Amount) -> Message {
     Message::System(SystemMessage::Credit {
-        source: AccountOwner::Chain,
-        target: AccountOwner::Chain,
+        source: AccountOwner::CHAIN,
+        target: AccountOwner::CHAIN,
         amount,
     })
 }
 
 fn direct_credit_message(recipient: ChainId, amount: Amount) -> OutgoingMessage {
     let message = SystemMessage::Credit {
-        source: AccountOwner::Chain,
-        target: AccountOwner::Chain,
+        source: AccountOwner::CHAIN,
+        target: AccountOwner::CHAIN,
         amount,
     };
     direct_outgoing_message(recipient, MessageKind::Tracked, message)
 }
 
-/// Creates `count` key pairs and returns them, sorted by the `Owner` created from their public key.
+/// Creates `count` key pairs and returns them, sorted by the `AccountOwner` created from their public key.
 fn generate_key_pairs(count: usize) -> Vec<AccountSecretKey> {
     let mut key_pairs = iter::repeat_with(Secp256k1SecretKey::generate)
         .map(AccountSecretKey::Secp256k1)
         .take(count)
         .collect::<Vec<_>>();
-    key_pairs.sort_by_key(|key_pair| Owner::from(key_pair.public()));
+    key_pairs.sort_by_key(|key_pair| AccountOwner::from(key_pair.public()));
     key_pairs
 }
 
@@ -793,6 +809,7 @@ where
                         Amount::from_tokens(2),
                     )],
                 ],
+                previous_message_blocks: BTreeMap::new(),
                 events: vec![Vec::new(); 2],
                 blobs: vec![Vec::new(); 2],
                 state_hash: SystemExecutionState {
@@ -824,6 +841,7 @@ where
                     ChainId::root(2),
                     Amount::from_tokens(3),
                 )]],
+                previous_message_blocks: BTreeMap::from([(ChainId::root(2), certificate0.hash())]),
                 events: vec![Vec::new()],
                 blobs: vec![Vec::new()],
                 state_hash: SystemExecutionState {
@@ -1060,6 +1078,7 @@ where
                         Vec::new(),
                         vec![direct_credit_message(ChainId::root(3), Amount::ONE)],
                     ],
+                    previous_message_blocks: BTreeMap::new(),
                     events: vec![Vec::new(); 2],
                     blobs: vec![Vec::new(); 2],
                     state_hash: SystemExecutionState {
@@ -1349,6 +1368,7 @@ where
     let value = Hashed::new(ConfirmedBlock::new(
         BlockExecutionOutcome {
             messages: vec![Vec::new()],
+            previous_message_blocks: BTreeMap::new(),
             events: vec![Vec::new()],
             blobs: vec![Vec::new()],
             state_hash: state.into_hash().await,
@@ -1390,7 +1410,7 @@ where
         ChainDescription::Root(2),
         &sender_key_pair,
         Some(chain_key_pair.public().into()),
-        AccountOwner::Chain,
+        AccountOwner::CHAIN,
         Recipient::chain(ChainId::root(2)),
         Amount::from_tokens(5),
         Vec::new(),
@@ -2088,17 +2108,17 @@ where
     B: StorageBuilder,
 {
     let sender_key_pair = AccountSecretKey::generate();
-    let sender = Owner::from(sender_key_pair.public());
+    let sender = AccountOwner::from(sender_key_pair.public());
     let sender_account = Account {
         chain_id: ChainId::root(1),
-        owner: AccountOwner::User(sender),
+        owner: sender,
     };
 
     let recipient_key_pair = AccountSecretKey::generate();
-    let recipient = Owner::from(sender_key_pair.public());
+    let recipient = AccountOwner::from(sender_key_pair.public());
     let recipient_account = Account {
         chain_id: ChainId::root(2),
-        owner: AccountOwner::User(recipient),
+        owner: recipient,
     };
 
     let (committee, worker) = init_worker_with_chains(
@@ -2123,8 +2143,8 @@ where
     let certificate00 = make_transfer_certificate(
         ChainDescription::Root(1),
         &sender_key_pair,
-        Some(Owner::from(sender_key_pair.public())),
-        AccountOwner::Chain,
+        Some(AccountOwner::from(sender_key_pair.public())),
+        AccountOwner::CHAIN,
         Recipient::Account(sender_account),
         Amount::from_tokens(5),
         Vec::new(),
@@ -2143,8 +2163,8 @@ where
     let certificate01 = make_transfer_certificate(
         ChainDescription::Root(1),
         &sender_key_pair,
-        Some(Owner::from(sender_key_pair.public())),
-        AccountOwner::Chain,
+        Some(AccountOwner::from(sender_key_pair.public())),
+        AccountOwner::CHAIN,
         Recipient::Burn,
         Amount::ONE,
         vec![IncomingBundle {
@@ -2155,8 +2175,8 @@ where
                 timestamp: Timestamp::from(0),
                 transaction_index: 0,
                 messages: vec![Message::System(SystemMessage::Credit {
-                    source: AccountOwner::Chain,
-                    target: AccountOwner::User(sender),
+                    source: AccountOwner::CHAIN,
+                    target: sender,
                     amount: Amount::from_tokens(5),
                 })
                 .to_posted(0, MessageKind::Tracked)],
@@ -2165,7 +2185,7 @@ where
         }],
         &committee,
         Amount::ZERO,
-        BTreeMap::from_iter([(sender.into(), Amount::from_tokens(5))]),
+        BTreeMap::from_iter([(sender, Amount::from_tokens(5))]),
         &worker,
         Some(&certificate00),
     )
@@ -2186,13 +2206,13 @@ where
         ChainDescription::Root(1),
         &sender_key_pair,
         Some(sender),
-        AccountOwner::User(sender),
+        sender,
         Recipient::Account(recipient_account),
         Amount::from_tokens(3),
         Vec::new(),
         &committee,
         Amount::ZERO,
-        BTreeMap::from_iter([(sender.into(), Amount::from_tokens(2))]),
+        BTreeMap::from_iter([(sender, Amount::from_tokens(2))]),
         &worker,
         Some(&certificate01),
     )
@@ -2206,7 +2226,7 @@ where
         ChainDescription::Root(1),
         &sender_key_pair,
         Some(sender),
-        AccountOwner::User(sender),
+        sender,
         Recipient::Account(recipient_account),
         Amount::from_tokens(2),
         Vec::new(),
@@ -2227,7 +2247,7 @@ where
         ChainDescription::Root(2),
         &recipient_key_pair,
         Some(recipient),
-        AccountOwner::User(recipient),
+        recipient,
         Recipient::Burn,
         Amount::ONE,
         vec![
@@ -2239,8 +2259,8 @@ where
                     timestamp: Timestamp::from(0),
                     transaction_index: 0,
                     messages: vec![Message::System(SystemMessage::Credit {
-                        source: AccountOwner::User(sender),
-                        target: AccountOwner::User(recipient),
+                        source: sender,
+                        target: recipient,
                         amount: Amount::from_tokens(3),
                     })
                     .to_posted(0, MessageKind::Tracked)],
@@ -2255,8 +2275,8 @@ where
                     timestamp: Timestamp::from(0),
                     transaction_index: 0,
                     messages: vec![Message::System(SystemMessage::Credit {
-                        source: AccountOwner::User(sender),
-                        target: AccountOwner::User(recipient),
+                        source: sender,
+                        target: recipient,
                         amount: Amount::from_tokens(2),
                     })
                     .to_posted(0, MessageKind::Tracked)],
@@ -2266,7 +2286,7 @@ where
         ],
         &committee,
         Amount::ZERO,
-        BTreeMap::from_iter([(recipient.into(), Amount::from_tokens(1))]),
+        BTreeMap::from_iter([(recipient, Amount::from_tokens(1))]),
         &worker,
         None,
     )
@@ -2287,7 +2307,7 @@ where
         ChainDescription::Root(1),
         &sender_key_pair,
         Some(sender),
-        AccountOwner::User(sender),
+        sender,
         Recipient::Burn,
         Amount::from_tokens(3),
         vec![IncomingBundle {
@@ -2298,8 +2318,8 @@ where
                 timestamp: Timestamp::from(0),
                 transaction_index: 0,
                 messages: vec![Message::System(SystemMessage::Credit {
-                    source: AccountOwner::User(sender),
-                    target: AccountOwner::User(recipient),
+                    source: sender,
+                    target: recipient,
                     amount: Amount::from_tokens(3),
                 })
                 .to_posted(0, MessageKind::Bouncing)],
@@ -2373,6 +2393,7 @@ where
                         application_permissions: Default::default(),
                     }),
                 )]],
+                previous_message_blocks: BTreeMap::new(),
                 events: vec![Vec::new()],
                 blobs: vec![Vec::new()],
                 state_hash: SystemExecutionState {
@@ -2442,6 +2463,7 @@ where
                     vec![],
                     vec![direct_credit_message(user_id, Amount::from_tokens(2))],
                 ],
+                previous_message_blocks: BTreeMap::from([(user_id, certificate0.hash())]),
                 events: vec![
                     vec![Event {
                         stream_id: event_id.stream_id.clone(),
@@ -2488,16 +2510,6 @@ where
             *user_chain.execution_state.system.admin_id.get(),
             Some(admin_id)
         );
-        assert_eq!(
-            user_chain
-                .execution_state
-                .system
-                .subscriptions
-                .indices()
-                .await?
-                .len(),
-            0
-        );
         user_chain.validate_incoming_bundles().await?;
         matches!(
             &user_chain
@@ -2524,6 +2536,7 @@ where
         Hashed::new(ConfirmedBlock::new(
             BlockExecutionOutcome {
                 messages: vec![Vec::new(); 3],
+                previous_message_blocks: BTreeMap::new(),
                 events: vec![Vec::new(); 3],
                 blobs: vec![Vec::new(); 3],
                 state_hash: SystemExecutionState {
@@ -2606,16 +2619,6 @@ where
             *user_chain.execution_state.system.admin_id.get(),
             Some(admin_id)
         );
-        assert_eq!(
-            user_chain
-                .execution_state
-                .system
-                .subscriptions
-                .indices()
-                .await?
-                .len(),
-            0
-        );
         assert_eq!(user_chain.execution_state.system.committees.get().len(), 2);
         user_chain.validate_incoming_bundles().await?;
         Ok(())
@@ -2654,6 +2657,7 @@ where
         Hashed::new(ConfirmedBlock::new(
             BlockExecutionOutcome {
                 messages: vec![vec![direct_credit_message(admin_id, Amount::ONE)]],
+                previous_message_blocks: BTreeMap::new(),
                 events: vec![Vec::new()],
                 blobs: vec![Vec::new()],
                 state_hash: SystemExecutionState {
@@ -2688,6 +2692,7 @@ where
         Hashed::new(ConfirmedBlock::new(
             BlockExecutionOutcome {
                 messages: vec![vec![]],
+                previous_message_blocks: BTreeMap::new(),
                 events: vec![vec![Event {
                     stream_id: StreamId::system(NEW_EPOCH_STREAM_NAME),
                     key: bcs::to_bytes(&Epoch::from(1)).unwrap(),
@@ -2793,6 +2798,7 @@ where
         Hashed::new(ConfirmedBlock::new(
             BlockExecutionOutcome {
                 messages: vec![vec![direct_credit_message(admin_id, Amount::ONE)]],
+                previous_message_blocks: BTreeMap::new(),
                 events: vec![Vec::new()],
                 blobs: vec![Vec::new()],
                 state_hash: SystemExecutionState {
@@ -2824,6 +2830,7 @@ where
         Hashed::new(ConfirmedBlock::new(
             BlockExecutionOutcome {
                 messages: vec![vec![]; 2],
+                previous_message_blocks: BTreeMap::new(),
                 events: vec![
                     vec![Event {
                         stream_id: StreamId::system(NEW_EPOCH_STREAM_NAME),
@@ -2899,6 +2906,7 @@ where
         Hashed::new(ConfirmedBlock::new(
             BlockExecutionOutcome {
                 messages: vec![Vec::new()],
+                previous_message_blocks: BTreeMap::new(),
                 events: vec![Vec::new()],
                 blobs: vec![Vec::new()],
                 state_hash: SystemExecutionState {
@@ -2983,7 +2991,7 @@ async fn test_cross_chain_helper() -> anyhow::Result<()> {
         ChainDescription::Root(0),
         &key_pair0,
         Some(key_pair0.public().into()),
-        AccountOwner::Chain,
+        AccountOwner::CHAIN,
         Recipient::chain(id1),
         Amount::ONE,
         Vec::new(),
@@ -2999,7 +3007,7 @@ async fn test_cross_chain_helper() -> anyhow::Result<()> {
         ChainDescription::Root(0),
         &key_pair0,
         Some(key_pair0.public().into()),
-        AccountOwner::Chain,
+        AccountOwner::CHAIN,
         Recipient::chain(id1),
         Amount::ONE,
         Vec::new(),
@@ -3015,7 +3023,7 @@ async fn test_cross_chain_helper() -> anyhow::Result<()> {
         ChainDescription::Root(0),
         &key_pair0,
         Some(key_pair0.public().into()),
-        AccountOwner::Chain,
+        AccountOwner::CHAIN,
         Recipient::chain(id1),
         Amount::ONE,
         Vec::new(),
@@ -3032,7 +3040,7 @@ async fn test_cross_chain_helper() -> anyhow::Result<()> {
         ChainDescription::Root(0),
         &key_pair0,
         Some(key_pair0.public().into()),
-        AccountOwner::Chain,
+        AccountOwner::CHAIN,
         Recipient::chain(id1),
         Amount::ONE,
         Vec::new(),
@@ -3193,8 +3201,8 @@ where
     let clock = storage_builder.clock();
     let chain_id = ChainId::root(0);
     let key_pairs = generate_key_pairs(2);
-    let owner0 = Owner::from(key_pairs[0].public());
-    let owner1 = Owner::from(key_pairs[1].public());
+    let owner0 = AccountOwner::from(key_pairs[0].public());
+    let owner1 = AccountOwner::from(key_pairs[1].public());
     let balances = vec![(ChainDescription::Root(0), owner0, Amount::from_tokens(2))];
     let (committee, worker) = init_worker_with_chains(storage, balances).await;
 
@@ -3208,7 +3216,7 @@ where
             timeout_config: TimeoutConfig::default(),
         })
         .with_authenticated_signer(Some(owner0));
-    let (executed_block0, _) = worker.stage_block_execution(block0, None).await?;
+    let (executed_block0, _) = worker.stage_block_execution(block0, None, vec![]).await?;
     let value0 = Hashed::new(ConfirmedBlock::new(executed_block0));
     let certificate0 = make_certificate(&committee, &worker, value0.clone());
     let response = worker
@@ -3257,7 +3265,9 @@ where
 
     // Now owner 0 can propose a block, but owner 1 can't.
     let block1 = make_child_block(&value0.clone());
-    let (executed_block1, _) = worker.stage_block_execution(block1.clone(), None).await?;
+    let (executed_block1, _) = worker
+        .stage_block_execution(block1.clone(), None, vec![])
+        .await?;
     let proposal1_wrong_owner = block1
         .clone()
         .with_authenticated_signer(Some(owner1))
@@ -3296,7 +3306,9 @@ where
     // Create block2, also at height 1, but different from block 1.
     let amount = Amount::from_tokens(1);
     let block2 = make_child_block(&value0.clone()).with_simple_transfer(ChainId::root(1), amount);
-    let (executed_block2, _) = worker.stage_block_execution(block2.clone(), None).await?;
+    let (executed_block2, _) = worker
+        .stage_block_execution(block2.clone(), None, vec![])
+        .await?;
 
     // Since round 3 is already over, the validator won't vote for a validated block from round 3.
     let value2 = Hashed::new(ValidatedBlock::new(executed_block2.clone()));
@@ -3393,8 +3405,8 @@ where
     let clock = storage_builder.clock();
     let chain_id = ChainId::root(0);
     let key_pairs = generate_key_pairs(2);
-    let owner0 = Owner::from(key_pairs[0].public());
-    let owner1 = Owner::from(key_pairs[1].public());
+    let owner0 = AccountOwner::from(key_pairs[0].public());
+    let owner1 = AccountOwner::from(key_pairs[1].public());
     let balances = vec![(ChainDescription::Root(0), owner0, Amount::from_tokens(2))];
     let (committee, worker) = init_worker_with_chains(storage, balances).await;
 
@@ -3409,7 +3421,7 @@ where
             ..TimeoutConfig::default()
         },
     });
-    let (executed_block0, _) = worker.stage_block_execution(block0, None).await?;
+    let (executed_block0, _) = worker.stage_block_execution(block0, None, vec![]).await?;
     let value0 = Hashed::new(ConfirmedBlock::new(executed_block0));
     let certificate0 = make_certificate(&committee, &worker, value0.clone());
     let response = worker
@@ -3499,7 +3511,7 @@ where
             },
         });
     let (change_ownership_executed_block, _) = worker
-        .stage_block_execution(change_ownership_block, None)
+        .stage_block_execution(change_ownership_block, None, vec![])
         .await?;
     let change_ownership_value = Hashed::new(ConfirmedBlock::new(change_ownership_executed_block));
     let change_ownership_certificate =
@@ -3511,7 +3523,7 @@ where
     // The first round is the multi-leader round 0. Anyone is allowed to propose.
     // But non-owners are not allowed to transfer the chain's funds.
     let proposal = make_child_block(&change_ownership_value)
-        .with_transfer(AccountOwner::Chain, Recipient::Burn, Amount::from_tokens(1))
+        .with_transfer(AccountOwner::CHAIN, Recipient::Burn, Amount::from_tokens(1))
         .into_proposal_with_round(&AccountSecretKey::generate(), Round::MultiLeader(0));
     let result = worker.handle_block_proposal(proposal).await;
     assert_matches!(result, Err(WorkerError::ChainError(error)) if matches!(&*error,
@@ -3523,7 +3535,7 @@ where
     let proposal = make_child_block(&change_ownership_value)
         .into_proposal_with_round(&AccountSecretKey::generate(), Round::MultiLeader(0));
     let (executed_block, _) = worker
-        .stage_block_execution(proposal.content.block.clone(), None)
+        .stage_block_execution(proposal.content.block.clone(), None, vec![])
         .await?;
     let value = Hashed::new(ConfirmedBlock::new(executed_block));
     let (response, _) = worker.handle_block_proposal(proposal).await?;
@@ -3546,8 +3558,8 @@ where
     let clock = storage_builder.clock();
     let chain_id = ChainId::root(0);
     let key_pairs = generate_key_pairs(2);
-    let owner0 = Owner::from(key_pairs[0].public());
-    let owner1 = Owner::from(key_pairs[1].public());
+    let owner0 = AccountOwner::from(key_pairs[0].public());
+    let owner1 = AccountOwner::from(key_pairs[1].public());
     let balances = vec![(ChainDescription::Root(0), owner0, Amount::from_tokens(2))];
     let (committee, worker) = init_worker_with_chains(storage, balances).await;
 
@@ -3562,7 +3574,7 @@ where
             ..TimeoutConfig::default()
         },
     });
-    let (executed_block0, _) = worker.stage_block_execution(block0, None).await?;
+    let (executed_block0, _) = worker.stage_block_execution(block0, None, vec![]).await?;
     let value0 = Hashed::new(ConfirmedBlock::new(executed_block0));
     let certificate0 = make_certificate(&committee, &worker, value0.clone());
     let response = worker
@@ -3578,7 +3590,9 @@ where
     let proposal1 = block1
         .clone()
         .into_proposal_with_round(&key_pairs[0], Round::Fast);
-    let (executed_block1, _) = worker.stage_block_execution(block1.clone(), None).await?;
+    let (executed_block1, _) = worker
+        .stage_block_execution(block1.clone(), None, vec![])
+        .await?;
     let value1 = Hashed::new(ConfirmedBlock::new(executed_block1));
     let (response, _) = worker.handle_block_proposal(proposal1).await?;
     let vote = response.info.manager.pending.as_ref().unwrap();
@@ -3624,7 +3638,9 @@ where
     worker.handle_block_proposal(proposal3).await?;
 
     // A validated block certificate from a later round can override the locked fast block.
-    let (executed_block2, _) = worker.stage_block_execution(block2.clone(), None).await?;
+    let (executed_block2, _) = worker
+        .stage_block_execution(block2.clone(), None, vec![])
+        .await?;
     let value2 = Hashed::new(ValidatedBlock::new(executed_block2.clone()));
     let certificate2 =
         make_certificate_with_round(&committee, &worker, value2.clone(), Round::MultiLeader(0));
@@ -3679,7 +3695,7 @@ where
     let block = make_first_block(chain_id)
         .with_simple_transfer(chain_id, Amount::ONE)
         .with_authenticated_signer(Some(key_pair.public().into()));
-    let (executed_block, _) = worker.stage_block_execution(block, None).await?;
+    let (executed_block, _) = worker.stage_block_execution(block, None, vec![]).await?;
     let value = Hashed::new(ConfirmedBlock::new(executed_block));
     let certificate = make_certificate(&committee, &worker, value);
     worker
@@ -3706,7 +3722,7 @@ where
     let manager = response.info.manager;
     let account_key = worker.account_key();
     assert_eq!(manager.current_round, Round::Validator(0));
-    assert_eq!(manager.leader, Some(Owner::from(account_key)));
+    assert_eq!(manager.leader, Some(AccountOwner::from(account_key)));
     Ok(())
 }
 
@@ -3937,6 +3953,7 @@ where
     let value = Hashed::new(ConfirmedBlock::new(
         BlockExecutionOutcome {
             messages: vec![],
+            previous_message_blocks: BTreeMap::new(),
             events: vec![],
             blobs: vec![],
             state_hash: state.crypto_hash_mut().await?,

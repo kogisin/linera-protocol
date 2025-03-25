@@ -77,7 +77,9 @@ impl Contract for MatchingEngineContract {
             Operation::ExecuteOrder { order } => {
                 let owner = Self::get_owner(&order);
                 let chain_id = self.runtime.chain_id();
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for ExecuteOrder operation");
                 if chain_id == self.runtime.application_creator_chain_id() {
                     self.execute_order_local(order, chain_id).await;
                 } else {
@@ -119,7 +121,9 @@ impl Contract for MatchingEngineContract {
                     .runtime
                     .message_id()
                     .expect("Incoming message ID has to be available when executing a message");
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for ExecuteOrder message");
                 self.execute_order_local(order, message_id.chain_id).await;
             }
         }
@@ -149,29 +153,6 @@ impl MatchingEngineContract {
         }
     }
 
-    /// authenticate the originator of the message
-    fn check_account_authentication(&mut self, owner: AccountOwner) {
-        match owner {
-            AccountOwner::User(address) => {
-                assert_eq!(
-                    self.runtime.authenticated_signer(),
-                    Some(address),
-                    "Unauthorized"
-                )
-            }
-            AccountOwner::Application(id) => {
-                assert_eq!(
-                    self.runtime.authenticated_caller_id(),
-                    Some(id),
-                    "Unauthorized"
-                )
-            }
-            AccountOwner::Chain => {
-                panic!("Chain account is not supported")
-            }
-        }
-    }
-
     /// The application engine is trading between two tokens. Those tokens are the parameters of the
     /// construction of the exchange and are accessed by index in the system.
     fn fungible_id(&mut self, token_idx: u32) -> ApplicationId<FungibleTokenAbi> {
@@ -188,7 +169,7 @@ impl MatchingEngineContract {
     ) {
         let destination = Account {
             chain_id: self.runtime.chain_id(),
-            owner: AccountOwner::Application(self.runtime.application_id().forget_abi()),
+            owner: self.runtime.application_id().into(),
         };
         let (amount, token_idx) = Self::get_amount_idx(nature, price, amount);
         self.transfer(*owner, amount, destination, token_idx)
@@ -197,7 +178,7 @@ impl MatchingEngineContract {
     /// Transfers `amount` tokens from the funds in custody to the `destination`.
     fn send_to(&mut self, transfer: Transfer) {
         let destination = transfer.account;
-        let owner_app = AccountOwner::Application(self.runtime.application_id().forget_abi());
+        let owner_app = self.runtime.application_id().into();
         self.transfer(owner_app, transfer.amount, destination, transfer.token_idx);
     }
 

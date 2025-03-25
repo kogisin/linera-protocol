@@ -13,12 +13,14 @@ use linera_base::{
     data_types::{
         Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, Timestamp,
     },
-    http,
+    ensure, http,
     identifiers::{
         Account, AccountOwner, ApplicationId, ChainId, ChannelName, Destination, MessageId,
-        ModuleId, Owner, StreamName,
+        ModuleId, StreamName,
     },
-    ownership::{ChainOwnership, ChangeApplicationPermissionsError, CloseChainError},
+    ownership::{
+        AccountPermissionError, ChainOwnership, ChangeApplicationPermissionsError, CloseChainError,
+    },
 };
 use serde::Serialize;
 
@@ -41,7 +43,7 @@ where
     application_id: Option<ApplicationId<Application::Abi>>,
     application_creator_chain_id: Option<ChainId>,
     chain_id: Option<ChainId>,
-    authenticated_signer: Option<Option<Owner>>,
+    authenticated_signer: Option<Option<AccountOwner>>,
     block_height: Option<BlockHeight>,
     round: Option<u32>,
     message_id: Option<Option<MessageId>>,
@@ -221,7 +223,7 @@ where
     /// Configures the authenticated signer to return during the test.
     pub fn with_authenticated_signer(
         mut self,
-        authenticated_signer: impl Into<Option<Owner>>,
+        authenticated_signer: impl Into<Option<AccountOwner>>,
     ) -> Self {
         self.authenticated_signer = Some(authenticated_signer.into());
         self
@@ -230,14 +232,14 @@ where
     /// Configures the authenticated signer to return during the test.
     pub fn set_authenticated_signer(
         &mut self,
-        authenticated_signer: impl Into<Option<Owner>>,
+        authenticated_signer: impl Into<Option<AccountOwner>>,
     ) -> &mut Self {
         self.authenticated_signer = Some(authenticated_signer.into());
         self
     }
 
     /// Returns the authenticated signer for this execution, if there is one.
-    pub fn authenticated_signer(&mut self) -> Option<Owner> {
+    pub fn authenticated_signer(&mut self) -> Option<AccountOwner> {
         self.authenticated_signer.expect(
             "Authenticated signer has not been mocked, \
             please call `MockContractRuntime::set_authenticated_signer` first",
@@ -349,6 +351,19 @@ where
             "Authenticated caller ID has not been mocked, \
             please call `MockContractRuntime::set_authenticated_caller_id` first",
         )
+    }
+
+    /// Verifies that the current execution context authorizes operations on a given account.
+    pub fn check_account_permission(
+        &mut self,
+        owner: AccountOwner,
+    ) -> Result<(), AccountPermissionError> {
+        ensure!(
+            self.authenticated_signer() == Some(owner)
+                || self.authenticated_caller_id().map(AccountOwner::from) == Some(owner),
+            AccountPermissionError::NotPermitted(owner)
+        );
+        Ok(())
     }
 
     /// Configures the system time to return during the test.
@@ -515,9 +530,10 @@ where
     /// Debits an `amount` of native tokens from a `source` owner account (or the current
     /// chain's balance).
     fn debit(&mut self, source: AccountOwner, amount: Amount) {
-        let source_balance = match source {
-            AccountOwner::Application(_) | AccountOwner::User(_) => self.owner_balance_mut(source),
-            AccountOwner::Chain => self.chain_balance_mut(),
+        let source_balance = if source == AccountOwner::CHAIN {
+            self.chain_balance_mut()
+        } else {
+            self.owner_balance_mut(source)
         };
 
         *source_balance = source_balance
@@ -528,11 +544,10 @@ where
     /// Credits an `amount` of native tokens into a `destination` owner account (or the
     /// current chain's balance).
     fn credit(&mut self, destination: AccountOwner, amount: Amount) {
-        let destination_balance = match destination {
-            owner @ AccountOwner::Application(_) | owner @ AccountOwner::User(_) => {
-                self.owner_balance_mut(owner)
-            }
-            AccountOwner::Chain => self.chain_balance_mut(),
+        let destination_balance = if destination == AccountOwner::CHAIN {
+            self.chain_balance_mut()
+        } else {
+            self.owner_balance_mut(destination)
         };
 
         *destination_balance = destination_balance

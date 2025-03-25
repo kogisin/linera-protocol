@@ -35,7 +35,7 @@ use linera_base::{
 use linera_chain::data_types::{Medium, Origin};
 use linera_core::worker::{Notification, Reason};
 use linera_sdk::{
-    linera_base_types::{BlobContent, BlockHeight, Owner},
+    linera_base_types::{BlobContent, BlockHeight},
     DataBlobHash,
 };
 #[cfg(any(
@@ -84,8 +84,7 @@ fn test_iterations() -> Option<usize> {
 }
 
 fn get_fungible_account_owner(client: &ClientWrapper) -> AccountOwner {
-    let owner = client.get_owner().unwrap();
-    AccountOwner::User(owner)
+    client.get_owner().unwrap()
 }
 
 struct FungibleApp(ApplicationWrapper<fungible::FungibleTokenAbi>);
@@ -405,7 +404,7 @@ async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()>
     let query = hex::encode(&query);
     let query = format!("query {{ v{} }}", query);
 
-    let result = application.raw_query(query).await?;
+    let result = application.run_graphql_query(query).await?;
     let result = result.to_string();
     let result = hex::decode(&result[1..result.len() - 1])?;
 
@@ -417,14 +416,14 @@ async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()>
     let mutation = hex::encode(&mutation);
     let mutation = format!("mutation {{ v{} }}", mutation);
 
-    application.raw_query(mutation).await?;
+    application.run_graphql_query(mutation).await?;
 
     let query = get_valueCall {};
     let query = query.abi_encode();
     let query = hex::encode(&query);
     let query = format!("query {{ v{} }}", query);
 
-    let result = application.raw_query(query).await?;
+    let result = application.run_graphql_query(query).await?;
     let result = result.to_string();
     let result = hex::decode(&result[1..result.len() - 1])?;
 
@@ -439,6 +438,7 @@ async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()>
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(all(feature = "rocksdb", feature = "scylladb"), test_case(LocalNetConfig::new_test(Database::DualRocksDbScyllaDb, Network::Grpc) ; "dualrocksdbscylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
@@ -482,6 +482,65 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
 
     let counter_value: u64 = application.query_json("value").await?;
     assert_eq!(counter_value, original_counter_value + increment);
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_end_to_end_counter_no_graphql(config: impl LineraNetConfig) -> Result<()> {
+    use counter_no_graphql::{CounterNoGraphQlAbi, CounterRequest};
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+
+    let original_counter_value = 35;
+    let increment = 5;
+
+    let chain = client.load_wallet()?.default_chain().unwrap();
+    let (contract, service) = client.build_example("counter-no-graphql").await?;
+
+    let application_id = client
+        .publish_and_create::<CounterNoGraphQlAbi, (), u64>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &original_counter_value,
+            &[],
+            None,
+        )
+        .await?;
+    let port = get_node_port().await;
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let application = node_service
+        .make_application(&chain, &application_id)
+        .await?;
+
+    let query = CounterRequest::Query;
+    let read_counter_value = application.run_json_query(&query).await?;
+    let mut counter_value = original_counter_value;
+    assert_eq!(read_counter_value, counter_value);
+
+    // executing a query that mutates the state
+
+    let query_increment = CounterRequest::Increment(increment);
+    application.run_json_query(&query_increment).await?;
+
+    let read_counter_value = application.run_json_query(&query).await?;
+    counter_value += increment;
+    assert_eq!(read_counter_value, counter_value);
 
     node_service.ensure_is_running()?;
 
@@ -845,7 +904,7 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
         let wallet = client1.load_wallet()?;
         let user_chain = wallet.get(chain2).unwrap();
         let public_key = user_chain.key_pair.as_ref().unwrap().public();
-        AccountOwner::User(public_key.into())
+        AccountOwner::from(public_key)
     };
     // The initial accounts on chain1
     let accounts = BTreeMap::from([
@@ -1618,6 +1677,7 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(all(feature = "rocksdb", feature = "scylladb"), test_case(LocalNetConfig::new_test(Database::DualRocksDbScyllaDb, Network::Grpc) ; "dualrocksdbscylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
@@ -1837,7 +1897,7 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         )
         .await?;
 
-    let owner_amm_app = AccountOwner::Application(application_id_amm.forget_abi());
+    let owner_amm_app = application_id_amm.into();
 
     // Create AMM wrappers
     let app_amm = AmmApp(
@@ -2368,7 +2428,7 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
     let (mut net, client) = config.instantiate().await?;
 
     let chain1 = client.load_wallet()?.default_chain().unwrap();
-    let owner1 = Owner::from(
+    let owner1 = AccountOwner::from(
         client
             .load_wallet()?
             .get(chain1)

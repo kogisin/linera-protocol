@@ -178,6 +178,7 @@ async fn get_chain(node: &str, chain_id: ChainId) -> Result<Chain> {
         channels_input: None,
         inboxes_input: None,
         outboxes_input: None,
+        previous_message_blocks_input: None,
     };
     let chain = request::<gql_service::Chain, _>(&client, node, variables)
         .await?
@@ -312,7 +313,7 @@ async fn applications(node: &str, chain_id: ChainId) -> Result<(Page, String)> {
     ))
 }
 
-/// Returns the applications page.
+/// Returns the operations page.
 async fn operations(indexer: &str, chain_id: ChainId) -> Result<(Page, String)> {
     let operations = get_operations(indexer, chain_id).await?;
     Ok((

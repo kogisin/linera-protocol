@@ -15,11 +15,11 @@ use linera_base::crypto::AccountPublicKey;
 use linera_base::{
     crypto::{AccountSecretKey, CryptoError, CryptoHash, ValidatorPublicKey, ValidatorSecretKey},
     data_types::{
-        ArithmeticError, Blob, BlockHeight, DecompressionError, Round, UserApplicationDescription,
+        ApplicationDescription, ArithmeticError, Blob, BlockHeight, DecompressionError, Round,
     },
     doc_scalar,
     hashed::Hashed,
-    identifiers::{BlobId, ChainId, EventId, Owner, UserApplicationId},
+    identifiers::{AccountOwner, ApplicationId, BlobId, ChainId, EventId},
     time::timer::{sleep, timeout},
 };
 use linera_chain::{
@@ -165,7 +165,7 @@ pub enum WorkerError {
     InvalidOwner,
 
     #[error("Operations in the block are not authenticated by the proper signer: {0}")]
-    InvalidSigner(Owner),
+    InvalidSigner(AccountOwner),
 
     // Chaining
     #[error(
@@ -500,11 +500,13 @@ where
         &self,
         block: ProposedBlock,
         round: Option<u32>,
+        published_blobs: Vec<Blob>,
     ) -> Result<(ExecutedBlock, ChainInfoResponse), WorkerError> {
         self.query_chain_worker(block.chain_id, move |callback| {
             ChainWorkerRequest::StageBlockExecution {
                 block,
                 round,
+                published_blobs,
                 callback,
             }
         })
@@ -528,8 +530,8 @@ where
     pub async fn describe_application(
         &self,
         chain_id: ChainId,
-        application_id: UserApplicationId,
-    ) -> Result<UserApplicationDescription, WorkerError> {
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, WorkerError> {
         self.query_chain_worker(chain_id, move |callback| {
             ChainWorkerRequest::DescribeApplication {
                 application_id,
@@ -606,7 +608,7 @@ where
         origin: Origin,
         recipient: ChainId,
         bundles: Vec<(Epoch, MessageBundle)>,
-    ) -> Result<Option<(BlockHeight, NetworkActions)>, WorkerError> {
+    ) -> Result<Option<BlockHeight>, WorkerError> {
         self.query_chain_worker(recipient, move |callback| {
             ChainWorkerRequest::ProcessCrossChainUpdate {
                 origin,
@@ -986,11 +988,10 @@ where
                 let mut actions = NetworkActions::default();
                 for (medium, bundles) in bundle_vecs {
                     let origin = Origin { sender, medium };
-                    if let Some((height, new_actions)) = self
+                    if let Some(height) = self
                         .process_cross_chain_update(origin.clone(), recipient, bundles)
                         .await?
                     {
-                        actions.extend(new_actions);
                         height_by_origin.push((origin, height));
                     }
                 }
