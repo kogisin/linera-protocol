@@ -4,7 +4,6 @@
 //! This module manages the execution of the system application and the user applications in a
 //! Linera chain.
 
-#![cfg_attr(web, feature(trait_upcasting))]
 #![deny(clippy::large_futures)]
 
 pub mod committee;
@@ -78,8 +77,6 @@ pub use crate::{
     transaction_tracker::{TransactionOutcome, TransactionTracker},
 };
 
-/// The maximum length of an event key in bytes.
-const MAX_EVENT_KEY_LEN: usize = 64;
 /// The maximum length of a stream name.
 const MAX_STREAM_NAME_LEN: usize = 64;
 
@@ -263,8 +260,6 @@ pub enum ExecutionError {
         local_time: Timestamp,
     },
 
-    #[error("Event keys can be at most {MAX_EVENT_KEY_LEN} bytes.")]
-    EventKeyTooLong,
     #[error("Stream names can be at most {MAX_STREAM_NAME_LEN} bytes.")]
     StreamNameTooLong,
     #[error("Blob exceeds size limit")]
@@ -330,6 +325,8 @@ pub enum ExecutionError {
     InactiveChain,
     #[error("No recorded response for oracle query")]
     MissingOracleResponse,
+    #[error("Internal error: {0}")]
+    InternalError(&'static str),
 }
 
 impl From<ViewError> for ExecutionError {
@@ -731,13 +728,8 @@ pub trait ContractRuntime: BaseRuntime {
         argument: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError>;
 
-    /// Adds a new item to an event stream.
-    fn emit(
-        &mut self,
-        name: StreamName,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    ) -> Result<(), ExecutionError>;
+    /// Adds a new item to an event stream. Returns the new event's index in the stream.
+    fn emit(&mut self, name: StreamName, value: Vec<u8>) -> Result<u32, ExecutionError>;
 
     /// Queries a service.
     fn query_service(
@@ -793,7 +785,7 @@ pub enum Operation {
     },
 }
 
-impl<'de> BcsHashable<'de> for Operation {}
+impl BcsHashable<'_> for Operation {}
 
 /// A message to be sent and possibly executed in the receiver's block.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
@@ -948,7 +940,7 @@ pub struct OutgoingMessage {
     pub message: Message,
 }
 
-impl<'de> BcsHashable<'de> for OutgoingMessage {}
+impl BcsHashable<'_> for OutgoingMessage {}
 
 impl OutgoingMessage {
     /// Creates a new simple outgoing message with no grant and no authenticated signer.
@@ -1296,10 +1288,6 @@ pub enum WasmRuntime {
     #[cfg_attr(not(with_wasmer), default)]
     #[display("wasmtime")]
     Wasmtime,
-    #[cfg(with_wasmer)]
-    WasmerWithSanitizer,
-    #[cfg(with_wasmtime)]
-    WasmtimeWithSanitizer,
 }
 
 #[derive(Clone, Copy, Display)]
@@ -1314,19 +1302,6 @@ pub enum EvmRuntime {
 /// Trait used to select a default `WasmRuntime`, if one is available.
 pub trait WithWasmDefault {
     fn with_wasm_default(self) -> Self;
-}
-
-impl WasmRuntime {
-    pub fn needs_sanitizer(self) -> bool {
-        match self {
-            #[cfg(with_wasmer)]
-            WasmRuntime::WasmerWithSanitizer => true,
-            #[cfg(with_wasmtime)]
-            WasmRuntime::WasmtimeWithSanitizer => true,
-            #[cfg(with_wasm_runtime)]
-            _ => false,
-        }
-    }
 }
 
 impl WithWasmDefault for Option<WasmRuntime> {

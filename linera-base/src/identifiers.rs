@@ -523,8 +523,8 @@ pub struct EventId {
     pub chain_id: ChainId,
     /// The ID of the stream this event belongs to.
     pub stream_id: StreamId,
-    /// The event key.
-    pub key: Vec<u8>,
+    /// The event index, i.e. the number of events in the stream before this one.
+    pub index: u32,
 }
 
 /// The destination of a message, relative to a particular application.
@@ -1034,7 +1034,7 @@ impl ChainId {
     }
 }
 
-impl<'de> BcsHashable<'de> for ChainDescription {}
+impl BcsHashable<'_> for ChainDescription {}
 
 bcs_scalar!(ApplicationId, "A unique identifier for a user application");
 doc_scalar!(

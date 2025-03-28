@@ -584,7 +584,8 @@ where
         // Timestamp older than previous one
         assert_matches!(
             worker.handle_block_proposal(block_proposal).await,
-            Err(WorkerError::ChainError(error)) if matches!(*error, ChainError::InvalidBlockTimestamp {..})
+            Err(WorkerError::ChainError(error))
+                if matches!(*error, ChainError::InvalidBlockTimestamp)
         );
     }
     Ok(())
@@ -1353,15 +1354,17 @@ where
             height: BlockHeight::ZERO,
             timestamp: Timestamp::from(0),
             transaction_index: 0,
-            messages: vec![Message::System(SystemMessage::OpenChain(OpenChainConfig {
-                ownership,
-                admin_id,
-                epoch,
-                committees,
-                balance,
-                application_permissions: Default::default(),
-            }))
-            .to_posted(0, MessageKind::Protected)],
+            messages: vec![
+                Message::System(SystemMessage::OpenChain(Box::new(OpenChainConfig {
+                    ownership,
+                    admin_id,
+                    epoch,
+                    committees,
+                    balance,
+                    application_permissions: Default::default(),
+                })))
+                .to_posted(0, MessageKind::Protected),
+            ],
         },
         action: MessageAction::Accept,
     };
@@ -2384,14 +2387,14 @@ where
                 messages: vec![vec![direct_outgoing_message(
                     user_id,
                     MessageKind::Protected,
-                    SystemMessage::OpenChain(OpenChainConfig {
+                    SystemMessage::OpenChain(Box::new(OpenChainConfig {
                         ownership: ChainOwnership::single(key_pair.public().into()),
                         epoch: Epoch::ZERO,
                         committees: committees.clone(),
                         admin_id,
                         balance: Amount::ZERO,
                         application_permissions: Default::default(),
-                    }),
+                    })),
                 )]],
                 previous_message_blocks: BTreeMap::new(),
                 events: vec![Vec::new()],
@@ -2447,7 +2450,7 @@ where
     let event_id = EventId {
         chain_id: admin_id,
         stream_id: StreamId::system(NEW_EPOCH_STREAM_NAME),
-        key: bcs::to_bytes(&Epoch::from(1)).unwrap(),
+        index: 1,
     };
     let committee_blob = Blob::new(BlobContent::new_committee(bcs::to_bytes(&committee)?));
     // `PublishCommitteeBlob` is tested e.g. in `client_tests::test_change_voting_rights`, so we
@@ -2467,7 +2470,7 @@ where
                 events: vec![
                     vec![Event {
                         stream_id: event_id.stream_id.clone(),
-                        key: event_id.key.clone(),
+                        index: event_id.index,
                         value: bcs::to_bytes(&blob_hash).unwrap(),
                     }],
                     Vec::new(),
@@ -2557,7 +2560,7 @@ where
                             EventId {
                                 chain_id: admin_id,
                                 stream_id: StreamId::system(NEW_EPOCH_STREAM_NAME),
-                                key: bcs::to_bytes(&Epoch::from(1)).unwrap(),
+                                index: 1,
                             },
                             bcs::to_bytes(&blob_hash).unwrap(),
                         ),
@@ -2575,7 +2578,7 @@ where
                             height: BlockHeight::from(0),
                             timestamp: Timestamp::from(0),
                             transaction_index: 0,
-                            messages: vec![Message::System(SystemMessage::OpenChain(
+                            messages: vec![Message::System(SystemMessage::OpenChain(Box::new(
                                 OpenChainConfig {
                                     ownership: ChainOwnership::single(key_pair.public().into()),
                                     epoch: Epoch::from(0),
@@ -2584,7 +2587,7 @@ where
                                     balance: Amount::ZERO,
                                     application_permissions: Default::default(),
                                 },
-                            ))
+                            )))
                             .to_posted(0, MessageKind::Protected)],
                         },
                         action: MessageAction::Accept,
@@ -2695,7 +2698,7 @@ where
                 previous_message_blocks: BTreeMap::new(),
                 events: vec![vec![Event {
                     stream_id: StreamId::system(NEW_EPOCH_STREAM_NAME),
-                    key: bcs::to_bytes(&Epoch::from(1)).unwrap(),
+                    index: 1,
                     value: bcs::to_bytes(&committee_blob.id().hash).unwrap(),
                 }]],
                 blobs: vec![Vec::new()],
@@ -2834,13 +2837,13 @@ where
                 events: vec![
                     vec![Event {
                         stream_id: StreamId::system(NEW_EPOCH_STREAM_NAME),
-                        key: bcs::to_bytes(&Epoch::from(1)).unwrap(),
+                        index: 1,
                         value: bcs::to_bytes(&committee_blob.id().hash).unwrap(),
                     }],
                     vec![Event {
-                        value: Vec::new(),
                         stream_id: StreamId::system(REMOVED_EPOCH_STREAM_NAME),
-                        key: bcs::to_bytes(&Epoch::from(0)).unwrap(),
+                        index: 0,
+                        value: Vec::new(),
                     }],
                 ],
                 blobs: vec![Vec::new(); 2],

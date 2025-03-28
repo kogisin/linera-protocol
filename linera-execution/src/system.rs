@@ -208,7 +208,7 @@ pub enum SystemMessage {
         recipient: Recipient,
     },
     /// Creates (or activates) a new chain.
-    OpenChain(OpenChainConfig),
+    OpenChain(Box<OpenChainConfig>),
     /// Notifies that a new application was created.
     ApplicationCreated,
 }
@@ -389,7 +389,7 @@ where
                         self.epoch.set(Some(epoch));
                         txn_tracker.add_event(
                             StreamId::system(EPOCH_STREAM_NAME),
-                            bcs::to_bytes(&epoch)?,
+                            epoch.0,
                             bcs::to_bytes(&blob_hash)?,
                         );
                     }
@@ -400,7 +400,7 @@ where
                         );
                         txn_tracker.add_event(
                             StreamId::system(REMOVED_EPOCH_STREAM_NAME),
-                            bcs::to_bytes(&epoch)?,
+                            epoch.0,
                             vec![],
                         );
                     }
@@ -461,7 +461,7 @@ where
                 let event_id = EventId {
                     chain_id: admin_id,
                     stream_id: StreamId::system(EPOCH_STREAM_NAME),
-                    key: bcs::to_bytes(&epoch)?,
+                    index: epoch.0,
                 };
                 let bytes = match txn_tracker.next_replayed_oracle_response()? {
                     None => self.context().extra().get_event(event_id.clone()).await?,
@@ -491,7 +491,7 @@ where
                 let event_id = EventId {
                     chain_id: admin_id,
                     stream_id: StreamId::system(REMOVED_EPOCH_STREAM_NAME),
-                    key: bcs::to_bytes(&epoch)?,
+                    index: epoch.0,
                 };
                 let bytes = match txn_tracker.next_replayed_oracle_response()? {
                     None => self.context().extra().get_event(event_id.clone()).await?,
@@ -743,7 +743,7 @@ where
             }
         );
         self.debit(&AccountOwner::CHAIN, config.balance).await?;
-        let message = SystemMessage::OpenChain(config);
+        let message = SystemMessage::OpenChain(Box::new(config));
         Ok(OutgoingMessage::new(child_id, message).with_kind(MessageKind::Protected))
     }
 

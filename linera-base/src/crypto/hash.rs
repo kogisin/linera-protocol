@@ -46,6 +46,11 @@ impl CryptoHash {
         &self.0
     }
 
+    /// Force the last 12 bytes of the hash to be zeroes. This is currently used for EVM compatibility
+    pub fn make_evm_compatible(&mut self) {
+        self.0[20..32].fill(0);
+    }
+
     /// Returns the hash of `TestString(s)`, for testing purposes.
     #[cfg(with_testing)]
     pub fn test_hash(s: impl Into<String>) -> Self {
@@ -75,7 +80,7 @@ impl io::Write for Keccak256Ext {
 #[cfg_attr(with_testing, derive(Default))]
 pub struct CryptoHashVec(pub Vec<CryptoHash>);
 
-impl<'de> BcsHashable<'de> for CryptoHashVec {}
+impl BcsHashable<'_> for CryptoHashVec {}
 
 impl Serialize for CryptoHash {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -145,7 +150,7 @@ impl From<CryptoHash> for [u64; 4] {
 impl fmt::Display for CryptoHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let prec = f.precision().unwrap_or(self.0.len() * 2);
-        hex::encode(&self.0[..((prec + 1) / 2)]).fmt(f)
+        hex::encode(&self.0[..prec.div_ceil(2)]).fmt(f)
     }
 }
 

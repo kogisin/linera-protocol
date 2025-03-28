@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use linera_base::{
-    data_types::{Amount, Blob, BlockHeight, OracleResponse, Timestamp},
+    data_types::{Amount, Blob, BlockHeight, Timestamp},
     identifiers::{ChainDescription, ChainId},
 };
 use linera_execution::{
@@ -24,9 +24,7 @@ use test_case::test_case;
 ///
 /// To update the bytecode files, run `linera-execution/update_wasm_fixtures.sh`.
 #[cfg_attr(with_wasmer, test_case(WasmRuntime::Wasmer, 71_229; "wasmer"))]
-#[cfg_attr(with_wasmer, test_case(WasmRuntime::WasmerWithSanitizer, 71_797; "wasmer_with_sanitizer"))]
-#[cfg_attr(with_wasmtime, test_case(WasmRuntime::Wasmtime, 71_629; "wasmtime"))]
-#[cfg_attr(with_wasmtime, test_case(WasmRuntime::WasmtimeWithSanitizer, 71_629; "wasmtime_with_sanitizer"))]
+#[cfg_attr(with_wasmtime, test_case(WasmRuntime::Wasmtime, 71_229; "wasmtime"))]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_fuel_for_counter_wasm_application(
     wasm_runtime: WasmRuntime,
@@ -90,22 +88,13 @@ async fn test_fuel_for_counter_wasm_application(
     };
 
     for (index, increment) in increments.iter().enumerate() {
-        let mut txn_tracker = TransactionTracker::new(
-            0,
-            0,
-            Some(if index == 0 {
-                vec![
-                    OracleResponse::Blob(app_desc_blob_id),
-                    OracleResponse::Blob(contract_blob_id),
-                    OracleResponse::Blob(service_blob_id),
-                ]
-            } else {
-                vec![]
-            }),
-        );
+        let mut txn_tracker = TransactionTracker::new_replaying_blobs(if index == 0 {
+            vec![app_desc_blob_id, contract_blob_id, service_blob_id]
+        } else {
+            vec![]
+        });
         view.execute_operation(
             context,
-            Timestamp::from(0),
             Operation::user_without_abi(app_id, increment).unwrap(),
             &mut txn_tracker,
             &mut controller,

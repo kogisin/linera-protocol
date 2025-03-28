@@ -63,7 +63,7 @@ pub struct Secp256k1Signature(pub Signature);
 
 impl Secp256k1PublicKey {
     /// A fake public key used for testing.
-    #[cfg(with_testing)]
+    #[cfg(all(with_testing, not(target_arch = "wasm32")))]
     pub fn test_key(seed: u8) -> Self {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
@@ -192,7 +192,7 @@ impl fmt::Debug for Secp256k1PublicKey {
     }
 }
 
-impl<'de> BcsHashable<'de> for Secp256k1PublicKey {}
+impl BcsHashable<'_> for Secp256k1PublicKey {}
 
 impl WitType for Secp256k1PublicKey {
     const SIZE: u32 = <(u64, u64, u64, u64, u8) as WitType>::SIZE;
@@ -501,7 +501,7 @@ mod tests {
         #[derive(Debug, Serialize, Deserialize)]
         struct Foo(String);
 
-        impl<'de> BcsSignable<'de> for Foo {}
+        impl BcsSignable<'_> for Foo {}
 
         let keypair1 = Secp256k1KeyPair::generate();
         let keypair2 = Secp256k1KeyPair::generate();

@@ -39,6 +39,7 @@ use crate::{
     },
     limited_writer::{LimitedWriter, LimitedWriterError},
     time::{Duration, SystemTime},
+    vm::VmRuntime,
 };
 
 /// A non-negative amount of tokens.
@@ -822,7 +823,7 @@ pub enum OracleResponse {
     Event(EventId, Vec<u8>),
 }
 
-impl<'de> BcsHashable<'de> for OracleResponse {}
+impl BcsHashable<'_> for OracleResponse {}
 
 /// Description of a user application.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
@@ -845,9 +846,11 @@ pub struct ApplicationDescription {
 
 impl From<&ApplicationDescription> for ApplicationId {
     fn from(description: &ApplicationDescription) -> Self {
-        ApplicationId::new(CryptoHash::new(&BlobContent::new_application_description(
-            description,
-        )))
+        let mut hash = CryptoHash::new(&BlobContent::new_application_description(description));
+        if matches!(description.module_id.vm_runtime, VmRuntime::Evm) {
+            hash.make_evm_compatible();
+        }
+        ApplicationId::new(hash)
     }
 }
 
@@ -990,7 +993,7 @@ impl CompressedBytecode {
     }
 }
 
-impl<'a> BcsHashable<'a> for BlobContent {}
+impl BcsHashable<'_> for BlobContent {}
 
 /// A blob of binary data.
 #[derive(Hash, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1076,7 +1079,14 @@ pub struct Blob {
 impl Blob {
     /// Computes the hash and returns the hashed blob for the given content.
     pub fn new(content: BlobContent) -> Self {
-        let hash = CryptoHash::new(&content);
+        let mut hash = CryptoHash::new(&content);
+        if matches!(content.blob_type, BlobType::ApplicationDescription) {
+            let application_description = bcs::from_bytes::<ApplicationDescription>(&content.bytes)
+                .expect("to obtain an application description");
+            if matches!(application_description.module_id.vm_runtime, VmRuntime::Evm) {
+                hash.make_evm_compatible();
+            }
+        }
         Blob { hash, content }
     }
 
@@ -1181,17 +1191,15 @@ impl<'a> Deserialize<'a> for Blob {
     }
 }
 
-impl<'de> BcsHashable<'de> for Blob {}
+impl BcsHashable<'_> for Blob {}
 
 /// An event recorded in an executed block.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct Event {
     /// The ID of the stream this event belongs to.
     pub stream_id: StreamId,
-    /// The event key.
-    #[debug(with = "hex_debug")]
-    #[serde(with = "serde_bytes")]
-    pub key: Vec<u8>,
+    /// The event index, i.e. the number of events in the stream before this one.
+    pub index: u32,
     /// The payload data.
     #[debug(with = "hex_debug")]
     #[serde(with = "serde_bytes")]
@@ -1204,12 +1212,12 @@ impl Event {
         EventId {
             chain_id,
             stream_id: self.stream_id.clone(),
-            key: self.key.clone(),
+            index: self.index,
         }
     }
 }
 
-impl<'de> BcsHashable<'de> for Event {}
+impl BcsHashable<'_> for Event {}
 
 doc_scalar!(Bytecode, "A WebAssembly module's bytecode");
 doc_scalar!(Amount, "A non-negative amount of tokens.");

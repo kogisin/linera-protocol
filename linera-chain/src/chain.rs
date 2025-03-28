@@ -751,12 +751,6 @@ where
         resource_controller
             .track_block_size(EMPTY_BLOCK_SIZE)
             .with_execution_context(ChainExecutionContext::Block)?;
-        resource_controller
-            .track_executed_block_size_sequence_extension(0, block.incoming_bundles.len())
-            .with_execution_context(ChainExecutionContext::Block)?;
-        resource_controller
-            .track_executed_block_size_sequence_extension(0, block.operations.len())
-            .with_execution_context(ChainExecutionContext::Block)?;
         for blob in published_blobs {
             let blob_type = blob.content().blob_type();
             if blob_type == BlobType::Data
@@ -801,6 +795,8 @@ where
                 None => None,
             };
             let mut txn_tracker = TransactionTracker::new(
+                local_time,
+                txn_index,
                 next_message_index,
                 next_application_index,
                 maybe_responses,
@@ -817,8 +813,6 @@ where
                             incoming_bundle,
                             block,
                             round,
-                            txn_index,
-                            local_time,
                             &mut txn_tracker,
                             &mut resource_controller,
                         ))
@@ -841,7 +835,6 @@ where
                     };
                     Box::pin(self.execution_state.execute_operation(
                         context,
-                        local_time,
                         operation.clone(),
                         &mut txn_tracker,
                         &mut resource_controller,
@@ -901,18 +894,6 @@ where
                         .with_execution_context(chain_execution_context)?;
                 }
             }
-            resource_controller
-                .track_executed_block_size_sequence_extension(oracle_responses.len(), 1)
-                .with_execution_context(chain_execution_context)?;
-            resource_controller
-                .track_executed_block_size_sequence_extension(messages.len(), 1)
-                .with_execution_context(chain_execution_context)?;
-            resource_controller
-                .track_executed_block_size_sequence_extension(events.len(), 1)
-                .with_execution_context(chain_execution_context)?;
-            resource_controller
-                .track_executed_block_size_sequence_extension(blobs.len(), 1)
-                .with_execution_context(chain_execution_context)?;
             oracle_responses.push(txn_outcome.oracle_responses);
             messages.push(txn_outcome.outgoing_messages);
             events.push(txn_outcome.events);
@@ -921,9 +902,6 @@ where
             if let Transaction::ExecuteOperation(_) = transaction {
                 resource_controller
                     .track_block_size_of(&(&txn_outcome.operation_result))
-                    .with_execution_context(chain_execution_context)?;
-                resource_controller
-                    .track_executed_block_size_sequence_extension(operation_results.len(), 1)
                     .with_execution_context(chain_execution_context)?;
                 operation_results.push(OperationResult(txn_outcome.operation_result));
             }
@@ -993,8 +971,6 @@ where
         incoming_bundle: &IncomingBundle,
         block: &ProposedBlock,
         round: Option<u32>,
-        txn_index: u32,
-        local_time: Timestamp,
         txn_tracker: &mut TransactionTracker,
         resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ChainError> {
@@ -1013,29 +989,24 @@ where
         let mut grant = posted_message.grant;
         match incoming_bundle.action {
             MessageAction::Accept => {
+                let chain_execution_context =
+                    ChainExecutionContext::IncomingBundle(txn_tracker.transaction_index());
                 // Once a chain is closed, accepting incoming messages is not allowed.
                 ensure!(!self.is_closed(), ChainError::ClosedChain);
 
                 Box::pin(self.execution_state.execute_message(
                     context,
-                    local_time,
                     posted_message.message.clone(),
                     (grant > Amount::ZERO).then_some(&mut grant),
                     txn_tracker,
                     resource_controller,
                 ))
                 .await
-                .with_execution_context(ChainExecutionContext::IncomingBundle(txn_index))?;
-                if grant > Amount::ZERO {
-                    if let Some(refund_grant_to) = posted_message.refund_grant_to {
-                        self.execution_state
-                            .send_refund(context, grant, refund_grant_to, txn_tracker)
-                            .await
-                            .with_execution_context(ChainExecutionContext::IncomingBundle(
-                                txn_index,
-                            ))?;
-                    }
-                }
+                .with_execution_context(chain_execution_context)?;
+                self.execution_state
+                    .send_refund(context, grant, txn_tracker)
+                    .await
+                    .with_execution_context(chain_execution_context)?;
             }
             MessageAction::Reject => {
                 // If rejecting a message fails, the entire block proposal should be
@@ -1054,17 +1025,10 @@ where
                         .bounce_message(context, grant, posted_message.message.clone(), txn_tracker)
                         .await
                         .with_execution_context(ChainExecutionContext::Block)?;
-                } else if grant > Amount::ZERO {
+                } else {
                     // Nothing to do except maybe refund the grant.
-                    let Some(refund_grant_to) = posted_message.refund_grant_to else {
-                        // See OperationContext::refund_grant_to()
-                        return Err(ChainError::InternalError(
-                            "Messages with grants should have a non-empty `refund_grant_to`".into(),
-                        ));
-                    };
-                    // Refund grant.
                     self.execution_state
-                        .send_refund(context, posted_message.grant, refund_grant_to, txn_tracker)
+                        .send_refund(context, grant, txn_tracker)
                         .await
                         .with_execution_context(ChainExecutionContext::Block)?;
                 }

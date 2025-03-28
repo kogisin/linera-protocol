@@ -5,12 +5,13 @@ use std::{mem, vec};
 
 use futures::{FutureExt, StreamExt};
 use linera_base::{
-    data_types::{Amount, BlockHeight, Timestamp},
-    identifiers::{Account, AccountOwner, BlobType, ChainId, Destination},
+    data_types::{Amount, BlockHeight},
+    identifiers::{Account, AccountOwner, BlobType, Destination, StreamId},
 };
 use linera_views::{
     context::Context,
     key_value_store_view::KeyValueStoreView,
+    map_view::MapView,
     reentrant_collection_view::HashedReentrantCollectionView,
     views::{ClonableView, View},
 };
@@ -41,6 +42,8 @@ pub struct ExecutionStateView<C> {
     pub system: SystemExecutionStateView<C>,
     /// User applications.
     pub users: HashedReentrantCollectionView<C, ApplicationId, KeyValueStoreView<C>>,
+    /// The number of events in the streams that this chain is writing to.
+    pub stream_event_counts: MapView<C, StreamId, u32>,
 }
 
 /// How to interact with a long-lived service runtime.
@@ -60,13 +63,14 @@ where
     pub async fn simulate_instantiation(
         &mut self,
         contract: UserContractCode,
-        local_time: Timestamp,
+        local_time: linera_base::data_types::Timestamp,
         application_description: ApplicationDescription,
         instantiation_argument: Vec<u8>,
         contract_blob: Blob,
         service_blob: Blob,
     ) -> Result<(), ExecutionError> {
         let chain_id = application_description.creator_chain_id;
+        assert_eq!(chain_id, self.context().extra().chain_id);
         let context = OperationContext {
             chain_id,
             authenticated_signer: None,
@@ -106,13 +110,16 @@ where
             tracker,
             account: None,
         };
-        let mut txn_tracker =
-            TransactionTracker::new(next_message_index, next_application_index, None);
+        let mut txn_tracker = TransactionTracker::new(
+            local_time,
+            0,
+            next_message_index,
+            next_application_index,
+            None,
+        );
         txn_tracker.add_created_blob(Blob::new_application_description(&application_description));
         self.run_user_action(
             application_id,
-            chain_id,
-            local_time,
             action,
             context.refund_grant_to(),
             None,
@@ -163,12 +170,9 @@ where
     C: Context + Clone + Send + Sync + 'static,
     C::Extra: ExecutionRuntimeContext,
 {
-    #[expect(clippy::too_many_arguments)]
     async fn run_user_action(
         &mut self,
         application_id: ApplicationId,
-        chain_id: ChainId,
-        local_time: Timestamp,
         action: UserAction,
         refund_grant_to: Option<Account>,
         grant: Option<&mut Amount>,
@@ -178,8 +182,6 @@ where
         let ExecutionRuntimeConfig {} = self.context().extra().execution_runtime_config();
         self.run_user_action_with_runtime(
             application_id,
-            chain_id,
-            local_time,
             action,
             refund_grant_to,
             grant,
@@ -189,18 +191,16 @@ where
         .await
     }
 
-    #[expect(clippy::too_many_arguments)]
     async fn run_user_action_with_runtime(
         &mut self,
         application_id: ApplicationId,
-        chain_id: ChainId,
-        local_time: Timestamp,
         action: UserAction,
         refund_grant_to: Option<Account>,
         grant: Option<&mut Amount>,
         txn_tracker: &mut TransactionTracker,
         resource_controller: &mut ResourceController<Option<AccountOwner>>,
     ) -> Result<(), ExecutionError> {
+        let chain_id = self.context().extra().chain_id();
         let mut cloned_grant = grant.as_ref().map(|x| **x);
         let initial_balance = resource_controller
             .with_state_and_grant(&mut self.system, cloned_grant.as_mut())
@@ -219,7 +219,6 @@ where
             let runtime = ContractSyncRuntime::new(
                 execution_state_sender,
                 chain_id,
-                local_time,
                 refund_grant_to,
                 controller,
                 &action,
@@ -257,7 +256,6 @@ where
     pub async fn execute_operation(
         &mut self,
         context: OperationContext,
-        local_time: Timestamp,
         operation: Operation,
         txn_tracker: &mut TransactionTracker,
         resource_controller: &mut ResourceController<Option<AccountOwner>>,
@@ -273,8 +271,6 @@ where
                     let user_action = UserAction::Instantiate(context, argument);
                     self.run_user_action(
                         application_id,
-                        context.chain_id,
-                        local_time,
                         user_action,
                         context.refund_grant_to(),
                         None,
@@ -290,8 +286,6 @@ where
             } => {
                 self.run_user_action(
                     application_id,
-                    context.chain_id,
-                    local_time,
                     UserAction::Operation(context, bytes),
                     context.refund_grant_to(),
                     None,
@@ -307,7 +301,6 @@ where
     pub async fn execute_message(
         &mut self,
         context: MessageContext,
-        local_time: Timestamp,
         message: Message,
         grant: Option<&mut Amount>,
         txn_tracker: &mut TransactionTracker,
@@ -325,8 +318,6 @@ where
             } => {
                 self.run_user_action(
                     application_id,
-                    context.chain_id,
-                    local_time,
                     UserAction::Message(context, bytes),
                     context.refund_grant_to,
                     grant,
@@ -362,10 +353,17 @@ where
         &self,
         context: MessageContext,
         amount: Amount,
-        account: Account,
         txn_tracker: &mut TransactionTracker,
     ) -> Result<(), ExecutionError> {
         assert_eq!(context.chain_id, self.context().extra().chain_id());
+        if amount.is_zero() {
+            return Ok(());
+        }
+        let Some(account) = context.refund_grant_to else {
+            return Err(ExecutionError::InternalError(
+                "Messages with grants should have a non-empty `refund_grant_to`",
+            ));
+        };
         let message = SystemMessage::Credit {
             amount,
             source: context.authenticated_signer.unwrap_or(AccountOwner::CHAIN),
