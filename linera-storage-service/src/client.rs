@@ -508,7 +508,7 @@ impl AdminKeyValueStore for ServiceStoreClientInternal {
 
     async fn create(config: &Self::Config, namespace: &str) -> Result<(), ServiceStoreError> {
         if ServiceStoreClientInternal::exists(config, namespace).await? {
-            return Err(ServiceStoreError::StoreAlreadyExist);
+            return Err(ServiceStoreError::StoreAlreadyExists);
         }
         let namespace = bcs::to_bytes(namespace)?;
         let query = RequestCreateNamespace { namespace };
@@ -547,6 +547,7 @@ pub fn service_config_from_endpoint(
     let common_config = CommonStoreInternalConfig {
         max_concurrent_queries: None,
         max_stream_queries: 100,
+        replication_factor: 1,
     };
     let endpoint = endpoint.to_string();
     Ok(ServiceStoreInternalConfig {

@@ -5,14 +5,11 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use async_trait::async_trait;
 use futures::{FutureExt as _, SinkExt, StreamExt};
 use linera_base::listen_for_shutdown_signals;
-use linera_client::{
-    config::{GenesisConfig, ValidatorServerConfig},
-    storage::{run_with_storage, Runnable, StorageConfigNamespace},
-};
+use linera_client::config::{GenesisConfig, ValidatorServerConfig};
 use linera_core::{node::NodeError, JoinSetExt as _};
 use linera_rpc::{
     config::{
@@ -23,9 +20,12 @@ use linera_rpc::{
     RpcMessage,
 };
 use linera_sdk::linera_base_types::Blob;
-use linera_service::util;
 #[cfg(with_metrics)]
-use linera_service::{prometheus_server, pyroscope_server};
+use linera_service::prometheus_server;
+use linera_service::{
+    storage::{Runnable, StorageConfigNamespace},
+    util,
+};
 use linera_storage::Storage;
 use linera_views::{lru_caching::StorageCacheConfig, store::CommonStoreConfig};
 use tokio::task::JoinSet;
@@ -47,16 +47,26 @@ pub struct ProxyOptions {
     config_path: PathBuf,
 
     /// Timeout for sending queries (ms)
-    #[arg(long = "send-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
+    #[arg(long = "send-timeout-ms",
+          default_value = "4000",
+          value_parser = util::parse_millis,
+          env = "LINERA_PROXY_SEND_TIMEOUT")]
     send_timeout: Duration,
 
     /// Timeout for receiving responses (ms)
-    #[arg(long = "recv-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
+    #[arg(long = "recv-timeout-ms",
+          default_value = "4000",
+          value_parser = util::parse_millis,
+          env = "LINERA_PROXY_RECV_TIMEOUT")]
     recv_timeout: Duration,
 
     /// The number of Tokio worker threads to use.
     #[arg(long, env = "LINERA_PROXY_TOKIO_THREADS")]
     tokio_threads: Option<usize>,
+
+    /// The number of Tokio blocking threads to use.
+    #[arg(long, env = "LINERA_PROXY_TOKIO_BLOCKING_THREADS")]
+    tokio_blocking_threads: Option<usize>,
 
     /// Storage configuration for the blockchain history, chain states and binary blobs.
     #[arg(long = "storage")]
@@ -85,6 +95,10 @@ pub struct ProxyOptions {
     /// Path to the file describing the initial user chains (aka genesis state)
     #[arg(long = "genesis")]
     genesis_config_path: PathBuf,
+
+    /// The replication factor for the keyspace
+    #[arg(long, default_value = "1")]
+    storage_replication_factor: u32,
 }
 
 /// A Linera Proxy, either gRPC or over 'Simple Transport', meaning TCP or UDP.
@@ -100,7 +114,6 @@ where
 
 struct ProxyContext {
     config: ValidatorServerConfig,
-    genesis_config: GenesisConfig,
     send_timeout: Duration,
     recv_timeout: Duration,
 }
@@ -108,12 +121,10 @@ struct ProxyContext {
 impl ProxyContext {
     pub fn from_options(options: &ProxyOptions) -> Result<Self> {
         let config = util::read_json(&options.config_path)?;
-        let genesis_config = util::read_json(&options.genesis_config_path)?;
         Ok(Self {
             config,
             send_timeout: options.send_timeout,
             recv_timeout: options.recv_timeout,
-            genesis_config,
         })
     }
 }
@@ -149,7 +160,6 @@ where
                 Self::Grpc(GrpcProxy::new(
                     context.config.validator.network,
                     context.config.internal_network,
-                    context.genesis_config,
                     context.send_timeout,
                     context.recv_timeout,
                     tls,
@@ -169,7 +179,6 @@ where
                     .validator
                     .network
                     .clone_with_protocol(public_transport),
-                genesis_config: context.genesis_config,
                 send_timeout: context.send_timeout,
                 recv_timeout: context.recv_timeout,
                 storage,
@@ -194,7 +203,6 @@ where
 {
     public_config: ValidatorPublicNetworkPreConfig<TransportProtocol>,
     internal_config: ValidatorInternalNetworkPreConfig<TransportProtocol>,
-    genesis_config: GenesisConfig,
     send_timeout: Duration,
     recv_timeout: Duration,
     storage: S,
@@ -249,25 +257,17 @@ impl<S> SimpleProxy<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    #[instrument(name = "SimpleProxy::run", skip_all, fields(port = self.public_config.port, metrics_port = self.internal_config.metrics_port, pyroscope_port = self.internal_config.pyroscope_port), err)]
+    #[instrument(name = "SimpleProxy::run", skip_all, fields(port = self.public_config.port, metrics_port = self.internal_config.metrics_port), err)]
     async fn run(self, shutdown_signal: CancellationToken) -> Result<()> {
-        info!("Starting simple server");
+        info!("Starting proxy");
         let mut join_set = JoinSet::new();
         let address = self.get_listen_address(self.public_config.port);
 
         #[cfg(with_metrics)]
-        {
-            prometheus_server::start_metrics(
-                self.get_listen_address(self.internal_config.metrics_port),
-                shutdown_signal.clone(),
-            );
-            pyroscope_server::start_pyroscope(
-                self.get_pyroscope_address(),
-                "proxy".to_string(),
-                shutdown_signal.clone(),
-                self.internal_config.pyroscope_sample_rate,
-            )?;
-        }
+        Self::start_metrics(
+            self.get_listen_address(self.internal_config.metrics_port),
+            shutdown_signal.clone(),
+        );
 
         self.public_config
             .protocol
@@ -280,18 +280,13 @@ where
         Ok(())
     }
 
-    fn get_listen_address(&self, port: u16) -> SocketAddr {
-        SocketAddr::from(([0, 0, 0, 0], port))
+    #[cfg(with_metrics)]
+    pub fn start_metrics(address: SocketAddr, shutdown_signal: CancellationToken) {
+        prometheus_server::start_metrics(address, shutdown_signal)
     }
 
-    #[cfg(with_metrics)]
-    fn get_pyroscope_address(&self) -> String {
-        format!(
-            "{}://{}:{}",
-            self.internal_config.protocol.scheme(),
-            self.internal_config.host,
-            self.internal_config.pyroscope_port
-        )
+    fn get_listen_address(&self, port: u16) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], port))
     }
 
     async fn try_proxy_message(
@@ -319,9 +314,16 @@ where
                     linera_version::VersionInfo::default().into(),
                 )))
             }
-            GenesisConfigHashQuery => Ok(Some(RpcMessage::GenesisConfigHashResponse(Box::new(
-                self.genesis_config.hash(),
-            )))),
+            NetworkDescriptionQuery => {
+                let description = self
+                    .storage
+                    .read_network_description()
+                    .await?
+                    .ok_or(anyhow!("Cannot find network description in the database"))?;
+                Ok(Some(RpcMessage::NetworkDescriptionResponse(Box::new(
+                    description,
+                ))))
+            }
             UploadBlob(content) => {
                 let blob = Blob::new(*content);
                 let id = blob.id();
@@ -335,14 +337,9 @@ where
                 let content = self.storage.read_blob(*blob_id).await?.into_content();
                 Ok(Some(RpcMessage::DownloadBlobResponse(Box::new(content))))
             }
-            DownloadConfirmedBlock(hash) => {
-                Ok(Some(RpcMessage::DownloadConfirmedBlockResponse(Box::new(
-                    self.storage
-                        .read_hashed_confirmed_block(*hash)
-                        .await?
-                        .into_inner(),
-                ))))
-            }
+            DownloadConfirmedBlock(hash) => Ok(Some(RpcMessage::DownloadConfirmedBlockResponse(
+                Box::new(self.storage.read_confirmed_block(*hash).await?),
+            ))),
             DownloadCertificates(hashes) => {
                 let certificates = self.storage.read_certificates(hashes).await?;
                 Ok(Some(RpcMessage::DownloadCertificatesResponse(certificates)))
@@ -364,7 +361,7 @@ where
             | Error(_)
             | ChainInfoResponse(_)
             | VersionInfoResponse(_)
-            | GenesisConfigHashResponse(_)
+            | NetworkDescriptionResponse(_)
             | DownloadBlobResponse(_)
             | DownloadPendingBlob(_)
             | DownloadPendingBlobResponse(_)
@@ -398,6 +395,10 @@ fn main() -> Result<()> {
         builder
     };
 
+    if let Some(blocking_threads) = options.tokio_blocking_threads {
+        runtime.max_blocking_threads(blocking_threads);
+    }
+
     runtime.enable_all().build()?.block_on(options.run())
 }
 
@@ -412,16 +413,13 @@ impl ProxyOptions {
             max_concurrent_queries: self.max_concurrent_queries,
             max_stream_queries: self.max_stream_queries,
             storage_cache_config,
+            replication_factor: self.storage_replication_factor,
         };
-        let full_storage_config = self.storage_config.add_common_config(common_config).await?;
         let genesis_config: GenesisConfig = util::read_json(&self.genesis_config_path)?;
-        run_with_storage(
-            full_storage_config,
-            &genesis_config,
-            None,
-            ProxyContext::from_options(self)?,
-        )
-        .boxed()
-        .await?
+        let store_config = self.storage_config.add_common_config(common_config).await?;
+        store_config
+            .run_with_storage(&genesis_config, None, ProxyContext::from_options(self)?)
+            .boxed()
+            .await?
     }
 }

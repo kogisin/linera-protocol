@@ -8,10 +8,7 @@ use linera_base::{
     data_types::{
         Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, TimeDelta,
     },
-    identifiers::{
-        Account, AccountOwner, ApplicationId, ChainId, ChannelName, Destination, MessageId,
-        ModuleId, StreamName,
-    },
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId, StreamName},
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
 };
@@ -38,6 +35,16 @@ impl From<ChainId> for wit_contract_api::CryptoHash {
     }
 }
 
+impl From<[u8; 20]> for wit_contract_api::Array20 {
+    fn from(bytes: [u8; 20]) -> Self {
+        wit_contract_api::Array20 {
+            part1: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+            part2: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+            part3: u64::from_be_bytes(bytes[16..20].try_into().unwrap()),
+        }
+    }
+}
+
 impl From<Amount> for wit_contract_api::Amount {
     fn from(host: Amount) -> Self {
         wit_contract_api::Amount {
@@ -61,6 +68,9 @@ impl From<AccountOwner> for wit_contract_api::AccountOwner {
             AccountOwner::Reserved(value) => wit_contract_api::AccountOwner::Reserved(value),
             AccountOwner::Address32(owner) => {
                 wit_contract_api::AccountOwner::Address32(owner.into())
+            }
+            AccountOwner::Address20(owner) => {
+                wit_contract_api::AccountOwner::Address20(owner.into())
             }
         }
     }
@@ -122,7 +132,8 @@ impl From<ApplicationId> for wit_contract_api::ApplicationId {
 impl From<Resources> for wit_contract_api::Resources {
     fn from(resources: Resources) -> Self {
         wit_contract_api::Resources {
-            fuel: resources.fuel,
+            wasm_fuel: resources.wasm_fuel,
+            evm_fuel: resources.evm_fuel,
             read_operations: resources.read_operations,
             write_operations: resources.write_operations,
             bytes_to_read: resources.bytes_to_read,
@@ -136,27 +147,6 @@ impl From<Resources> for wit_contract_api::Resources {
             storage_size_delta: resources.storage_size_delta,
             service_as_oracle_queries: resources.service_as_oracle_queries,
             http_requests: resources.http_requests,
-        }
-    }
-}
-
-impl From<ChannelName> for wit_contract_api::ChannelName {
-    fn from(name: ChannelName) -> Self {
-        wit_contract_api::ChannelName {
-            inner0: name.into_bytes(),
-        }
-    }
-}
-
-impl From<Destination> for wit_contract_api::Destination {
-    fn from(destination: Destination) -> Self {
-        match destination {
-            Destination::Recipient(chain_id) => {
-                wit_contract_api::Destination::Recipient(chain_id.into())
-            }
-            Destination::Subscribers(subscription) => {
-                wit_contract_api::Destination::Subscribers(subscription.into())
-            }
         }
     }
 }

@@ -6,12 +6,15 @@
 use std::{
     fs::File,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use anyhow::Context;
-use tempfile::tempdir;
+use serde_json::Value;
+use tempfile::{tempdir, TempDir};
+
+use crate::LINERA_SOL;
 
 fn write_compilation_json(path: &Path, file_name: &str) -> anyhow::Result<()> {
     let mut source = File::create(path).unwrap();
@@ -77,6 +80,13 @@ fn get_bytecode_path(path: &Path, file_name: &str, contract_name: &str) -> anyho
 pub fn get_bytecode(source_code: &str, contract_name: &str) -> anyhow::Result<Vec<u8>> {
     let dir = tempdir().unwrap();
     let path = dir.path();
+    if source_code.contains("linera.sol") {
+        // The source code seems to import linera.sol, so let us write it in the code
+        let file_name = "linera.sol";
+        let test_code_path = path.join(file_name);
+        let mut test_code_file = File::create(&test_code_path)?;
+        writeln!(test_code_file, "{}", LINERA_SOL)?;
+    }
     let file_name = "test_code.sol";
     let test_code_path = path.join(file_name);
     let mut test_code_file = File::create(&test_code_path)?;
@@ -84,28 +94,49 @@ pub fn get_bytecode(source_code: &str, contract_name: &str) -> anyhow::Result<Ve
     get_bytecode_path(path, file_name, contract_name)
 }
 
-pub fn get_example_counter() -> anyhow::Result<Vec<u8>> {
-    let source_code = r#"
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
-
-contract ExampleCounter {
-  uint256 value;
-  constructor(uint256 start_value) {
-    value = start_value;
-  }
-
-  function increment(uint256 input) external returns (uint256) {
-    value = value + input;
-    return value;
-  }
-
-  function get_value() external view returns (uint256) {
-    return value;
-  }
-
+pub fn load_solidity_example(path: &str) -> anyhow::Result<Vec<u8>> {
+    let source_code = std::fs::read_to_string(path)?;
+    let contract_name: &str = source_code
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("contract "))
+        .next()
+        .ok_or(anyhow::anyhow!("Not matching"))?;
+    let contract_name: &str = contract_name
+        .strip_suffix(" {")
+        .ok_or(anyhow::anyhow!("Not matching"))?;
+    get_bytecode(&source_code, contract_name)
 }
-"#
-    .to_string();
-    get_bytecode(&source_code, "ExampleCounter")
+
+pub fn temporary_write_evm_module(module: Vec<u8>) -> anyhow::Result<(PathBuf, TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path();
+    let app_file = "app.json";
+    let app_path = path.join(app_file);
+    {
+        std::fs::write(app_path.clone(), &module)?;
+    }
+    let evm_contract = app_path.to_path_buf();
+    Ok((evm_contract, dir))
+}
+
+pub fn get_evm_contract_path(path: &str) -> anyhow::Result<(PathBuf, TempDir)> {
+    let module = load_solidity_example(path)?;
+    temporary_write_evm_module(module)
+}
+
+pub fn value_to_vec_u8(value: Value) -> Vec<u8> {
+    let mut vec: Vec<u8> = Vec::new();
+    for val in value.as_array().unwrap() {
+        let val = val.as_u64().unwrap();
+        let val = val as u8;
+        vec.push(val);
+    }
+    vec
+}
+
+pub fn read_evm_u64_entry(value: Value) -> u64 {
+    let vec = value_to_vec_u8(value);
+    let mut arr = [0_u8; 8];
+    arr.copy_from_slice(&vec[24..]);
+    u64::from_be_bytes(arr)
 }

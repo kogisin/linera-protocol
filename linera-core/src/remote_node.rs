@@ -34,7 +34,6 @@ pub struct RemoteNode<N> {
     pub node: N,
 }
 
-#[allow(clippy::result_large_err)]
 impl<N: ValidatorNode> RemoteNode<N> {
     pub(crate) async fn handle_chain_info_query(
         &self,
@@ -175,20 +174,24 @@ impl<N: ValidatorNode> RemoteNode<N> {
             limit: Some(limit),
         };
         let query = ChainInfoQuery::new(chain_id).with_sent_certificate_hashes_in_range(range);
-        if let Ok(info) = self.handle_chain_info_query(query).await {
-            let certificates = self
-                .node
-                .download_certificates(info.requested_sent_certificate_hashes)
-                .await?
-                .into_iter()
-                .map(|c| {
-                    ConfirmedBlockCertificate::try_from(c)
-                        .map_err(|_| NodeError::InvalidChainInfoResponse)
-                })
-                .collect::<Result<_, _>>()?;
-            Ok(Some(certificates))
-        } else {
-            Ok(None)
+        match self.handle_chain_info_query(query).await {
+            Ok(info) => {
+                let certificates = self
+                    .node
+                    .download_certificates(info.requested_sent_certificate_hashes)
+                    .await?
+                    .into_iter()
+                    .map(|c| {
+                        ConfirmedBlockCertificate::try_from(c)
+                            .map_err(|_| NodeError::InvalidChainInfoResponse)
+                    })
+                    .collect::<Result<_, _>>()?;
+                Ok(Some(certificates))
+            }
+            Err(error) => {
+                tracing::warn!("Failed to query certificates: {error}");
+                Ok(None)
+            }
         }
     }
 
@@ -199,7 +202,7 @@ impl<N: ValidatorNode> RemoteNode<N> {
     ) -> Result<ConfirmedBlockCertificate, NodeError> {
         let last_used_hash = self.node.blob_last_used_by(blob_id).await?;
         let certificate = self.node.download_certificate(last_used_hash).await?;
-        if !certificate.requires_blob(&blob_id) {
+        if !certificate.block().requires_or_creates_blob(&blob_id) {
             warn!(
                 "Got invalid last used by certificate for blob {} from validator {}",
                 blob_id, self.public_key
@@ -310,8 +313,10 @@ impl<N: ValidatorNode> RemoteNode<N> {
         self.node.download_certificates(hashes).await
     }
 
+    /// Downloads a blob, but does not verify if it has actually been published and
+    /// accepted by a quorum of validators.
     #[instrument(level = "trace", skip(validators))]
-    async fn download_blob(
+    pub async fn download_blob(
         validators: &[Self],
         blob_id: BlobId,
         timeout: Duration,

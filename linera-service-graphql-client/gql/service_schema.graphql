@@ -207,6 +207,14 @@ A block height to identify blocks in a chain
 scalar BlockHeight
 
 
+type BucketQueueView_BlockHeight_e824a938 {
+	entries(count: Int): [BlockHeight!]!
+}
+
+type BucketQueueView_TimestampedBundleInInbox_5a630c55 {
+	entries(count: Int): [TimestampedBundleInInbox!]!
+}
+
 """
 An origin and cursor of a unskippable bundle that is no longer in our inbox.
 """
@@ -214,7 +222,7 @@ type BundleInInbox {
 	"""
 	The origin from which we received the bundle.
 	"""
-	origin: Origin!
+	origin: ChainId!
 	"""
 	The cursor of the bundle in the inbox.
 	"""
@@ -235,7 +243,7 @@ type ChainAndHeight {
 }
 
 """
-How to create a chain
+Initial chain configuration and chain origin.
 """
 scalar ChainDescription
 
@@ -314,7 +322,7 @@ type ChainStateExtendedView {
 	"""
 	The incomplete sets of blobs for upcoming proposals.
 	"""
-	pendingProposedBlobs: ReentrantCollectionView_AccountOwner_PendingBlobsView_673534848!
+	pendingProposedBlobs: ReentrantCollectionView_AccountOwner_PendingBlobsView_1774202114!
 	"""
 	Hashes of all certified blocks for this sender.
 	This ends with `block_hash` and has length `usize::from(next_block_height)`.
@@ -331,11 +339,11 @@ type ChainStateExtendedView {
 	"""
 	Mailboxes used to receive messages indexed by their origin.
 	"""
-	inboxes: ReentrantCollectionView_Origin_InboxStateView_3699835794!
+	inboxes: ReentrantCollectionView_ChainId_InboxStateView_1502311823!
 	"""
 	A queue of unskippable bundles, with the timestamp when we added them to the inbox.
 	"""
-	unskippableBundles: QueueView_TimestampedBundleInInbox_5a630c55!
+	unskippableBundles: BucketQueueView_TimestampedBundleInInbox_5a630c55!
 	"""
 	Unskippable bundles that have been removed but are still in the queue.
 	"""
@@ -347,16 +355,12 @@ type ChainStateExtendedView {
 	"""
 	Mailboxes used to send messages, indexed by their target.
 	"""
-	outboxes: ReentrantCollectionView_Target_OutboxStateView_2789119133!
+	outboxes: ReentrantCollectionView_ChainId_OutboxStateView_1536326071!
 	"""
 	Number of outgoing messages in flight for each block height.
 	We use a `RegisterView` to prioritize speed for small maps.
 	"""
 	outboxCounters: JSONObject!
-	"""
-	Channels able to multicast messages to subscribers.
-	"""
-	channels: ReentrantCollectionView_ChannelFullName_ChannelStateView_3660287053!
 }
 
 """
@@ -391,25 +395,6 @@ type Chains {
 }
 
 """
-A channel name together with its application ID.
-"""
-scalar ChannelFullName
-
-"""
-The state of a channel followed by subscribers.
-"""
-type ChannelStateView {
-	"""
-	The current subscribers.
-	"""
-	subscribers: [ChainId!]!
-	"""
-	The block heights so far, to be sent to future subscribers.
-	"""
-	blockHeights: LogView_BlockHeight_e824a938!
-}
-
-"""
 A set of validators (identified by their public keys) and their voting rights.
 """
 input Committee {
@@ -438,6 +423,7 @@ input Committee {
 type ConfirmedBlock {
 	block: Block!
 	status: String!
+	hash: CryptoHash!
 }
 
 """
@@ -451,11 +437,6 @@ type Cursor {
 }
 
 """
-The destination of a message, relative to a particular application.
-"""
-scalar Destination
-
-"""
 A GraphQL-visible map item, complete with key.
 """
 type Entry_AccountOwner_Amount_aaf96548 {
@@ -466,7 +447,7 @@ type Entry_AccountOwner_Amount_aaf96548 {
 """
 A GraphQL-visible map item, complete with key.
 """
-type Entry_AccountOwner_PendingBlobsView_f0b6a64b {
+type Entry_AccountOwner_PendingBlobsView_2740f04d {
 	key: AccountOwner!
 	value: PendingBlobsView!
 }
@@ -498,24 +479,16 @@ type Entry_ChainId_BlockHeight_2fe78645 {
 """
 A GraphQL-visible map item, complete with key.
 """
-type Entry_ChannelFullName_ChannelStateView_bd1de7ae {
-	key: ChannelFullName!
-	value: ChannelStateView!
-}
-
-"""
-A GraphQL-visible map item, complete with key.
-"""
-type Entry_Origin_InboxStateView_c4db01d6 {
-	key: Origin!
+type Entry_ChainId_InboxStateView_685a16a3 {
+	key: ChainId!
 	value: InboxStateView!
 }
 
 """
 A GraphQL-visible map item, complete with key.
 """
-type Entry_Target_OutboxStateView_50a86149 {
-	key: Target!
+type Entry_ChainId_OutboxStateView_258a4684 {
+	key: ChainId!
 	value: OutboxStateView!
 }
 
@@ -525,7 +498,7 @@ A number identifying the configuration of the chain (aka the committee)
 scalar Epoch
 
 """
-An event recorded in an executed block.
+An event recorded in a block.
 """
 type Event {
 	"""
@@ -551,11 +524,6 @@ type ExecutionStateView {
 A unique identifier for a user application or for the system application
 """
 scalar GenericApplicationId
-
-type HashedConfirmedBlock {
-	hash: CryptoHash!
-	value: ConfirmedBlock!
-}
 
 
 """
@@ -597,9 +565,9 @@ A bundle of cross-chain messages.
 """
 type IncomingBundle {
 	"""
-	The origin of the messages (chain and channel if any).
+	The origin of the messages.
 	"""
-	origin: Origin!
+	origin: ChainId!
 	"""
 	The messages to be delivered to the inbox identified by `origin`.
 	"""
@@ -615,10 +583,6 @@ type IncomingBundle {
 A scalar that can represent any JSON Object value.
 """
 scalar JSONObject
-
-type LogView_BlockHeight_e824a938 {
-	entries(start: Int, end: Int): [BlockHeight!]!
-}
 
 type LogView_ChainAndHeight_7af83576 {
 	entries(start: Int, end: Int): [ChainAndHeight!]!
@@ -640,18 +604,6 @@ input MapFilters_ChainId_37f83aa9 {
 	keys: [ChainId!]
 }
 
-input MapFilters_ChannelFullName_7b67e184 {
-	keys: [ChannelFullName!]
-}
-
-input MapFilters_Origin_742d451b {
-	keys: [Origin!]
-}
-
-input MapFilters_Target_7aac1e1c {
-	keys: [Target!]
-}
-
 input MapInput_AccountOwner_d6668c53 {
 	filters: MapFilters_AccountOwner_d6668c53
 }
@@ -662,18 +614,6 @@ input MapInput_BlobId_4d2a0555 {
 
 input MapInput_ChainId_37f83aa9 {
 	filters: MapFilters_ChainId_37f83aa9
-}
-
-input MapInput_ChannelFullName_7b67e184 {
-	filters: MapFilters_ChannelFullName_7b67e184
-}
-
-input MapInput_Origin_742d451b {
-	filters: MapFilters_Origin_742d451b
-}
-
-input MapInput_Target_7aac1e1c {
-	filters: MapFilters_Target_7aac1e1c
 }
 
 type MapView_AccountOwner_Amount_11ef1379 {
@@ -877,11 +817,6 @@ A record of a single oracle response.
 scalar OracleResponse
 
 """
-The origin of a message, relative to a particular application. Used to identify each inbox.
-"""
-scalar Origin
-
-"""
 The state of an outbox
 * An outbox is used to send messages to another chain.
 * Internally, this is implemented as a FIFO queue of (increasing) block heights.
@@ -899,7 +834,7 @@ type OutboxStateView {
 	Keep sending these certified blocks of ours until they are acknowledged by
 	receivers.
 	"""
-	queue: QueueView_BlockHeight_e824a938!
+	queue: BucketQueueView_BlockHeight_e824a938!
 }
 
 """
@@ -909,7 +844,7 @@ type OutgoingMessage {
 	"""
 	The destination of the message.
 	"""
-	destination: Destination!
+	destination: ChainId!
 	"""
 	The user authentication carried by the message, if any.
 	"""
@@ -988,24 +923,16 @@ type QueryRoot {
 	chain(chainId: ChainId!): ChainStateExtendedView!
 	applications(chainId: ChainId!): [ApplicationOverview!]!
 	chains: Chains!
-	block(hash: CryptoHash, chainId: ChainId!): HashedConfirmedBlock
-	blocks(from: CryptoHash, chainId: ChainId!, limit: Int): [HashedConfirmedBlock!]!
+	block(hash: CryptoHash, chainId: ChainId!): ConfirmedBlock
+	blocks(from: CryptoHash, chainId: ChainId!, limit: Int): [ConfirmedBlock!]!
 	"""
 	Returns the version information on this node service.
 	"""
 	version: VersionInfo!
 }
 
-type QueueView_BlockHeight_e824a938 {
-	entries(count: Int): [BlockHeight!]!
-}
-
 type QueueView_MessageBundle_f4399f0b {
 	entries(count: Int): [MessageBundle!]!
-}
-
-type QueueView_TimestampedBundleInInbox_5a630c55 {
-	entries(count: Int): [TimestampedBundleInInbox!]!
 }
 
 """
@@ -1013,28 +940,22 @@ The recipient of a transfer
 """
 scalar Recipient
 
-type ReentrantCollectionView_AccountOwner_PendingBlobsView_673534848 {
+type ReentrantCollectionView_AccountOwner_PendingBlobsView_1774202114 {
 	keys: [AccountOwner!]!
-	entry(key: AccountOwner!): Entry_AccountOwner_PendingBlobsView_f0b6a64b!
-	entries(input: MapInput_AccountOwner_d6668c53): [Entry_AccountOwner_PendingBlobsView_f0b6a64b!]!
+	entry(key: AccountOwner!): Entry_AccountOwner_PendingBlobsView_2740f04d!
+	entries(input: MapInput_AccountOwner_d6668c53): [Entry_AccountOwner_PendingBlobsView_2740f04d!]!
 }
 
-type ReentrantCollectionView_ChannelFullName_ChannelStateView_3660287053 {
-	keys: [ChannelFullName!]!
-	entry(key: ChannelFullName!): Entry_ChannelFullName_ChannelStateView_bd1de7ae!
-	entries(input: MapInput_ChannelFullName_7b67e184): [Entry_ChannelFullName_ChannelStateView_bd1de7ae!]!
+type ReentrantCollectionView_ChainId_InboxStateView_1502311823 {
+	keys: [ChainId!]!
+	entry(key: ChainId!): Entry_ChainId_InboxStateView_685a16a3!
+	entries(input: MapInput_ChainId_37f83aa9): [Entry_ChainId_InboxStateView_685a16a3!]!
 }
 
-type ReentrantCollectionView_Origin_InboxStateView_3699835794 {
-	keys: [Origin!]!
-	entry(key: Origin!): Entry_Origin_InboxStateView_c4db01d6!
-	entries(input: MapInput_Origin_742d451b): [Entry_Origin_InboxStateView_c4db01d6!]!
-}
-
-type ReentrantCollectionView_Target_OutboxStateView_2789119133 {
-	keys: [Target!]!
-	entry(key: Target!): Entry_Target_OutboxStateView_50a86149!
-	entries(input: MapInput_Target_7aac1e1c): [Entry_Target_OutboxStateView_50a86149!]!
+type ReentrantCollectionView_ChainId_OutboxStateView_1536326071 {
+	keys: [ChainId!]!
+	entry(key: ChainId!): Entry_ChainId_OutboxStateView_258a4684!
+	entries(input: MapInput_ChainId_37f83aa9): [Entry_ChainId_OutboxStateView_258a4684!]!
 }
 
 """
@@ -1046,9 +967,13 @@ input ResourceControlPolicy {
 	"""
 	block: Amount!
 	"""
-	The price per unit of fuel (aka gas) for VM execution.
+	The price per unit of fuel (aka gas) for Wasm execution.
 	"""
-	fuelUnit: Amount!
+	wasmFuelUnit: Amount!
+	"""
+	The price per unit of fuel (aka gas) for EVM execution.
+	"""
+	evmFuelUnit: Amount!
 	"""
 	The price of one read operation.
 	"""
@@ -1110,18 +1035,22 @@ input ResourceControlPolicy {
 	"""
 	httpRequest: Amount!
 	"""
-	The maximum amount of fuel a block can consume.
+	The maximum amount of Wasm fuel a block can consume.
 	"""
-	maximumFuelPerBlock: Int!
+	maximumWasmFuelPerBlock: Int!
+	"""
+	The maximum amount of EVM fuel a block can consume.
+	"""
+	maximumEvmFuelPerBlock: Int!
 	"""
 	The maximum time in milliseconds that a block can spend executing services as oracles.
 	"""
 	maximumServiceOracleExecutionMs: Int!
 	"""
-	The maximum size of an executed block. This includes the block proposal itself as well as
+	The maximum size of a block. This includes the block proposal itself as well as
 	the execution outcome.
 	"""
-	maximumExecutedBlockSize: Int!
+	maximumBlockSize: Int!
 	"""
 	The maximum size of decompressed contract or service bytecode, in bytes.
 	"""
@@ -1206,11 +1135,6 @@ type SystemExecutionStateView {
 	balances: MapView_AccountOwner_Amount_11ef1379!
 	timestamp: Timestamp!
 }
-
-"""
-The target of a message, relative to a particular application. Used to identify each outbox.
-"""
-scalar Target
 
 """
 A timestamp, in microseconds since the Unix epoch

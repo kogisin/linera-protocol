@@ -12,17 +12,18 @@ use std::{
 use custom_debug_derive::Debug;
 use linera_base::{
     crypto::{CryptoHash, ValidatorPublicKey},
-    data_types::{ApplicationDescription, Blob, BlockHeight, Timestamp},
+    data_types::{ApplicationDescription, Blob, BlockHeight, Epoch, Timestamp},
     hashed::Hashed,
     identifiers::{ApplicationId, BlobId, ChainId},
 };
 use linera_chain::{
-    data_types::{BlockProposal, ExecutedBlock, MessageBundle, Origin, ProposedBlock, Target},
+    data_types::{BlockProposal, MessageBundle, ProposedBlock},
     types::{Block, ConfirmedBlockCertificate, TimeoutCertificate, ValidatedBlockCertificate},
     ChainStateView,
 };
 use linera_execution::{
-    committee::Epoch, Query, QueryContext, QueryOutcome, ServiceRuntimeEndpoint, ServiceSyncRuntime,
+    ExecutionStateView, Query, QueryContext, QueryOutcome, ServiceRuntimeEndpoint,
+    ServiceSyncRuntime,
 };
 use linera_storage::Storage;
 use tokio::sync::{mpsc, oneshot, OwnedRwLockReadGuard};
@@ -52,7 +53,7 @@ where
     /// Search for a bundle in one of the chain's inboxes.
     #[cfg(with_testing)]
     FindBundleInInbox {
-        inbox_id: Origin,
+        inbox_id: ChainId,
         certificate_hash: CryptoHash,
         height: BlockHeight,
         index: u32,
@@ -87,7 +88,7 @@ where
         round: Option<u32>,
         published_blobs: Vec<Blob>,
         #[debug(skip)]
-        callback: oneshot::Sender<Result<(ExecutedBlock, ChainInfoResponse), WorkerError>>,
+        callback: oneshot::Sender<Result<(Block, ChainInfoResponse), WorkerError>>,
     },
 
     /// Process a leader timeout issued for this multi-owner chain.
@@ -122,7 +123,7 @@ where
 
     /// Process a cross-chain update.
     ProcessCrossChainUpdate {
-        origin: Origin,
+        origin: ChainId,
         bundles: Vec<(Epoch, MessageBundle)>,
         #[debug(skip)]
         callback: oneshot::Sender<Result<Option<BlockHeight>, WorkerError>>,
@@ -130,7 +131,8 @@ where
 
     /// Handle cross-chain request to confirm that the recipient was updated.
     ConfirmUpdatedRecipient {
-        latest_heights: Vec<(Target, BlockHeight)>,
+        recipient: ChainId,
+        latest_height: BlockHeight,
         #[debug(skip)]
         callback: oneshot::Sender<Result<(), WorkerError>>,
     },
@@ -181,10 +183,14 @@ where
     ///
     /// If loading the chain state fails the next request will receive the error reported by the
     /// `storage`, and the actor will then try again to load the state.
+    #[expect(clippy::too_many_arguments)]
     pub async fn run(
         config: ChainWorkerConfig,
         storage: StorageClient,
-        executed_block_cache: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
+        block_cache: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
+        execution_state_cache: Arc<
+            ValueCache<CryptoHash, ExecutionStateView<StorageClient::Context>>,
+        >,
         tracked_chains: Option<Arc<RwLock<HashSet<ChainId>>>>,
         delivery_notifier: DeliveryNotifier,
         chain_id: ChainId,
@@ -197,7 +203,8 @@ where
             let load_result = Self::load(
                 config.clone(),
                 storage.clone(),
-                executed_block_cache.clone(),
+                block_cache.clone(),
+                execution_state_cache.clone(),
                 tracked_chains.clone(),
                 delivery_notifier.clone(),
                 chain_id,
@@ -222,7 +229,10 @@ where
     pub async fn load(
         config: ChainWorkerConfig,
         storage: StorageClient,
-        executed_block_cache: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
+        block_cache: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
+        execution_state_cache: Arc<
+            ValueCache<CryptoHash, ExecutionStateView<StorageClient::Context>>,
+        >,
         tracked_chains: Option<Arc<RwLock<HashSet<ChainId>>>>,
         delivery_notifier: DeliveryNotifier,
         chain_id: ChainId,
@@ -239,7 +249,8 @@ where
         let worker = ChainWorkerState::load(
             config,
             storage,
-            executed_block_cache,
+            block_cache,
+            execution_state_cache,
             tracked_chains,
             delivery_notifier,
             chain_id,
@@ -393,10 +404,15 @@ where
                 )
                 .is_ok(),
             ChainWorkerRequest::ConfirmUpdatedRecipient {
-                latest_heights,
+                recipient,
+                latest_height,
                 callback,
             } => callback
-                .send(self.worker.confirm_updated_recipient(latest_heights).await)
+                .send(
+                    self.worker
+                        .confirm_updated_recipient(recipient, latest_height)
+                        .await,
+                )
                 .is_ok(),
             ChainWorkerRequest::HandleChainInfoQuery { query, callback } => callback
                 .send(self.worker.handle_chain_info_query(query).await)

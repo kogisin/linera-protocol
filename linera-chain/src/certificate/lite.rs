@@ -7,7 +7,6 @@ use std::borrow::Cow;
 use linera_base::{
     crypto::{ValidatorPublicKey, ValidatorSignature},
     data_types::Round,
-    hashed::Hashed,
 };
 use linera_execution::committee::Committee;
 use serde::{Deserialize, Serialize};
@@ -79,18 +78,15 @@ impl LiteCertificate<'_> {
     }
 
     /// Checks whether the value matches this certificate.
-    pub fn check_value<T: CertificateValue>(&self, value: &Hashed<T>) -> bool {
-        self.value.chain_id == value.inner().chain_id()
+    pub fn check_value<T: CertificateValue>(&self, value: &T) -> bool {
+        self.value.chain_id == value.chain_id()
             && T::KIND == self.value.kind
             && self.value.value_hash == value.hash()
     }
 
     /// Returns the [`GenericCertificate`] with the specified value, if it matches.
-    pub fn with_value<T: CertificateValue>(
-        self,
-        value: Hashed<T>,
-    ) -> Option<GenericCertificate<T>> {
-        if self.value.chain_id != value.inner().chain_id()
+    pub fn with_value<T: CertificateValue>(self, value: T) -> Option<GenericCertificate<T>> {
+        if self.value.chain_id != value.chain_id()
             || T::KIND != self.value.kind
             || self.value.value_hash != value.hash()
         {

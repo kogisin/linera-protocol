@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use linera_base::{
-    crypto::{Ed25519SecretKey, Secp256k1SecretKey, ValidatorKeypair},
+    crypto::{AccountSecretKey, Ed25519SecretKey, Secp256k1SecretKey, ValidatorKeypair},
     data_types::Amount,
 };
 
@@ -13,14 +13,16 @@ use crate::{
     test::{make_first_block, BlockTestExt},
 };
 
+fn dummy_chain_id(index: u32) -> ChainId {
+    ChainId(CryptoHash::test_hash(format!("chain{}", index)))
+}
+
 #[test]
 fn test_signed_values() {
     let validator1_key_pair = ValidatorKeypair::generate();
     let validator2_key_pair = ValidatorKeypair::generate();
 
-    let block =
-        make_first_block(ChainId::root(1)).with_simple_transfer(ChainId::root(2), Amount::ONE);
-    let executed_block = BlockExecutionOutcome {
+    let block = BlockExecutionOutcome {
         messages: vec![Vec::new()],
         previous_message_blocks: BTreeMap::new(),
         state_hash: CryptoHash::test_hash("state"),
@@ -29,8 +31,8 @@ fn test_signed_values() {
         blobs: vec![Vec::new()],
         operation_results: vec![OperationResult::default()],
     }
-    .with(block);
-    let confirmed_value = Hashed::new(ConfirmedBlock::new(executed_block.clone()));
+    .with(make_first_block(dummy_chain_id(1)).with_simple_transfer(dummy_chain_id(2), Amount::ONE));
+    let confirmed_value = ConfirmedBlock::new(block.clone());
 
     let confirmed_vote = LiteVote::new(
         LiteValue::new(&confirmed_value),
@@ -39,7 +41,7 @@ fn test_signed_values() {
     );
     assert!(confirmed_vote.check().is_ok());
 
-    let validated_value = Hashed::new(ValidatedBlock::new(executed_block));
+    let validated_value = ValidatedBlock::new(block);
     let validated_vote = LiteVote::new(
         LiteValue::new(&validated_value),
         Round::Fast,
@@ -47,7 +49,7 @@ fn test_signed_values() {
     );
     assert_ne!(
         confirmed_vote.value, validated_vote.value,
-        "Confirmed and validated votes should be different, even if for the same executed block"
+        "Confirmed and validated votes should be different, even if for the same block"
     );
 
     let mut v = LiteVote::new(
@@ -78,28 +80,6 @@ fn test_signed_values() {
 }
 
 #[test]
-fn test_hashes() {
-    // Test that hash of confirmed and validated blocks are different,
-    // even if the blocks are the same.
-    let block =
-        make_first_block(ChainId::root(1)).with_simple_transfer(ChainId::root(2), Amount::ONE);
-    let executed_block = BlockExecutionOutcome {
-        messages: vec![Vec::new()],
-        previous_message_blocks: BTreeMap::new(),
-        state_hash: CryptoHash::test_hash("state"),
-        oracle_responses: vec![Vec::new()],
-        events: vec![Vec::new()],
-        blobs: vec![Vec::new()],
-        operation_results: vec![OperationResult::default()],
-    }
-    .with(block);
-    let confirmed_hashed = Hashed::new(ConfirmedBlock::new(executed_block.clone()));
-    let validated_hashed = Hashed::new(ValidatedBlock::new(executed_block));
-
-    assert_eq!(confirmed_hashed.hash(), validated_hashed.hash());
-}
-
-#[test]
 fn test_certificates() {
     let validator1_key_pair = ValidatorKeypair::generate();
     let account1_secret = AccountSecretKey::Ed25519(Ed25519SecretKey::generate());
@@ -112,9 +92,7 @@ fn test_certificates() {
         (validator2_key_pair.public_key, account2_secret.public()),
     ]);
 
-    let block =
-        make_first_block(ChainId::root(1)).with_simple_transfer(ChainId::root(1), Amount::ONE);
-    let executed_block = BlockExecutionOutcome {
+    let block = BlockExecutionOutcome {
         messages: vec![Vec::new()],
         previous_message_blocks: BTreeMap::new(),
         state_hash: CryptoHash::test_hash("state"),
@@ -123,8 +101,8 @@ fn test_certificates() {
         blobs: vec![Vec::new()],
         operation_results: vec![OperationResult::default()],
     }
-    .with(block);
-    let value = Hashed::new(ConfirmedBlock::new(executed_block));
+    .with(make_first_block(dummy_chain_id(1)).with_simple_transfer(dummy_chain_id(1), Amount::ONE));
+    let value = ConfirmedBlock::new(block);
 
     let v1 = LiteVote::new(
         LiteValue::new(&value),

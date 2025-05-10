@@ -70,18 +70,16 @@
 
 use std::collections::BTreeMap;
 
-use async_graphql::{ComplexObject, SimpleObject};
 use custom_debug_derive::Debug;
 use futures::future::Either;
 use linera_base::{
     crypto::{AccountPublicKey, ValidatorSecretKey},
-    data_types::{Blob, BlockHeight, Round, Timestamp},
+    data_types::{Blob, BlockHeight, Epoch, Round, Timestamp},
     ensure,
-    hashed::Hashed,
     identifiers::{AccountOwner, BlobId, ChainId},
     ownership::ChainOwnership,
 };
-use linera_execution::{committee::Epoch, ExecutionRuntimeContext};
+use linera_execution::ExecutionRuntimeContext;
 use linera_views::{
     context::Context,
     map_view::MapView,
@@ -93,8 +91,8 @@ use rand_distr::{Distribution, WeightedAliasIndex};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    block::{ConfirmedBlock, Timeout, ValidatedBlock},
-    data_types::{BlockProposal, ExecutedBlock, LiteVote, ProposedBlock, Vote},
+    block::{Block, ConfirmedBlock, Timeout, ValidatedBlock},
+    data_types::{BlockProposal, LiteVote, ProposedBlock, Vote},
     types::{TimeoutCertificate, ValidatedBlockCertificate},
     ChainError,
 };
@@ -133,14 +131,14 @@ impl LockingBlock {
     pub fn chain_id(&self) -> ChainId {
         match self {
             Self::Fast(proposal) => proposal.content.block.chain_id,
-            Self::Regular(certificate) => certificate.value().inner().chain_id(),
+            Self::Regular(certificate) => certificate.value().chain_id(),
         }
     }
 }
 
 /// The state of the certification process for a chain's next block.
-#[derive(Debug, View, ClonableView, SimpleObject)]
-#[graphql(complex)]
+#[cfg_attr(with_graphql, derive(async_graphql::SimpleObject), graphql(complex))]
+#[derive(Debug, View, ClonableView)]
 pub struct ChainManager<C>
 where
     C: Clone + Context + Send + Sync + 'static,
@@ -150,37 +148,37 @@ where
     /// The seed for the pseudo-random number generator that determines the round leaders.
     pub seed: RegisterView<C, u64>,
     /// The probability distribution for choosing a round leader.
-    #[graphql(skip)] // Derived from ownership.
+    #[cfg_attr(with_graphql, graphql(skip))] // Derived from ownership.
     pub distribution: RegisterView<C, Option<WeightedAliasIndex<u64>>>,
     /// The probability distribution for choosing a fallback round leader.
-    #[graphql(skip)] // Derived from validator weights.
+    #[cfg_attr(with_graphql, graphql(skip))] // Derived from validator weights.
     pub fallback_distribution: RegisterView<C, Option<WeightedAliasIndex<u64>>>,
     /// Highest-round authenticated block that we have received and checked. If there are multiple
     /// proposals in the same round, this contains only the first one.
-    #[graphql(skip)]
+    #[cfg_attr(with_graphql, graphql(skip))]
     pub proposed: RegisterView<C, Option<BlockProposal>>,
     /// These are blobs published or read by the proposed block.
     pub proposed_blobs: MapView<C, BlobId, Blob>,
     /// Latest validated proposal that a validator may have voted to confirm. This is either the
     /// latest `ValidatedBlock` we have seen, or the proposal from the `Fast` round.
-    #[graphql(skip)]
+    #[cfg_attr(with_graphql, graphql(skip))]
     pub locking_block: RegisterView<C, Option<LockingBlock>>,
     /// These are blobs published or read by the locking block.
     pub locking_blobs: MapView<C, BlobId, Blob>,
     /// Latest leader timeout certificate we have received.
-    #[graphql(skip)]
+    #[cfg_attr(with_graphql, graphql(skip))]
     pub timeout: RegisterView<C, Option<TimeoutCertificate>>,
     /// Latest vote we cast to confirm a block.
-    #[graphql(skip)]
+    #[cfg_attr(with_graphql, graphql(skip))]
     pub confirmed_vote: RegisterView<C, Option<Vote<ConfirmedBlock>>>,
     /// Latest vote we cast to validate a block.
-    #[graphql(skip)]
+    #[cfg_attr(with_graphql, graphql(skip))]
     pub validated_vote: RegisterView<C, Option<Vote<ValidatedBlock>>>,
     /// Latest timeout vote we cast.
-    #[graphql(skip)]
+    #[cfg_attr(with_graphql, graphql(skip))]
     pub timeout_vote: RegisterView<C, Option<Vote<Timeout>>>,
     /// Fallback vote we cast.
-    #[graphql(skip)]
+    #[cfg_attr(with_graphql, graphql(skip))]
     pub fallback_vote: RegisterView<C, Option<Vote<Timeout>>>,
     /// The time after which we are ready to sign a timeout certificate for the current round.
     pub round_timeout: RegisterView<C, Option<Timestamp>>,
@@ -190,13 +188,14 @@ where
     /// Having a leader timeout certificate in any given round causes the next one to become
     /// current. Seeing a validated block certificate or a valid proposal in any round causes that
     /// round to become current, unless a higher one already is.
-    #[graphql(skip)]
+    #[cfg_attr(with_graphql, graphql(skip))]
     pub current_round: RegisterView<C, Round>,
     /// The owners that take over in fallback mode.
     pub fallback_owners: RegisterView<C, BTreeMap<AccountOwner, u64>>,
 }
 
-#[ComplexObject]
+#[cfg(with_graphql)]
+#[async_graphql::ComplexObject]
 impl<C> ChainManager<C>
 where
     C: Context + Clone + Send + Sync + 'static,
@@ -347,7 +346,7 @@ where
                 if let Some(validated_cert) = proposal.validated_block_certificate.as_ref() {
                     vote.round <= validated_cert.round
                 } else {
-                    vote.round.is_fast() && vote.value().inner().matches_proposed_block(new_block)
+                    vote.round.is_fast() && vote.value().matches_proposed_block(new_block)
                 },
                 ChainError::HasIncompatibleConfirmedVote(new_block.height, vote.round)
             );
@@ -379,7 +378,7 @@ where
                 return false; // We already signed this timeout.
             }
         }
-        let value = Hashed::new(Timeout::new(chain_id, height, epoch));
+        let value = Timeout::new(chain_id, height, epoch);
         self.timeout_vote
             .set(Some(Vote::new(value, current_round, key_pair)));
         true
@@ -402,7 +401,7 @@ where
         if self.fallback_vote.get().is_some() || self.current_round() >= Round::Validator(0) {
             return false; // We already signed this or are already in fallback mode.
         }
-        let value = Hashed::new(Timeout::new(chain_id, height, epoch));
+        let value = Timeout::new(chain_id, height, epoch);
         let last_regular_round = Round::SingleLeader(u32::MAX);
         self.fallback_vote
             .set(Some(Vote::new(value, last_regular_round, key_pair)));
@@ -417,7 +416,7 @@ where
         let new_block = certificate.block();
         let new_round = certificate.round;
         if let Some(Vote { value, round, .. }) = self.confirmed_vote.get() {
-            if value.inner().block() == new_block && *round == new_round {
+            if value.block() == new_block && *round == new_round {
                 return Ok(Outcome::Skip); // We already voted to confirm this block.
             }
         }
@@ -445,7 +444,7 @@ where
     pub fn create_vote(
         &mut self,
         proposal: BlockProposal,
-        executed_block: ExecutedBlock,
+        block: Block,
         key_pair: Option<&ValidatorSecretKey>,
         local_time: Timestamp,
         blobs: BTreeMap<BlobId, Blob>,
@@ -460,7 +459,7 @@ where
                 .as_ref()
                 .is_none_or(|locking| locking.round() < lite_cert.round)
             {
-                let value = Hashed::new(ValidatedBlock::new(executed_block.clone()));
+                let value = ValidatedBlock::new(block.clone());
                 if let Some(certificate) = lite_cert.clone().with_value(value) {
                     self.update_locking(LockingBlock::Regular(certificate), blobs.clone())?;
                 }
@@ -482,13 +481,13 @@ where
         // If this is a fast block, vote to confirm. Otherwise vote to validate.
         if round.is_fast() {
             self.validated_vote.set(None);
-            let value = Hashed::new(ConfirmedBlock::new(executed_block));
+            let value = ConfirmedBlock::new(block);
             let vote = Vote::new(value, round, key_pair);
             Ok(Some(Either::Right(
                 self.confirmed_vote.get_mut().insert(vote),
             )))
         } else {
-            let value = Hashed::new(ValidatedBlock::new(executed_block));
+            let value = ValidatedBlock::new(block);
             let vote = Vote::new(value, round, key_pair);
             Ok(Some(Either::Left(
                 self.validated_vote.get_mut().insert(vote),
@@ -505,7 +504,7 @@ where
         blobs: BTreeMap<BlobId, Blob>,
     ) -> Result<(), ViewError> {
         let round = validated.round;
-        let confirmed_block = ConfirmedBlock::new(validated.inner().block().clone().into());
+        let confirmed_block = ConfirmedBlock::new(validated.inner().block().clone());
         self.update_locking(LockingBlock::Regular(validated), blobs)?;
         self.update_current_round(local_time);
         if let Some(key_pair) = key_pair {
@@ -513,7 +512,7 @@ where
                 return Ok(()); // We never vote in a past round.
             }
             // Vote to confirm.
-            let vote = Vote::new(Hashed::new(confirmed_block), round, key_pair);
+            let vote = Vote::new(confirmed_block, round, key_pair);
             // Ok to overwrite validation votes with confirmation votes at equal or higher round.
             self.confirmed_vote.set(Some(vote));
             self.validated_vote.set(None);
@@ -716,10 +715,10 @@ pub struct ChainManagerInfo {
     pub fallback_vote: Option<LiteVote>,
     /// The value we voted for, if requested.
     #[debug(skip_if = Option::is_none)]
-    pub requested_confirmed: Option<Box<Hashed<ConfirmedBlock>>>,
+    pub requested_confirmed: Option<Box<ConfirmedBlock>>,
     /// The value we voted for, if requested.
     #[debug(skip_if = Option::is_none)]
-    pub requested_validated: Option<Box<Hashed<ValidatedBlock>>>,
+    pub requested_validated: Option<Box<ValidatedBlock>>,
     /// The current round, i.e. the lowest round where we can still vote to validate a block.
     pub current_round: Round,
     /// The current leader, who is allowed to propose the next block.
@@ -796,9 +795,9 @@ impl ChainManagerInfo {
     }
 
     /// Returns whether a proposal with this content was already handled.
-    pub fn already_handled_proposal(&self, round: Round, block: &ProposedBlock) -> bool {
+    pub fn already_handled_proposal(&self, round: Round, proposed_block: &ProposedBlock) -> bool {
         self.requested_proposed.as_ref().is_some_and(|proposal| {
-            proposal.content.round == round && proposal.content.block == *block
+            proposal.content.round == round && *proposed_block == proposal.content.block
         })
     }
 

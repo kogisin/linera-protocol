@@ -5,13 +5,19 @@
 
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Amount, BlockHeight},
-    identifiers::{AccountOwner, ApplicationId, ChainId, MessageId, ModuleId},
+    data_types::{Amount, BlockHeight, StreamUpdate},
+    identifiers::{
+        AccountOwner, ApplicationId, ChainId, GenericApplicationId, MessageId, ModuleId, StreamId,
+        StreamName,
+    },
     ownership::{ChangeApplicationPermissionsError, CloseChainError},
     vm::VmRuntime,
 };
 
-use super::wit::contract_runtime_api as wit_contract_api;
+use super::wit::{
+    contract_runtime_api as wit_contract_api,
+    exports::linera::app::contract_entrypoints as wit_entrypoints,
+};
 
 impl From<wit_contract_api::CryptoHash> for CryptoHash {
     fn from(crypto_hash: wit_contract_api::CryptoHash) -> Self {
@@ -24,12 +30,25 @@ impl From<wit_contract_api::CryptoHash> for CryptoHash {
     }
 }
 
+impl From<wit_contract_api::Array20> for [u8; 20] {
+    fn from(ethereum_address: wit_contract_api::Array20) -> Self {
+        let mut bytes = [0u8; 20];
+        bytes[0..8].copy_from_slice(&ethereum_address.part1.to_le_bytes());
+        bytes[8..16].copy_from_slice(&ethereum_address.part2.to_le_bytes());
+        bytes[16..20].copy_from_slice(&ethereum_address.part3.to_le_bytes());
+        bytes
+    }
+}
+
 impl From<wit_contract_api::AccountOwner> for AccountOwner {
     fn from(account_owner: wit_contract_api::AccountOwner) -> Self {
         match account_owner {
             wit_contract_api::AccountOwner::Reserved(value) => AccountOwner::Reserved(value),
             wit_contract_api::AccountOwner::Address32(value) => {
                 AccountOwner::Address32(value.into())
+            }
+            wit_contract_api::AccountOwner::Address20(value) => {
+                AccountOwner::Address20(value.into())
             }
         }
     }
@@ -100,6 +119,66 @@ impl From<wit_contract_api::ChangeApplicationPermissionsError>
             wit_contract_api::ChangeApplicationPermissionsError::NotPermitted => {
                 ChangeApplicationPermissionsError::NotPermitted
             }
+        }
+    }
+}
+
+impl From<wit_entrypoints::CryptoHash> for CryptoHash {
+    fn from(crypto_hash: wit_entrypoints::CryptoHash) -> Self {
+        CryptoHash::from([
+            crypto_hash.part1,
+            crypto_hash.part2,
+            crypto_hash.part3,
+            crypto_hash.part4,
+        ])
+    }
+}
+
+impl From<wit_entrypoints::ApplicationId> for ApplicationId {
+    fn from(application_id: wit_entrypoints::ApplicationId) -> Self {
+        ApplicationId::new(application_id.application_description_hash.into())
+    }
+}
+
+impl From<wit_entrypoints::GenericApplicationId> for GenericApplicationId {
+    fn from(generic_application_id: wit_entrypoints::GenericApplicationId) -> Self {
+        match generic_application_id {
+            wit_entrypoints::GenericApplicationId::System => GenericApplicationId::System,
+            wit_entrypoints::GenericApplicationId::User(application_id) => {
+                GenericApplicationId::User(application_id.into())
+            }
+        }
+    }
+}
+
+impl From<wit_entrypoints::ChainId> for ChainId {
+    fn from(chain_id: wit_entrypoints::ChainId) -> Self {
+        ChainId(chain_id.inner0.into())
+    }
+}
+
+impl From<wit_entrypoints::StreamName> for StreamName {
+    fn from(stream_name: wit_entrypoints::StreamName) -> Self {
+        StreamName(stream_name.inner0)
+    }
+}
+
+impl From<wit_entrypoints::StreamId> for StreamId {
+    fn from(stream_id: wit_entrypoints::StreamId) -> Self {
+        StreamId {
+            application_id: stream_id.application_id.into(),
+            stream_name: stream_id.stream_name.into(),
+        }
+    }
+}
+
+impl From<wit_entrypoints::StreamUpdate> for StreamUpdate {
+    fn from(stream_update: wit_entrypoints::StreamUpdate) -> Self {
+        StreamUpdate {
+            chain_id: stream_update.chain_id.into(),
+            stream_id: stream_update.stream_id.into(),
+            previous_index: stream_update.previous_index,
+            next_index: stream_update.next_index,
         }
     }
 }

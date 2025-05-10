@@ -8,6 +8,7 @@ mod ed25519;
 mod hash;
 #[allow(dead_code)]
 mod secp256k1;
+mod signer;
 use std::{fmt::Display, io, num::ParseIntError, str::FromStr};
 
 use alloy_primitives::FixedBytes;
@@ -15,8 +16,12 @@ use custom_debug_derive::Debug;
 pub use ed25519::{Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature};
 pub use hash::*;
 use linera_witty::{WitLoad, WitStore, WitType};
-pub use secp256k1::{Secp256k1PublicKey, Secp256k1SecretKey, Secp256k1Signature};
+pub use secp256k1::{
+    evm::{EvmPublicKey, EvmSecretKey, EvmSignature},
+    Secp256k1PublicKey, Secp256k1SecretKey, Secp256k1Signature,
+};
 use serde::{Deserialize, Serialize};
+pub use signer::*;
 use thiserror::Error;
 
 /// The public key of a validator.
@@ -35,6 +40,8 @@ pub enum SignatureScheme {
     Ed25519,
     /// secp256k1
     Secp256k1,
+    /// EVM secp256k1
+    EvmSecp256k1,
 }
 
 /// The public key of a chain owner.
@@ -60,6 +67,8 @@ pub enum AccountPublicKey {
     Ed25519(ed25519::Ed25519PublicKey),
     /// secp256k1 public key.
     Secp256k1(secp256k1::Secp256k1PublicKey),
+    /// EVM secp256k1 public key.
+    EvmSecp256k1(secp256k1::evm::EvmPublicKey),
 }
 
 /// The private key of a chain owner.
@@ -69,6 +78,8 @@ pub enum AccountSecretKey {
     Ed25519(ed25519::Ed25519SecretKey),
     /// secp256k1 secret key.
     Secp256k1(secp256k1::Secp256k1SecretKey),
+    /// EVM secp256k1 secret key.
+    EvmSecp256k1(secp256k1::evm::EvmSecretKey),
 }
 
 /// The signature of a chain owner.
@@ -78,6 +89,8 @@ pub enum AccountSignature {
     Ed25519(ed25519::Ed25519Signature),
     /// secp256k1 signature.
     Secp256k1(secp256k1::Secp256k1Signature),
+    /// EVM secp256k1 signature.
+    EvmSecp256k1(secp256k1::evm::EvmSignature),
 }
 
 impl AccountSecretKey {
@@ -86,6 +99,9 @@ impl AccountSecretKey {
         match self {
             AccountSecretKey::Ed25519(secret) => AccountPublicKey::Ed25519(secret.public()),
             AccountSecretKey::Secp256k1(secret) => AccountPublicKey::Secp256k1(secret.public()),
+            AccountSecretKey::EvmSecp256k1(secret) => {
+                AccountPublicKey::EvmSecp256k1(secret.public())
+            }
         }
     }
 
@@ -94,6 +110,7 @@ impl AccountSecretKey {
         match self {
             AccountSecretKey::Ed25519(secret) => AccountSecretKey::Ed25519(secret.copy()),
             AccountSecretKey::Secp256k1(secret) => AccountSecretKey::Secp256k1(secret.copy()),
+            AccountSecretKey::EvmSecp256k1(secret) => AccountSecretKey::EvmSecp256k1(secret.copy()),
         }
     }
 
@@ -111,6 +128,28 @@ impl AccountSecretKey {
                 let signature = secp256k1::Secp256k1Signature::new(value, secret);
                 AccountSignature::Secp256k1(signature)
             }
+            AccountSecretKey::EvmSecp256k1(secret) => {
+                let signature = secp256k1::evm::EvmSignature::new(value, secret);
+                AccountSignature::EvmSecp256k1(signature)
+            }
+        }
+    }
+
+    /// Creates a signature for the `value`.
+    pub fn sign_prehash(&self, value: CryptoHash) -> AccountSignature {
+        match self {
+            AccountSecretKey::Ed25519(secret) => {
+                let signature = Ed25519Signature::sign_prehash(secret, value);
+                AccountSignature::Ed25519(signature)
+            }
+            AccountSecretKey::Secp256k1(secret) => {
+                let signature = secp256k1::Secp256k1Signature::sign_prehash(secret, value);
+                AccountSignature::Secp256k1(signature)
+            }
+            AccountSecretKey::EvmSecp256k1(secret) => {
+                let signature = secp256k1::evm::EvmSignature::sign_prehash(secret, value);
+                AccountSignature::EvmSecp256k1(signature)
+            }
         }
     }
 
@@ -118,6 +157,12 @@ impl AccountSecretKey {
     /// Generates a new key pair using the operating system's RNG.
     pub fn generate() -> Self {
         AccountSecretKey::Ed25519(Ed25519SecretKey::generate())
+    }
+
+    #[cfg(with_getrandom)]
+    /// Generates a new key pair from the given RNG. Use with care.
+    pub fn generate_from<R: CryptoRng>(rng: &mut R) -> Self {
+        AccountSecretKey::Ed25519(Ed25519SecretKey::generate_from(rng))
     }
 }
 
@@ -127,6 +172,7 @@ impl AccountPublicKey {
         match self {
             AccountPublicKey::Ed25519(_) => SignatureScheme::Ed25519,
             AccountPublicKey::Secp256k1(_) => SignatureScheme::Secp256k1,
+            AccountPublicKey::EvmSecp256k1(_) => SignatureScheme::EvmSecp256k1,
         }
     }
 
@@ -162,6 +208,10 @@ impl AccountSignature {
             (AccountSignature::Secp256k1(signature), AccountPublicKey::Secp256k1(public_key)) => {
                 signature.check(value, &public_key)
             }
+            (
+                AccountSignature::EvmSecp256k1(signature),
+                AccountPublicKey::EvmSecp256k1(public_key),
+            ) => signature.check(value, &public_key),
             (AccountSignature::Ed25519(_), _) => {
                 let type_name = std::any::type_name::<T>();
                 Err(CryptoError::InvalidSignature {
@@ -173,6 +223,13 @@ impl AccountSignature {
                 let type_name = std::any::type_name::<T>();
                 Err(CryptoError::InvalidSignature {
                     error: "invalid signature scheme. Expected secp256k1 signature.".to_string(),
+                    type_name: type_name.to_string(),
+                })
+            }
+            (AccountSignature::EvmSecp256k1(_), _) => {
+                let type_name = std::any::type_name::<T>();
+                Err(CryptoError::InvalidSignature {
+                    error: "invalid signature scheme. Expected EvmSecp256k1 signature.".to_string(),
                     type_name: type_name.to_string(),
                 })
             }
@@ -383,7 +440,7 @@ pub(crate) fn u64_array_to_le_bytes(integers: [u64; 4]) -> [u8; 32] {
 }
 
 /// Returns the bytes that represent the `integers` in big-endian.
-pub(crate) fn u64_array_to_be_bytes(integers: [u64; 4]) -> [u8; 32] {
+pub fn u64_array_to_be_bytes(integers: [u64; 4]) -> [u8; 32] {
     let mut bytes = [0u8; 32];
 
     bytes[0..8].copy_from_slice(&integers[0].to_be_bytes());

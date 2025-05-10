@@ -7,13 +7,13 @@
 #![deny(clippy::large_futures)]
 
 pub mod committee;
+pub mod evm;
 mod execution;
 mod execution_state_actor;
+#[cfg(with_graphql)]
 mod graphql;
 mod policy;
 mod resources;
-#[cfg(with_revm)]
-pub mod revm;
 mod runtime;
 pub mod system;
 #[cfg(with_testing)]
@@ -26,7 +26,6 @@ use std::{any::Any, fmt, str::FromStr, sync::Arc};
 
 use async_graphql::SimpleObject;
 use async_trait::async_trait;
-use committee::Epoch;
 use custom_debug_derive::Debug;
 use dashmap::DashMap;
 use derive_more::Display;
@@ -37,23 +36,24 @@ use linera_base::{
     crypto::{BcsHashable, CryptoHash},
     data_types::{
         Amount, ApplicationDescription, ApplicationPermissions, ArithmeticError, Blob, BlockHeight,
-        DecompressionError, Resources, SendMessageRequest, Timestamp,
+        DecompressionError, Epoch, SendMessageRequest, StreamUpdate, Timestamp,
     },
     doc_scalar, hex_debug, http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, ChannelName, Destination,
-        EventId, GenericApplicationId, MessageId, ModuleId, StreamName,
+        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, EventId,
+        GenericApplicationId, MessageId, ModuleId, StreamName,
     },
     ownership::ChainOwnership,
     task,
+    vm::VmRuntime,
 };
 use linera_views::{batch::Batch, views::ViewError};
 use serde::{Deserialize, Serialize};
-use system::{AdminOperation, OpenChainConfig};
+use system::AdminOperation;
 use thiserror::Error;
 
 #[cfg(with_revm)]
-use crate::revm::EvmExecutionError;
+use crate::evm::EvmExecutionError;
 use crate::runtime::ContractSyncRuntime;
 #[cfg(all(with_testing, with_wasm_runtime))]
 pub use crate::wasm::test as wasm_test;
@@ -76,6 +76,10 @@ pub use crate::{
     },
     transaction_tracker::{TransactionOutcome, TransactionTracker},
 };
+
+/// The `linera.sol` library code to be included in solidity smart
+/// contracts using Linera features.
+pub const LINERA_SOL: &str = include_str!("../solidity/linera.sol");
 
 /// The maximum length of a stream name.
 const MAX_STREAM_NAME_LEN: usize = 64;
@@ -224,14 +228,14 @@ pub enum ExecutionError {
     ExcessiveRead,
     #[error("Excessive number of bytes written to storage")]
     ExcessiveWrite,
-    #[error("Block execution required too much fuel")]
-    MaximumFuelExceeded,
+    #[error("Block execution required too much fuel for VM {0}")]
+    MaximumFuelExceeded(VmRuntime),
     #[error("Services running as oracles in block took longer than allowed")]
     MaximumServiceOracleExecutionTimeExceeded,
     #[error("Service running as an oracle produced a response that's too large")]
     ServiceOracleResponseTooLarge,
-    #[error("Serialized size of the executed block exceeds limit")]
-    ExecutedBlockTooLarge,
+    #[error("Serialized size of the block exceeds limit")]
+    BlockTooLarge,
     #[error("HTTP response exceeds the size limit of {limit} bytes, having at least {size} bytes")]
     HttpResponseSizeLimitExceeded { limit: u64, size: u64 },
     #[error("Runtime failed to respond to application")]
@@ -325,8 +329,14 @@ pub enum ExecutionError {
     InactiveChain,
     #[error("No recorded response for oracle query")]
     MissingOracleResponse,
+    #[error("process_streams was not called for all stream updates")]
+    UnprocessedStreams,
     #[error("Internal error: {0}")]
     InternalError(&'static str),
+    #[error("UpdateStreams contains an unknown event")]
+    EventNotFound(EventId),
+    #[error("UpdateStreams is outdated")]
+    OutdatedUpdateStreams,
 }
 
 impl From<ViewError> for ExecutionError {
@@ -341,38 +351,25 @@ impl From<ViewError> for ExecutionError {
 /// The public entry points provided by the contract part of an application.
 pub trait UserContract {
     /// Instantiate the application state on the chain that owns the application.
-    fn instantiate(
-        &mut self,
-        context: OperationContext,
-        argument: Vec<u8>,
-    ) -> Result<(), ExecutionError>;
+    fn instantiate(&mut self, argument: Vec<u8>) -> Result<(), ExecutionError>;
 
     /// Applies an operation from the current block.
-    fn execute_operation(
-        &mut self,
-        context: OperationContext,
-        operation: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError>;
+    fn execute_operation(&mut self, operation: Vec<u8>) -> Result<Vec<u8>, ExecutionError>;
 
     /// Applies a message originating from a cross-chain message.
-    fn execute_message(
-        &mut self,
-        context: MessageContext,
-        message: Vec<u8>,
-    ) -> Result<(), ExecutionError>;
+    fn execute_message(&mut self, message: Vec<u8>) -> Result<(), ExecutionError>;
+
+    /// Reacts to new events on streams this application subscribes to.
+    fn process_streams(&mut self, updates: Vec<StreamUpdate>) -> Result<(), ExecutionError>;
 
     /// Finishes execution of the current transaction.
-    fn finalize(&mut self, context: FinalizeContext) -> Result<(), ExecutionError>;
+    fn finalize(&mut self) -> Result<(), ExecutionError>;
 }
 
 /// The public entry points provided by the service part of an application.
 pub trait UserService {
     /// Executes unmetered read-only queries on the state of this application.
-    fn handle_query(
-        &mut self,
-        context: QueryContext,
-        argument: Vec<u8>,
-    ) -> Result<Vec<u8>, ExecutionError>;
+    fn handle_query(&mut self, argument: Vec<u8>) -> Result<Vec<u8>, ExecutionError>;
 }
 
 /// Configuration options for the execution runtime available to applications.
@@ -408,6 +405,8 @@ pub trait ExecutionRuntimeContext {
 
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError>;
 
+    async fn contains_event(&self, event_id: EventId) -> Result<bool, ViewError>;
+
     #[cfg(with_testing)]
     async fn add_blobs(
         &self,
@@ -436,9 +435,8 @@ pub struct OperationContext {
     pub height: BlockHeight,
     /// The consensus round number, if this is a block that gets validated in a multi-leader round.
     pub round: Option<u32>,
-    /// The current index of the operation.
-    #[debug(skip_if = Option::is_none)]
-    pub index: Option<u32>,
+    /// The timestamp of the block containing the operation.
+    pub timestamp: Timestamp,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -457,11 +455,45 @@ pub struct MessageContext {
     pub height: BlockHeight,
     /// The consensus round number, if this is a block that gets validated in a multi-leader round.
     pub round: Option<u32>,
-    /// The hash of the remote certificate that created the message.
-    pub certificate_hash: CryptoHash,
+    /// The timestamp of the block executing the message.
+    pub timestamp: Timestamp,
     /// The ID of the message (based on the operation height and index in the remote
     /// certificate).
     pub message_id: MessageId,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessStreamsContext {
+    /// The current chain ID.
+    pub chain_id: ChainId,
+    /// The current block height.
+    pub height: BlockHeight,
+    /// The consensus round number, if this is a block that gets validated in a multi-leader round.
+    pub round: Option<u32>,
+    /// The timestamp of the current block.
+    pub timestamp: Timestamp,
+}
+
+impl From<MessageContext> for ProcessStreamsContext {
+    fn from(context: MessageContext) -> Self {
+        Self {
+            chain_id: context.chain_id,
+            height: context.height,
+            round: context.round,
+            timestamp: context.timestamp,
+        }
+    }
+}
+
+impl From<OperationContext> for ProcessStreamsContext {
+    fn from(context: OperationContext) -> Self {
+        Self {
+            chain_id: context.chain_id,
+            height: context.height,
+            round: context.round,
+            timestamp: context.timestamp,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -688,20 +720,17 @@ pub trait ContractRuntime: BaseRuntime {
     /// based on the execution context.
     fn authenticated_caller_id(&mut self) -> Result<Option<ApplicationId>, ExecutionError>;
 
+    /// Returns the maximum gas fuel per block.
+    fn maximum_fuel_per_block(&mut self, vm_runtime: VmRuntime) -> Result<u64, ExecutionError>;
+
     /// Returns the amount of execution fuel remaining before execution is aborted.
-    fn remaining_fuel(&mut self) -> Result<u64, ExecutionError>;
+    fn remaining_fuel(&mut self, vm_runtime: VmRuntime) -> Result<u64, ExecutionError>;
 
     /// Consumes some of the execution fuel.
-    fn consume_fuel(&mut self, fuel: u64) -> Result<(), ExecutionError>;
+    fn consume_fuel(&mut self, fuel: u64, vm_runtime: VmRuntime) -> Result<(), ExecutionError>;
 
     /// Schedules a message to be sent.
     fn send_message(&mut self, message: SendMessageRequest<Vec<u8>>) -> Result<(), ExecutionError>;
-
-    /// Schedules to subscribe to some `channel` on a `chain`.
-    fn subscribe(&mut self, chain: ChainId, channel: ChannelName) -> Result<(), ExecutionError>;
-
-    /// Schedules to unsubscribe to some `channel` on a `chain`.
-    fn unsubscribe(&mut self, chain: ChainId, channel: ChannelName) -> Result<(), ExecutionError>;
 
     /// Transfers amount from source to destination.
     fn transfer(
@@ -731,6 +760,32 @@ pub trait ContractRuntime: BaseRuntime {
     /// Adds a new item to an event stream. Returns the new event's index in the stream.
     fn emit(&mut self, name: StreamName, value: Vec<u8>) -> Result<u32, ExecutionError>;
 
+    /// Reads an event from a stream. Returns the event's value.
+    ///
+    /// Returns an error if the event doesn't exist.
+    fn read_event(
+        &mut self,
+        chain_id: ChainId,
+        stream_name: StreamName,
+        index: u32,
+    ) -> Result<Vec<u8>, ExecutionError>;
+
+    /// Subscribes this application to an event stream.
+    fn subscribe_to_events(
+        &mut self,
+        chain_id: ChainId,
+        application_id: ApplicationId,
+        stream_name: StreamName,
+    ) -> Result<(), ExecutionError>;
+
+    /// Unsubscribes this application from an event stream.
+    fn unsubscribe_from_events(
+        &mut self,
+        chain_id: ChainId,
+        application_id: ApplicationId,
+        stream_name: StreamName,
+    ) -> Result<(), ExecutionError>;
+
     /// Queries a service.
     fn query_service(
         &mut self,
@@ -744,7 +799,7 @@ pub trait ContractRuntime: BaseRuntime {
         ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
         balance: Amount,
-    ) -> Result<(MessageId, ChainId), ExecutionError>;
+    ) -> Result<ChainId, ExecutionError>;
 
     /// Closes the current chain.
     fn close_chain(&mut self) -> Result<(), ExecutionError>;
@@ -863,48 +918,6 @@ pub enum QueryResponse {
     ),
 }
 
-/// A message together with routing information.
-#[derive(Clone, Debug)]
-#[cfg_attr(with_testing, derive(Eq, PartialEq))]
-pub struct RawOutgoingMessage<Message, Grant> {
-    /// The destination of the message.
-    pub destination: Destination,
-    /// Whether the message is authenticated.
-    pub authenticated: bool,
-    /// The grant needed for message execution, typically specified as an `Amount` or as `Resources`.
-    pub grant: Grant,
-    /// The kind of outgoing message being sent.
-    pub kind: MessageKind,
-    /// The message itself.
-    pub message: Message,
-}
-
-impl<Message> From<SendMessageRequest<Message>> for RawOutgoingMessage<Message, Resources> {
-    fn from(request: SendMessageRequest<Message>) -> Self {
-        let SendMessageRequest {
-            destination,
-            authenticated,
-            grant,
-            is_tracked,
-            message,
-        } = request;
-
-        let kind = if is_tracked {
-            MessageKind::Tracked
-        } else {
-            MessageKind::Simple
-        };
-
-        RawOutgoingMessage {
-            destination,
-            authenticated,
-            grant,
-            kind,
-            message,
-        }
-    }
-}
-
 /// The kind of outgoing message being sent.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Copy)]
 pub enum MessageKind {
@@ -924,7 +937,7 @@ pub enum MessageKind {
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct OutgoingMessage {
     /// The destination of the message.
-    pub destination: Destination,
+    pub destination: ChainId,
     /// The user authentication carried by the message, if any.
     #[debug(skip_if = Option::is_none)]
     pub authenticated_signer: Option<AccountOwner>,
@@ -946,7 +959,7 @@ impl OutgoingMessage {
     /// Creates a new simple outgoing message with no grant and no authenticated signer.
     pub fn new(recipient: ChainId, message: impl Into<Message>) -> Self {
         OutgoingMessage {
-            destination: Destination::Recipient(recipient),
+            destination: recipient,
             authenticated_signer: None,
             grant: Amount::ZERO,
             refund_grant_to: None,
@@ -976,14 +989,6 @@ impl OperationContext {
             chain_id: self.chain_id,
             owner,
         })
-    }
-
-    fn next_message_id(&self, next_message_index: u32) -> MessageId {
-        MessageId {
-            chain_id: self.chain_id,
-            height: self.height,
-            index: next_message_index,
-        }
     }
 }
 
@@ -1080,6 +1085,10 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
         Ok(self.blobs.contains_key(&blob_id))
     }
 
+    async fn contains_event(&self, event_id: EventId) -> Result<bool, ViewError> {
+        Ok(self.events.contains_key(&event_id))
+    }
+
     #[cfg(with_testing)]
     async fn add_blobs(
         &self,
@@ -1163,12 +1172,22 @@ impl Operation {
             Some(SystemOperation::Admin(AdminOperation::PublishCommitteeBlob { blob_hash })) => {
                 vec![BlobId::new(*blob_hash, BlobType::Committee)]
             }
-            Some(SystemOperation::PublishModule { module_id }) => vec![
-                BlobId::new(module_id.contract_blob_hash, BlobType::ContractBytecode),
-                BlobId::new(module_id.service_blob_hash, BlobType::ServiceBytecode),
-            ],
+            Some(SystemOperation::PublishModule { module_id }) => module_id.bytecode_blob_ids(),
             _ => vec![],
         }
+    }
+
+    /// Returns whether this operation is allowed regardless of application permissions.
+    pub fn is_exempt_from_permissions(&self) -> bool {
+        let Operation::System(system_op) = self else {
+            return false;
+        };
+        matches!(
+            **system_op,
+            SystemOperation::ProcessNewEpoch(_)
+                | SystemOperation::ProcessRemovedEpoch(_)
+                | SystemOperation::UpdateStreams(_)
+        )
     }
 }
 
@@ -1201,13 +1220,6 @@ impl Message {
         match self {
             Self::System(_) => GenericApplicationId::System,
             Self::User { application_id, .. } => GenericApplicationId::User(*application_id),
-        }
-    }
-
-    pub fn matches_open_chain(&self) -> Option<&OpenChainConfig> {
-        match self {
-            Message::System(SystemMessage::OpenChain(config)) => Some(config),
-            _ => None,
         }
     }
 }

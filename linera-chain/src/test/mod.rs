@@ -6,13 +6,12 @@
 mod http_server;
 
 use linera_base::{
-    crypto::{AccountPublicKey, AccountSecretKey},
-    data_types::{Amount, BlockHeight, Round, Timestamp},
-    hashed::Hashed,
+    crypto::{AccountPublicKey, Signer},
+    data_types::{Amount, BlockHeight, Epoch, Round, Timestamp},
     identifiers::{AccountOwner, ChainId},
 };
 use linera_execution::{
-    committee::{Committee, Epoch, ValidatorState},
+    committee::{Committee, ValidatorState},
     system::Recipient,
     Message, MessageKind, Operation, ResourceControlPolicy, SystemOperation,
 };
@@ -27,9 +26,8 @@ use crate::{
 };
 
 /// Creates a new child of the given block, with the same timestamp.
-pub fn make_child_block(parent: &Hashed<ConfirmedBlock>) -> ProposedBlock {
-    let parent_value = parent.inner();
-    let parent_header = &parent_value.block().header;
+pub fn make_child_block(parent: &ConfirmedBlock) -> ProposedBlock {
+    let parent_header = &parent.block().header;
     ProposedBlock {
         epoch: parent_header.epoch,
         chain_id: parent_header.chain_id,
@@ -57,6 +55,7 @@ pub fn make_first_block(chain_id: ChainId) -> ProposedBlock {
 }
 
 /// A helper trait to simplify constructing blocks for tests.
+#[allow(async_fn_in_trait)]
 pub trait BlockTestExt: Sized {
     /// Returns the block with the given authenticated signer.
     fn with_authenticated_signer(self, authenticated_signer: Option<AccountOwner>) -> Self;
@@ -81,12 +80,22 @@ pub trait BlockTestExt: Sized {
 
     /// Returns a block proposal in the first round in a default ownership configuration
     /// (`Round::MultiLeader(0)`) without any hashed certificate values or validated block.
-    fn into_first_proposal(self, key_pair: &AccountSecretKey) -> BlockProposal {
-        self.into_proposal_with_round(key_pair, Round::MultiLeader(0))
+    async fn into_first_proposal(
+        self,
+        owner: AccountOwner,
+        signer: &(impl Signer + ?Sized),
+    ) -> Result<BlockProposal, Box<dyn std::error::Error>> {
+        self.into_proposal_with_round(owner, signer, Round::MultiLeader(0))
+            .await
     }
 
     /// Returns a block proposal without any hashed certificate values or validated block.
-    fn into_proposal_with_round(self, key_pair: &AccountSecretKey, round: Round) -> BlockProposal;
+    async fn into_proposal_with_round(
+        self,
+        owner: AccountOwner,
+        signer: &(impl Signer + ?Sized),
+        round: Round,
+    ) -> Result<BlockProposal, Box<dyn std::error::Error>>;
 }
 
 impl BlockTestExt for ProposedBlock {
@@ -127,12 +136,17 @@ impl BlockTestExt for ProposedBlock {
         self
     }
 
-    fn into_proposal_with_round(self, key_pair: &AccountSecretKey, round: Round) -> BlockProposal {
-        BlockProposal::new_initial(round, self, key_pair)
+    async fn into_proposal_with_round(
+        self,
+        owner: AccountOwner,
+        signer: &(impl Signer + ?Sized),
+        round: Round,
+    ) -> Result<BlockProposal, Box<dyn std::error::Error>> {
+        BlockProposal::new_initial(owner, round, self, signer).await
     }
 }
 
-pub trait VoteTestExt<T>: Sized {
+pub trait VoteTestExt<T: CertificateValue>: Sized {
     /// Returns a certificate for a committee consisting only of this validator.
     fn into_certificate(self) -> GenericCertificate<T>;
 }

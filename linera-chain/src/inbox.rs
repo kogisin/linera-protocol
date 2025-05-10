@@ -21,7 +21,7 @@ use linera_views::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{data_types::MessageBundle, ChainError, Origin};
+use crate::{data_types::MessageBundle, ChainError};
 
 #[cfg(test)]
 #[path = "unit_tests/inbox_tests.rs"]
@@ -39,7 +39,7 @@ static INBOX_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
         "inbox_size",
         "Inbox size",
         &[],
-        exponential_bucket_interval(1.0, 500_000.0),
+        exponential_bucket_interval(1.0, 2_000_000.0),
     )
 });
 
@@ -65,7 +65,8 @@ static REMOVED_BUNDLES: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// * The cursors of added bundles (resp. removed bundles) must be increasing over time.
 /// * Reconciliation of added and removed bundles is allowed to skip some added bundles.
 ///   However, the opposite is not true: every removed bundle must be eventually added.
-#[derive(Debug, ClonableView, View, async_graphql::SimpleObject)]
+#[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
+#[derive(Debug, ClonableView, View)]
 pub struct InboxStateView<C>
 where
     C: Clone + Context + Send + Sync,
@@ -143,8 +144,8 @@ impl Cursor {
     }
 }
 
-impl From<(ChainId, Origin, InboxError)> for ChainError {
-    fn from(value: (ChainId, Origin, InboxError)) -> Self {
+impl From<(ChainId, ChainId, InboxError)> for ChainError {
+    fn from(value: (ChainId, ChainId, InboxError)) -> Self {
         let (chain_id, origin, error) = value;
         match error {
             InboxError::ViewError(e) => ChainError::ViewError(e),
@@ -154,7 +155,7 @@ impl From<(ChainId, Origin, InboxError)> for ChainError {
                 previous_bundle,
             } => ChainError::UnexpectedMessage {
                 chain_id,
-                origin: origin.into(),
+                origin,
                 bundle: Box::new(bundle),
                 previous_bundle: Box::new(previous_bundle),
             },
@@ -163,14 +164,14 @@ impl From<(ChainId, Origin, InboxError)> for ChainError {
                 next_cursor,
             } => ChainError::IncorrectMessageOrder {
                 chain_id,
-                origin: origin.into(),
+                origin,
                 bundle: Box::new(bundle),
                 next_height: next_cursor.height,
                 next_index: next_cursor.index,
             },
             InboxError::UnskippableBundle { bundle } => ChainError::CannotSkipMessage {
                 chain_id,
-                origin: origin.into(),
+                origin,
                 bundle: Box::new(bundle),
             },
         }

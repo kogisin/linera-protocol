@@ -22,7 +22,7 @@ mod pending_blobs;
 pub mod test;
 
 pub use chain::ChainStateView;
-use data_types::{MessageBundle, Origin, PostedMessage};
+use data_types::{MessageBundle, PostedMessage};
 use linera_base::{
     bcs,
     crypto::{CryptoError, CryptoHash},
@@ -53,7 +53,7 @@ pub enum ChainError {
     )]
     MissingCrossChainUpdate {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         height: BlockHeight,
     },
     #[error(
@@ -62,7 +62,7 @@ pub enum ChainError {
     )]
     UnexpectedMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
         previous_bundle: Box<MessageBundle>,
     },
@@ -73,7 +73,7 @@ pub enum ChainError {
     )]
     IncorrectMessageOrder {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
         next_height: BlockHeight,
         next_index: u32,
@@ -84,7 +84,7 @@ pub enum ChainError {
     )]
     CannotRejectMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         posted_message: Box<PostedMessage>,
     },
     #[error(
@@ -93,7 +93,7 @@ pub enum ChainError {
     )]
     CannotSkipMessage {
         chain_id: ChainId,
-        origin: Box<Origin>,
+        origin: ChainId,
         bundle: Box<MessageBundle>,
     },
     #[error(
@@ -158,7 +158,7 @@ pub enum ChainError {
     MissingMandatoryApplications(Vec<ApplicationId>),
     #[error("Can't use grant across different broadcast messages")]
     GrantUseOnBroadcast,
-    #[error("ExecutedBlock contains fewer oracle responses than requests")]
+    #[error("Executed block contains fewer oracle responses than requests")]
     MissingOracleResponseList,
     #[error("Unexpected hash for CertificateValue! Expected: {expected:?}, Actual: {actual:?}")]
     CertificateValueHashMismatch {
@@ -179,6 +179,7 @@ impl From<ViewError> for ChainError {
 }
 
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(with_testing, derive(Eq, PartialEq))]
 pub enum ChainExecutionContext {
     Query,
     DescribeApplication,

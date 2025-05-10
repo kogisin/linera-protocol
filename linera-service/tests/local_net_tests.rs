@@ -19,11 +19,10 @@ use guard::INTEGRATION_TEST_GUARD;
 use linera_base::vm::VmRuntime;
 use linera_base::{
     crypto::Secp256k1SecretKey,
-    data_types::{Amount, BlockHeight},
-    identifiers::{Account, AccountOwner, ChainId},
+    data_types::{Amount, BlockHeight, Epoch},
+    identifiers::{Account, AccountOwner},
 };
 use linera_core::{data_types::ChainInfoQuery, node::ValidatorNode};
-use linera_execution::committee::Epoch;
 use linera_faucet::ClaimOutcome;
 use linera_sdk::linera_base_types::AccountSecretKey;
 use linera_service::{
@@ -35,7 +34,7 @@ use linera_service::{
 };
 use test_case::test_case;
 #[cfg(feature = "ethereum")]
-use {alloy::primitives::U256, linera_service::cli_wrappers::ApplicationWrapper};
+use {alloy_primitives::U256, linera_service::cli_wrappers::ApplicationWrapper};
 #[cfg(feature = "storage-service")]
 use {
     linera_base::port::get_free_port, linera_service::cli_wrappers::Faucet, std::process::Command,
@@ -81,7 +80,10 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
 
     let client_2 = net.make_client().await;
     client_2.wallet_init(&[], FaucetOption::None).await?;
-    let chain_1 = ChainId::root(0);
+    let chain_1 = client
+        .load_wallet()?
+        .default_chain()
+        .expect("should have a default chain");
 
     let chain_2 = client
         .open_and_assign(&client_2, Amount::from_tokens(3))
@@ -95,6 +97,12 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     };
 
     client.query_validators(None).await?;
+
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(0));
+    assert_eq!(
+        client.query_validator(&address).await?,
+        net.genesis_config()?.hash()
+    );
 
     // Restart the first shard for the 4th validator.
     // TODO(#2286): The proxy currently only re-establishes the connection with gRPC.
@@ -111,7 +119,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     net.start_validator(4).await?;
     net.start_validator(5).await?;
 
-    let address = format!("{}:localhost:{}", network.short(), LocalNet::proxy_port(4));
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(4));
     assert_eq!(
         client.query_validator(&address).await?,
         net.genesis_config()?.hash()
@@ -264,7 +272,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
     net.generate_validator_config(4).await?;
     net.start_validator(4).await?;
 
-    let address = format!("{}:localhost:{}", network.short(), LocalNet::proxy_port(4));
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(4));
     assert_eq!(
         client.query_validator(&address).await?,
         net.genesis_config()?.hash()
@@ -294,12 +302,8 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
 
     // Create a new chain starting on the new epoch
     let new_owner = client.keygen().await?;
-    let ClaimOutcome {
-        chain_id,
-        message_id,
-        ..
-    } = faucet.claim(&new_owner).await?;
-    client.assign(new_owner, message_id).await?;
+    let ClaimOutcome { chain_id, .. } = faucet.claim(&new_owner).await?;
+    client.assign(new_owner, chain_id).await?;
 
     // Attempt to receive the existing epoch change message
     client.process_inbox(chain_id).await?;
@@ -356,7 +360,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     net.generate_validator_config(4).await?;
     net.start_validator(4).await?;
 
-    let address = format!("{}:localhost:{}", network.short(), LocalNet::proxy_port(4));
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(4));
     assert_eq!(
         client.query_validator(&address).await?,
         net.genesis_config()?.hash()
@@ -394,7 +398,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     net.generate_validator_config(5).await?;
     net.start_validator(5).await?;
 
-    let address = format!("{}:localhost:{}", network.short(), LocalNet::proxy_port(5));
+    let address = format!("{}:127.0.0.1:{}", network.short(), LocalNet::proxy_port(5));
     assert_eq!(
         client.query_validator(&address).await?,
         net.genesis_config()?.hash()
@@ -424,12 +428,8 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
 
     // Create a new chain starting on the new epoch
     let new_owner = client.keygen().await?;
-    let ClaimOutcome {
-        chain_id,
-        message_id,
-        ..
-    } = faucet.claim(&new_owner).await?;
-    client.assign(new_owner, message_id).await?;
+    let ClaimOutcome { chain_id, .. } = faucet.claim(&new_owner).await?;
+    client.assign(new_owner, chain_id).await?;
 
     // Attempt to receive the existing epoch change messages
     client.process_inbox(chain_id).await?;
@@ -450,8 +450,13 @@ async fn test_end_to_end_retry_notification_stream(config: LocalNetConfig) -> Re
 
     let (mut net, client1) = config.instantiate().await?;
 
+    let (chain, chain1) = {
+        let wallet = client1.load_wallet()?;
+        let chains = wallet.chain_ids();
+        (chains[0], chains[1])
+    };
+
     let client2 = net.make_client().await;
-    let chain = ChainId::root(0);
     let mut height = 0;
     client2.wallet_init(&[chain], FaucetOption::None).await?;
 
@@ -470,14 +475,14 @@ async fn test_end_to_end_retry_notification_stream(config: LocalNetConfig) -> Re
 
     // Oh no! The first validator has an outage and gets restarted!
     net.remove_validator(0)?;
-    net.start_validator(0).await?;
+    net.restart_validator(0).await?;
 
     // The node service should try to reconnect.
     'success: {
         for i in 0..10 {
             // Add a new block on the chain, triggering a notification.
             client1
-                .transfer(Amount::from_tokens(1), chain, ChainId::root(1))
+                .transfer(Amount::from_tokens(1), chain, chain1)
                 .await?;
             linera_base::time::timer::sleep(Duration::from_secs(i)).await;
             height += 1;
@@ -511,7 +516,11 @@ async fn test_end_to_end_retry_pending_block(config: LocalNetConfig) -> Result<(
 
     // Create runner and client.
     let (mut net, client) = config.instantiate().await?;
-    let chain_id = client.load_wallet()?.default_chain().unwrap();
+    let (chain_id, chain1) = {
+        let wallet = client.load_wallet()?;
+        let chains = wallet.chain_ids();
+        (chains[0], chains[1])
+    };
     let account = Account::chain(chain_id);
     let balance = client.local_balance(account).await?;
     // Stop validators.
@@ -519,14 +528,14 @@ async fn test_end_to_end_retry_pending_block(config: LocalNetConfig) -> Result<(
         net.remove_validator(i)?;
     }
     let result = client
-        .transfer_with_silent_logs(Amount::from_tokens(2), chain_id, ChainId::root(1))
+        .transfer_with_silent_logs(Amount::from_tokens(2), chain_id, chain1)
         .await;
     assert!(result.is_err());
     // The transfer didn't get confirmed.
     assert_eq!(client.local_balance(account).await?, balance);
     // Restart validators.
     for i in 0..4 {
-        net.start_validator(i).await?;
+        net.restart_validator(i).await?;
     }
     let result = client.retry_pending_block(Some(chain_id)).await;
     assert!(result?.is_some());
@@ -626,6 +635,7 @@ async fn test_storage_service_wallet_lock() -> Result<()> {
     let (mut net, client) = config.instantiate().await?;
 
     let wallet_state = WalletState::read_from_file(client.wallet_path().as_path())?;
+
     let chain_id = wallet_state.default_chain().unwrap();
 
     let lock = wallet_state;
@@ -695,6 +705,10 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
         .next()
         .unwrap()?
         .starts_with("export LINERA_WALLET="));
+    assert!(exports
+        .next()
+        .unwrap()?
+        .starts_with("export LINERA_KEYSTORE="));
     assert!(exports
         .next()
         .unwrap()?
@@ -790,7 +804,7 @@ async fn test_sync_validator(config: LocalNetConfig) -> Result<()> {
 
     // Create some blocks
     let sender_chain = client.default_chain().expect("Client has no default chain");
-    let (_, receiver_chain, _) = client
+    let (receiver_chain, _) = client
         .open_chain(sender_chain, None, Amount::from_tokens(1_000))
         .await?;
 
@@ -805,7 +819,7 @@ async fn test_sync_validator(config: LocalNetConfig) -> Result<()> {
     }
 
     // Restart the stopped validator
-    net.start_validator(LAGGING_VALIDATOR_INDEX).await?;
+    net.restart_validator(LAGGING_VALIDATOR_INDEX).await?;
 
     let lagging_validator = net.validator_client(LAGGING_VALIDATOR_INDEX).await?;
 
@@ -875,12 +889,13 @@ async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> 
     let owner1 = {
         let wallet = client.load_wallet()?;
         let user_chain = wallet.get(chain).unwrap();
-        user_chain.key_pair.as_ref().unwrap().public().into()
+        *user_chain.owner.as_ref().unwrap()
     };
-    client.change_ownership(chain, vec![], vec![owner1]).await?;
 
+    client.change_ownership(chain, vec![], vec![owner1]).await?;
     let (contract, service) = client.build_example("ethereum-tracker").await?;
 
+    tracing::info!("Publishing Ethereum tracker contract");
     let application_id = client
         .publish_and_create::<EthereumTrackerAbi, (), InstantiationArgument>(
             contract,
@@ -892,6 +907,8 @@ async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> 
             None,
         )
         .await?;
+
+    tracing::info!("Application ID: {:?}", application_id);
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
 
@@ -970,4 +987,26 @@ impl EthereumTrackerApp {
         let mutation = format!("update(toBlock: {})", to_block);
         self.0.mutate(mutation).await.unwrap();
     }
+}
+
+#[cfg_attr(feature = "storage-service", test_case(Database::Service, Network::Grpc ; "storage_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(Database::ScyllaDb, Network::Grpc ; "scylladb_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(Database::DynamoDb, Network::Grpc ; "aws_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_linera_exporter(database: Database, network: Network) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let config = LocalNetConfig {
+        num_initial_validators: 1,
+        num_shards: 1,
+        num_block_exporters: 1,
+        ..LocalNetConfig::new_test(database, network)
+    };
+
+    let (_net, client) = config.instantiate().await?;
+    let chain = client.default_chain().expect("Client has no default chain");
+    client
+        .transfer_with_silent_logs(1.into(), chain, chain)
+        .await
 }

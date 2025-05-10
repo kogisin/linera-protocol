@@ -8,8 +8,8 @@ use linera_base::data_types::{ArithmeticError, BlockHeight};
 #[cfg(with_testing)]
 use linera_views::context::MemoryContext;
 use linera_views::{
+    bucket_queue_view::BucketQueueView,
     context::Context,
-    queue_view::QueueView,
     register_view::RegisterView,
     views::{ClonableView, View, ViewError},
 };
@@ -34,6 +34,12 @@ static OUTBOX_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
     )
 });
 
+// The number of block heights in a bucket
+// The `BlockHeight` has just 8 bytes so the size is constant.
+// This means that by choosing a size of 1000, we have a
+// reasonable size that will not create any memory issues.
+const BLOCK_HEIGHT_BUCKET_SIZE: usize = 1000;
+
 /// The state of an outbox
 /// * An outbox is used to send messages to another chain.
 /// * Internally, this is implemented as a FIFO queue of (increasing) block heights.
@@ -41,7 +47,8 @@ static OUTBOX_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
 ///   we just send the certified blocks over and let the receivers figure out what were the
 ///   messages for them.
 /// * When marking block heights as received, messages at lower heights are also marked (i.e. dequeued).
-#[derive(Debug, ClonableView, View, async_graphql::SimpleObject)]
+#[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
+#[derive(Debug, ClonableView, View)]
 pub struct OutboxStateView<C>
 where
     C: Context + Send + Sync + 'static,
@@ -50,7 +57,7 @@ where
     pub next_height_to_schedule: RegisterView<C, BlockHeight>,
     /// Keep sending these certified blocks of ours until they are acknowledged by
     /// receivers.
-    pub queue: QueueView<C, BlockHeight>,
+    pub queue: BucketQueueView<C, BlockHeight, BLOCK_HEIGHT_BUCKET_SIZE>,
 }
 
 impl<C> OutboxStateView<C>
@@ -82,11 +89,11 @@ where
         height: BlockHeight,
     ) -> Result<Vec<BlockHeight>, ViewError> {
         let mut updates = Vec::new();
-        while let Some(h) = self.queue.front().await? {
+        while let Some(h) = self.queue.front().cloned() {
             if h > height {
                 break;
             }
-            self.queue.delete_front();
+            self.queue.delete_front().await?;
             updates.push(h);
         }
         #[cfg(with_metrics)]

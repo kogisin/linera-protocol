@@ -17,6 +17,12 @@ AccountOwner:
       Address32:
         NEWTYPE:
           TYPENAME: CryptoHash
+    2:
+      Address20:
+        NEWTYPE:
+          TUPLEARRAY:
+            CONTENT: U8
+            SIZE: 20
 AccountPublicKey:
   ENUM:
     0:
@@ -27,6 +33,10 @@ AccountPublicKey:
       Secp256k1:
         NEWTYPE:
           TYPENAME: Secp256k1PublicKey
+    2:
+      EvmSecp256k1:
+        NEWTYPE:
+          TYPENAME: EvmPublicKey
 AccountSignature:
   ENUM:
     0:
@@ -37,6 +47,10 @@ AccountSignature:
       Secp256k1:
         NEWTYPE:
           TYPENAME: Secp256k1Signature
+    2:
+      EvmSecp256k1:
+        NEWTYPE:
+          TYPENAME: EvmSignature
 AdminOperation:
   ENUM:
     0:
@@ -105,9 +119,13 @@ BlobType:
     2:
       ServiceBytecode: UNIT
     3:
-      ApplicationDescription: UNIT
+      EvmBytecode: UNIT
     4:
+      ApplicationDescription: UNIT
+    5:
       Committee: UNIT
+    6:
+      ChainDescription: UNIT
 Block:
   STRUCT:
     - header:
@@ -242,14 +260,13 @@ ChainAndHeight:
     - height:
         TYPENAME: BlockHeight
 ChainDescription:
-  ENUM:
-    0:
-      Root:
-        NEWTYPE: U32
-    1:
-      Child:
-        NEWTYPE:
-          TYPENAME: MessageId
+  STRUCT:
+    - origin:
+        TYPENAME: ChainOrigin
+    - timestamp:
+        TYPENAME: Timestamp
+    - config:
+        TYPENAME: InitialChainConfig
 ChainId:
   NEWTYPESTRUCT:
     TYPENAME: CryptoHash
@@ -359,6 +376,19 @@ ChainManagerInfo:
     - round_timeout:
         OPTION:
           TYPENAME: Timestamp
+ChainOrigin:
+  ENUM:
+    0:
+      Root:
+        NEWTYPE: U32
+    1:
+      Child:
+        STRUCT:
+          - parent:
+              TYPENAME: ChainId
+          - block_height:
+              TYPENAME: BlockHeight
+          - chain_index: U32
 ChainOwnership:
   STRUCT:
     - super_owners:
@@ -373,14 +403,6 @@ ChainOwnership:
     - open_multi_leader_rounds: BOOL
     - timeout_config:
         TYPENAME: TimeoutConfig
-ChannelFullName:
-  STRUCT:
-    - application_id:
-        TYPENAME: ApplicationId
-    - name:
-        TYPENAME: ChannelName
-ChannelName:
-  NEWTYPESTRUCT: BYTES
 Committee:
   STRUCT:
     - validators:
@@ -416,14 +438,11 @@ CrossChainRequest:
               TYPENAME: ChainId
           - recipient:
               TYPENAME: ChainId
-          - bundle_vecs:
+          - bundles:
               SEQ:
                 TUPLE:
-                  - TYPENAME: Medium
-                  - SEQ:
-                      TUPLE:
-                        - TYPENAME: Epoch
-                        - TYPENAME: MessageBundle
+                  - TYPENAME: Epoch
+                  - TYPENAME: MessageBundle
     1:
       ConfirmUpdatedRecipient:
         STRUCT:
@@ -431,26 +450,13 @@ CrossChainRequest:
               TYPENAME: ChainId
           - recipient:
               TYPENAME: ChainId
-          - latest_heights:
-              SEQ:
-                TUPLE:
-                  - TYPENAME: Medium
-                  - TYPENAME: BlockHeight
+          - latest_height:
+              TYPENAME: BlockHeight
 CryptoHash:
   NEWTYPESTRUCT:
     TUPLEARRAY:
       CONTENT: U8
       SIZE: 32
-Destination:
-  ENUM:
-    0:
-      Recipient:
-        NEWTYPE:
-          TYPENAME: ChainId
-    1:
-      Subscribers:
-        NEWTYPE:
-          TYPENAME: ChannelName
 Ed25519PublicKey:
   NEWTYPESTRUCT:
     TUPLEARRAY:
@@ -476,6 +482,16 @@ EventId:
     - stream_id:
         TYPENAME: StreamId
     - index: U32
+EvmPublicKey:
+  NEWTYPESTRUCT:
+    TUPLEARRAY:
+      CONTENT: U8
+      SIZE: 33
+EvmSignature:
+  NEWTYPESTRUCT:
+    TUPLEARRAY:
+      CONTENT: U8
+      SIZE: 64
 GenericApplicationId:
   ENUM:
     0:
@@ -509,11 +525,30 @@ Header:
 IncomingBundle:
   STRUCT:
     - origin:
-        TYPENAME: Origin
+        TYPENAME: ChainId
     - bundle:
         TYPENAME: MessageBundle
     - action:
         TYPENAME: MessageAction
+InitialChainConfig:
+  STRUCT:
+    - ownership:
+        TYPENAME: ChainOwnership
+    - admin_id:
+        OPTION:
+          TYPENAME: ChainId
+    - epoch:
+        TYPENAME: Epoch
+    - committees:
+        MAP:
+          KEY:
+            TYPENAME: Epoch
+          VALUE:
+            SEQ: U8
+    - balance:
+        TYPENAME: Amount
+    - application_permissions:
+        TYPENAME: ApplicationPermissions
 LiteCertificate:
   STRUCT:
     - value:
@@ -553,14 +588,6 @@ LockingBlock:
       Regular:
         NEWTYPE:
           TYPENAME: ValidatedBlockCertificate
-Medium:
-  ENUM:
-    0:
-      Direct: UNIT
-    1:
-      Channel:
-        NEWTYPE:
-          TYPENAME: ChannelFullName
 Message:
   ENUM:
     0:
@@ -591,13 +618,6 @@ MessageBundle:
     - messages:
         SEQ:
           TYPENAME: PostedMessage
-MessageId:
-  STRUCT:
-    - chain_id:
-        TYPENAME: ChainId
-    - height:
-        TYPENAME: BlockHeight
-    - index: U32
 MessageKind:
   ENUM:
     0:
@@ -616,6 +636,13 @@ ModuleId:
         TYPENAME: CryptoHash
     - vm_runtime:
         TYPENAME: VmRuntime
+NetworkDescription:
+  STRUCT:
+    - name: STR
+    - genesis_config_hash:
+        TYPENAME: CryptoHash
+    - genesis_timestamp:
+        TYPENAME: Timestamp
 NodeError:
   ENUM:
     0:
@@ -648,7 +675,7 @@ NodeError:
           - chain_id:
               TYPENAME: ChainId
           - origin:
-              TYPENAME: Origin
+              TYPENAME: ChainId
           - height:
               TYPENAME: BlockHeight
     7:
@@ -715,16 +742,6 @@ OpenChainConfig:
   STRUCT:
     - ownership:
         TYPENAME: ChainOwnership
-    - admin_id:
-        TYPENAME: ChainId
-    - epoch:
-        TYPENAME: Epoch
-    - committees:
-        MAP:
-          KEY:
-            TYPENAME: Epoch
-          VALUE:
-            TYPENAME: Committee
     - balance:
         TYPENAME: Amount
     - application_permissions:
@@ -767,16 +784,10 @@ OracleResponse:
         TUPLE:
           - TYPENAME: EventId
           - SEQ: U8
-Origin:
-  STRUCT:
-    - sender:
-        TYPENAME: ChainId
-    - medium:
-        TYPENAME: Medium
 OutgoingMessage:
   STRUCT:
     - destination:
-        TYPENAME: Destination
+        TYPENAME: ChainId
     - authenticated_signer:
         OPTION:
           TYPENAME: AccountOwner
@@ -847,7 +858,9 @@ ResourceControlPolicy:
   STRUCT:
     - block:
         TYPENAME: Amount
-    - fuel_unit:
+    - wasm_fuel_unit:
+        TYPENAME: Amount
+    - evm_fuel_unit:
         TYPENAME: Amount
     - read_operation:
         TYPENAME: Amount
@@ -879,9 +892,10 @@ ResourceControlPolicy:
         TYPENAME: Amount
     - http_request:
         TYPENAME: Amount
-    - maximum_fuel_per_block: U64
+    - maximum_wasm_fuel_per_block: U64
+    - maximum_evm_fuel_per_block: U64
     - maximum_service_oracle_execution_ms: U64
-    - maximum_executed_block_size: U64
+    - maximum_block_size: U64
     - maximum_bytecode_size: U64
     - maximum_blob_size: U64
     - maximum_published_blobs: U64
@@ -980,7 +994,7 @@ RpcMessage:
     14:
       VersionInfoQuery: UNIT
     15:
-      GenesisConfigHashQuery: UNIT
+      NetworkDescriptionQuery: UNIT
     16:
       Vote:
         NEWTYPE:
@@ -998,9 +1012,9 @@ RpcMessage:
         NEWTYPE:
           TYPENAME: VersionInfo
     20:
-      GenesisConfigHashResponse:
+      NetworkDescriptionResponse:
         NEWTYPE:
-          TYPENAME: CryptoHash
+          TYPENAME: NetworkDescription
     21:
       UploadBlobResponse:
         NEWTYPE:
@@ -1074,10 +1088,6 @@ SystemMessage:
           - recipient:
               TYPENAME: Recipient
     2:
-      OpenChain:
-        NEWTYPE:
-          TYPENAME: OpenChainConfig
-    3:
       ApplicationCreated: UNIT
 SystemOperation:
   ENUM:
@@ -1163,6 +1173,14 @@ SystemOperation:
       ProcessRemovedEpoch:
         NEWTYPE:
           TYPENAME: Epoch
+    13:
+      UpdateStreams:
+        NEWTYPE:
+          SEQ:
+            TUPLE:
+              - TYPENAME: ChainId
+              - TYPENAME: StreamId
+              - U32
 TimeDelta:
   NEWTYPESTRUCT: U64
 Timeout:

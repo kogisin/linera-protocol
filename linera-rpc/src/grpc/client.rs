@@ -23,6 +23,7 @@ use linera_core::{
     node::{CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode},
     worker::Notification,
 };
+use linera_storage::NetworkDescription;
 use linera_version::VersionInfo;
 use tonic::{Code, IntoRequest, Request, Status};
 use tracing::{debug, error, info, instrument, warn};
@@ -33,7 +34,7 @@ use super::{
 };
 use crate::{
     HandleConfirmedCertificateRequest, HandleLiteCertRequest, HandleTimeoutCertificateRequest,
-    HandleValidatedCertificateRequest, NodeOptions,
+    HandleValidatedCertificateRequest,
 };
 
 #[derive(Clone)]
@@ -60,17 +61,6 @@ impl GrpcClient {
             retry_delay,
             max_retries,
         }
-    }
-
-    pub fn create(address: String, node_options: NodeOptions) -> Self {
-        let options = (&node_options).into();
-        let channel = transport::create_channel(address.clone(), &options).unwrap();
-        Self::new(
-            address,
-            channel,
-            node_options.retry_delay,
-            node_options.max_retries,
-        )
     }
 
     /// Returns whether this gRPC status means the server stream should be reconnected to, or not.
@@ -134,7 +124,6 @@ impl GrpcClient {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn try_into_chain_info(
         result: api::ChainInfoResult,
     ) -> Result<linera_core::data_types::ChainInfoResponse, NodeError> {
@@ -358,9 +347,9 @@ impl ValidatorNode for GrpcClient {
     }
 
     #[instrument(target = "grpc_client", skip_all, err, fields(address = self.address))]
-    async fn get_genesis_config_hash(&self) -> Result<CryptoHash, NodeError> {
+    async fn get_network_description(&self) -> Result<NetworkDescription, NodeError> {
         let req = ();
-        Ok(client_delegate!(self, get_genesis_config_hash, req)?.try_into()?)
+        Ok(client_delegate!(self, get_network_description, req)?.try_into()?)
     }
 
     #[instrument(target = "grpc_client", skip(self), err, fields(address = self.address))]

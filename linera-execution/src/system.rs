@@ -9,7 +9,7 @@ mod tests;
 #[cfg(with_metrics)]
 use std::sync::LazyLock;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     mem,
 };
 
@@ -17,18 +17,16 @@ use custom_debug_derive::Debug;
 use linera_base::{
     crypto::CryptoHash,
     data_types::{
-        Amount, ApplicationPermissions, Blob, BlobContent, BlockHeight, OracleResponse, Timestamp,
+        Amount, ApplicationPermissions, ArithmeticError, Blob, BlobContent, BlockHeight,
+        ChainDescription, ChainOrigin, Epoch, InitialChainConfig, OracleResponse, Timestamp,
     },
     ensure, hex_debug,
-    identifiers::{
-        Account, AccountOwner, BlobId, BlobType, ChainDescription, ChainId, EventId, MessageId,
-        ModuleId, StreamId,
-    },
+    identifiers::{Account, AccountOwner, BlobId, BlobType, ChainId, EventId, ModuleId, StreamId},
     ownership::{ChainOwnership, TimeoutConfig},
 };
 use linera_views::{
     context::Context,
-    map_view::HashedMapView,
+    map_view::{HashedMapView, MapView},
     register_view::HashedRegisterView,
     set_view::HashedSetView,
     views::{ClonableView, HashableView, View, ViewError},
@@ -40,14 +38,11 @@ use {linera_base::prometheus_util::register_int_counter_vec, prometheus::IntCoun
 #[cfg(test)]
 use crate::test_utils::SystemExecutionState;
 use crate::{
-    committee::{Committee, Epoch},
-    ApplicationDescription, ApplicationId, ExecutionError, ExecutionRuntimeContext, MessageContext,
-    MessageKind, OperationContext, OutgoingMessage, QueryContext, QueryOutcome, ResourceController,
-    TransactionTracker,
+    committee::Committee, ApplicationDescription, ApplicationId, ExecutionError,
+    ExecutionRuntimeContext, MessageContext, MessageKind, OperationContext, OutgoingMessage,
+    QueryContext, QueryOutcome, ResourceController, TransactionTracker,
 };
 
-/// The relative index of the `OpenChain` message created by the `OpenChain` operation.
-pub static OPEN_CHAIN_MESSAGE_INDEX: u32 = 0;
 /// The event stream name for new epochs and committees.
 pub static EPOCH_STREAM_NAME: &[u8] = &[0];
 /// The event stream name for removed epochs.
@@ -91,17 +86,49 @@ pub struct SystemExecutionStateView<C> {
     pub application_permissions: HashedRegisterView<C, ApplicationPermissions>,
     /// Blobs that have been used or published on this chain.
     pub used_blobs: HashedSetView<C, BlobId>,
+    /// The event stream subscriptions of applications on this chain.
+    pub event_subscriptions: MapView<C, (ChainId, StreamId), EventSubscriptions>,
 }
 
-/// The configuration for a new chain.
+/// The applications subscribing to a particular stream, and the next event index.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct EventSubscriptions {
+    /// The next event index, i.e. the total number of events in this stream that have already
+    /// been processed by this chain.
+    pub next_index: u32,
+    /// The applications that are subscribed to this stream.
+    pub applications: BTreeSet<ApplicationId>,
+}
+
+/// The initial configuration for a new chain.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct OpenChainConfig {
+    /// The ownership configuration of the new chain.
     pub ownership: ChainOwnership,
-    pub admin_id: ChainId,
-    pub epoch: Epoch,
-    pub committees: BTreeMap<Epoch, Committee>,
+    /// The initial chain balance.
     pub balance: Amount,
+    /// The initial application permissions.
     pub application_permissions: ApplicationPermissions,
+}
+
+impl OpenChainConfig {
+    /// Creates an [`InitialChainConfig`] based on this [`OpenChainConfig`] and additional
+    /// parameters.
+    pub fn init_chain_config(
+        &self,
+        epoch: Epoch,
+        admin_id: Option<ChainId>,
+        committees: BTreeMap<Epoch, Vec<u8>>,
+    ) -> InitialChainConfig {
+        InitialChainConfig {
+            admin_id,
+            application_permissions: self.application_permissions.clone(),
+            balance: self.balance,
+            committees,
+            epoch,
+            ownership: self.ownership.clone(),
+        }
+    }
 }
 
 /// A system operation.
@@ -172,6 +199,8 @@ pub enum SystemOperation {
     ProcessNewEpoch(Epoch),
     /// Processes an event about a removed epoch and committee.
     ProcessRemovedEpoch(Epoch),
+    /// Updates the event stream trackers.
+    UpdateStreams(Vec<(ChainId, StreamId, u32)>),
 }
 
 /// Operations that are only allowed on the admin chain.
@@ -207,8 +236,6 @@ pub enum SystemMessage {
         amount: Amount,
         recipient: Recipient,
     },
-    /// Creates (or activates) a new chain.
-    OpenChain(Box<OpenChainConfig>),
     /// Notifies that a new application was created.
     ApplicationCreated,
 }
@@ -237,12 +264,6 @@ impl Recipient {
     /// Returns the default recipient for the given chain (no owner).
     pub fn chain(chain_id: ChainId) -> Recipient {
         Recipient::Account(Account::chain(chain_id))
-    }
-
-    /// Returns the default recipient for the root chain with the given index.
-    #[cfg(with_testing)]
-    pub fn root(index: u32) -> Recipient {
-        Recipient::chain(ChainId::root(index))
     }
 }
 
@@ -304,6 +325,19 @@ where
         Some((*epoch, committee))
     }
 
+    /// Returns a map of epochs to serialized_committees.
+    pub fn get_committees(&self) -> BTreeMap<Epoch, Vec<u8>> {
+        self.committees
+            .get()
+            .iter()
+            .map(|(epoch, committee)| {
+                let serialized_committee =
+                    bcs::to_bytes(committee).expect("Serializing a committee should not fail!");
+                (*epoch, serialized_committee)
+            })
+            .collect()
+    }
+
     /// Executes the sender's side of an operation and returns a list of actions to be
     /// taken.
     pub async fn execute_operation(
@@ -317,9 +351,15 @@ where
         let mut new_application = None;
         match operation {
             OpenChain(config) => {
-                let next_message_id = context.next_message_id(txn_tracker.next_message_index());
-                let message = self.open_chain(config, next_message_id).await?;
-                txn_tracker.add_outgoing_message(message)?;
+                let _chain_id = self
+                    .open_chain(
+                        config,
+                        context.chain_id,
+                        context.height,
+                        context.timestamp,
+                        txn_tracker,
+                    )
+                    .await?;
                 #[cfg(with_metrics)]
                 OPEN_CHAIN_COUNT.with_label_values(&[]).inc();
             }
@@ -407,14 +447,9 @@ where
                 }
             }
             PublishModule { module_id } => {
-                self.blob_published(&BlobId::new(
-                    module_id.contract_blob_hash,
-                    BlobType::ContractBytecode,
-                ))?;
-                self.blob_published(&BlobId::new(
-                    module_id.service_blob_hash,
-                    BlobType::ServiceBytecode,
-                ))?;
+                for blob_id in module_id.bytecode_blob_ids() {
+                    self.blob_published(&blob_id)?;
+                }
             }
             CreateApplication {
                 module_id,
@@ -503,6 +538,43 @@ where
                     Some(_) => return Err(ExecutionError::OracleResponseMismatch),
                 };
                 txn_tracker.add_oracle_response(OracleResponse::Event(event_id, bytes));
+            }
+            UpdateStreams(streams) => {
+                for (chain_id, stream_id, next_index) in streams {
+                    let subscriptions = self
+                        .event_subscriptions
+                        .get_mut_or_default(&(chain_id, stream_id.clone()))
+                        .await?;
+                    ensure!(
+                        subscriptions.next_index < next_index,
+                        ExecutionError::OutdatedUpdateStreams
+                    );
+                    for application_id in &subscriptions.applications {
+                        txn_tracker.add_stream_to_process(
+                            *application_id,
+                            chain_id,
+                            stream_id.clone(),
+                            subscriptions.next_index,
+                            next_index,
+                        );
+                    }
+                    subscriptions.next_index = next_index;
+                    let index = next_index
+                        .checked_sub(1)
+                        .ok_or(ArithmeticError::Underflow)?;
+                    let event_id = EventId {
+                        chain_id,
+                        stream_id,
+                        index,
+                    };
+                    ensure!(
+                        self.context()
+                            .extra()
+                            .contains_event(event_id.clone())
+                            .await?,
+                        ExecutionError::EventNotFound(event_id)
+                    );
+                }
             }
         }
 
@@ -666,8 +738,6 @@ where
                     Recipient::Burn => (),
                 }
             }
-            // These messages are executed immediately when cross-chain requests are received.
-            OpenChain(_) => {}
             // This message is only a placeholder: Its ID is part of the application ID.
             ApplicationCreated => {}
         }
@@ -675,33 +745,42 @@ where
     }
 
     /// Initializes the system application state on a newly opened chain.
-    pub fn initialize_chain(
-        &mut self,
-        message_id: MessageId,
-        timestamp: Timestamp,
-        config: OpenChainConfig,
-    ) {
-        // Guaranteed under BFT assumptions.
-        assert!(self.description.get().is_none());
-        assert!(!self.ownership.get().is_active());
-        assert!(self.committees.get().is_empty());
-        let OpenChainConfig {
+    /// Returns `Ok(true)` if the chain was already initialized, `Ok(false)` if it wasn't.
+    pub async fn initialize_chain(&mut self, chain_id: ChainId) -> Result<bool, ExecutionError> {
+        if self.description.get().is_some() {
+            // already initialized
+            return Ok(true);
+        }
+        let description_blob = self
+            .read_blob_content(BlobId::new(chain_id.0, BlobType::ChainDescription))
+            .await?;
+        let description: ChainDescription = bcs::from_bytes(description_blob.bytes())?;
+        let InitialChainConfig {
             ownership,
             admin_id,
             epoch,
             committees,
             balance,
             application_permissions,
-        } = config;
-        let description = ChainDescription::Child(message_id);
+        } = description.config().clone();
+        self.timestamp.set(description.timestamp());
         self.description.set(Some(description));
         self.epoch.set(Some(epoch));
+        let committees = committees
+            .into_iter()
+            .map(|(epoch, serialized_committee)| {
+                let committee = bcs::from_bytes(&serialized_committee)
+                    .expect("Deserializing a committee shouldn't fail");
+                (epoch, committee)
+            })
+            .collect();
         self.committees.set(committees);
-        self.admin_id.set(Some(admin_id));
+        // If `admin_id` is `None`, this chain is its own admin chain.
+        self.admin_id.set(admin_id.or(Some(chain_id)));
         self.ownership.set(ownership);
-        self.timestamp.set(timestamp);
         self.balance.set(balance);
         self.application_permissions.set(application_permissions);
+        Ok(false)
     }
 
     pub async fn handle_query(
@@ -724,27 +803,29 @@ where
     pub async fn open_chain(
         &mut self,
         config: OpenChainConfig,
-        next_message_id: MessageId,
-    ) -> Result<OutgoingMessage, ExecutionError> {
-        let child_id = ChainId::child(next_message_id);
-        ensure!(
-            self.admin_id.get().as_ref() == Some(&config.admin_id),
-            ExecutionError::InvalidNewChainAdminId(child_id)
+        parent: ChainId,
+        block_height: BlockHeight,
+        timestamp: Timestamp,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<ChainId, ExecutionError> {
+        let chain_index = txn_tracker.next_chain_index();
+        let chain_origin = ChainOrigin::Child {
+            parent,
+            block_height,
+            chain_index,
+        };
+        let committees = self.get_committees();
+        let init_chain_config = config.init_chain_config(
+            (*self.epoch.get()).ok_or(ExecutionError::InactiveChain)?,
+            *self.admin_id.get(),
+            committees,
         );
-        ensure!(
-            self.committees.get() == &config.committees,
-            ExecutionError::InvalidCommittees
-        );
-        ensure!(
-            self.epoch.get().as_ref() == Some(&config.epoch),
-            ExecutionError::InvalidEpoch {
-                chain_id: child_id,
-                epoch: config.epoch,
-            }
-        );
+        let chain_description = ChainDescription::new(chain_origin, init_chain_config, timestamp);
+        let child_id = chain_description.id();
         self.debit(&AccountOwner::CHAIN, config.balance).await?;
-        let message = SystemMessage::OpenChain(Box::new(config));
-        Ok(OutgoingMessage::new(child_id, message).with_kind(MessageKind::Protected))
+        let blob = Blob::new_chain_description(&chain_description);
+        txn_tracker.add_created_blob(blob);
+        Ok(child_id)
     }
 
     pub async fn close_chain(&mut self) -> Result<(), ExecutionError> {
@@ -763,14 +844,12 @@ where
     ) -> Result<CreateApplicationResult, ExecutionError> {
         let application_index = txn_tracker.next_application_index();
 
-        let (contract_bytecode_blob_id, service_bytecode_blob_id) =
-            self.check_bytecode_blobs(&module_id).await?;
+        let blob_ids = self.check_bytecode_blobs(&module_id).await?;
         // We only remember to register the blobs that aren't recorded in `used_blobs`
         // already.
-        self.blob_used(Some(&mut txn_tracker), contract_bytecode_blob_id)
-            .await?;
-        self.blob_used(Some(&mut txn_tracker), service_bytecode_blob_id)
-            .await?;
+        for blob_id in blob_ids {
+            self.blob_used(Some(&mut txn_tracker), blob_id).await?;
+        }
 
         let application_description = ApplicationDescription {
             module_id,
@@ -783,7 +862,9 @@ where
         self.check_required_applications(&application_description, Some(&mut txn_tracker))
             .await?;
 
-        txn_tracker.add_created_blob(Blob::new_application_description(&application_description));
+        let blob = Blob::new_application_description(&application_description);
+        self.used_blobs.insert(&blob.id())?;
+        txn_tracker.add_created_blob(blob);
 
         Ok(CreateApplicationResult {
             app_id: ApplicationId::from(&application_description),
@@ -820,14 +901,12 @@ where
         self.blob_used(txn_tracker.as_deref_mut(), blob_id).await?;
         let description: ApplicationDescription = bcs::from_bytes(blob_content.bytes())?;
 
-        let (contract_bytecode_blob_id, service_bytecode_blob_id) =
-            self.check_bytecode_blobs(&description.module_id).await?;
+        let blob_ids = self.check_bytecode_blobs(&description.module_id).await?;
         // We only remember to register the blobs that aren't recorded in `used_blobs`
         // already.
-        self.blob_used(txn_tracker.as_deref_mut(), contract_bytecode_blob_id)
-            .await?;
-        self.blob_used(txn_tracker.as_deref_mut(), service_bytecode_blob_id)
-            .await?;
+        for blob_id in blob_ids {
+            self.blob_used(txn_tracker.as_deref_mut(), blob_id).await?;
+        }
 
         self.check_required_applications(&description, txn_tracker)
             .await?;
@@ -917,36 +996,20 @@ where
     async fn check_bytecode_blobs(
         &mut self,
         module_id: &ModuleId,
-    ) -> Result<(BlobId, BlobId), ExecutionError> {
-        let contract_bytecode_blob_id =
-            BlobId::new(module_id.contract_blob_hash, BlobType::ContractBytecode);
+    ) -> Result<Vec<BlobId>, ExecutionError> {
+        let blob_ids = module_id.bytecode_blob_ids();
 
         let mut missing_blobs = Vec::new();
-        if !self
-            .context()
-            .extra()
-            .contains_blob(contract_bytecode_blob_id)
-            .await?
-        {
-            missing_blobs.push(contract_bytecode_blob_id);
+        for blob_id in &blob_ids {
+            if !self.context().extra().contains_blob(*blob_id).await? {
+                missing_blobs.push(*blob_id);
+            }
         }
-
-        let service_bytecode_blob_id =
-            BlobId::new(module_id.service_blob_hash, BlobType::ServiceBytecode);
-        if !self
-            .context()
-            .extra()
-            .contains_blob(service_bytecode_blob_id)
-            .await?
-        {
-            missing_blobs.push(service_bytecode_blob_id);
-        }
-
         ensure!(
             missing_blobs.is_empty(),
             ExecutionError::BlobsNotFound(missing_blobs)
         );
 
-        Ok((contract_bytecode_blob_id, service_bytecode_blob_id))
+        Ok(blob_ids)
     }
 }

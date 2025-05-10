@@ -21,14 +21,14 @@ use heck::ToKebabCase;
 use linera_base::{
     abi::ContractAbi,
     command::{resolve_binary, CommandExt},
-    crypto::CryptoHash,
-    data_types::{Amount, Bytecode},
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId},
+    crypto::{CryptoHash, InMemorySigner},
+    data_types::{Amount, Bytecode, Epoch},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, ModuleId},
     vm::VmRuntime,
 };
 use linera_client::{client_options::ResourceControlPolicyConfig, wallet::Wallet};
 use linera_core::worker::Notification;
-use linera_execution::committee::{Committee, Epoch};
+use linera_execution::committee::Committee;
 use linera_faucet::ClaimOutcome;
 use linera_faucet_client::Faucet;
 use serde::{de::DeserializeOwned, ser::Serialize};
@@ -62,6 +62,7 @@ pub struct ClientWrapper {
     testing_prng_seed: Option<u64>,
     storage: String,
     wallet: String,
+    keystore: String,
     max_pending_message_bundles: usize,
     network: Network,
     pub path_provider: PathProvider,
@@ -91,11 +92,13 @@ impl ClientWrapper {
             id
         );
         let wallet = format!("wallet_{}.json", id);
+        let keystore = format!("keystore_{}.json", id);
         Self {
             binary_path: sync::Mutex::new(None),
             testing_prng_seed,
             storage,
             wallet,
+            keystore,
             max_pending_message_bundles: 10_000,
             network,
             path_provider,
@@ -175,6 +178,8 @@ impl ClientWrapper {
         [
             "--wallet".into(),
             self.wallet.as_str().into(),
+            "--keystore".into(),
+            self.keystore.as_str().into(),
             "--storage".into(),
             self.storage.as_str().into(),
             "--max-pending-message-bundles".into(),
@@ -292,11 +297,9 @@ impl ClientWrapper {
         if matches!(faucet, FaucetOption::NewChain(_)) {
             let mut lines = stdout.split_whitespace();
             let chain_id_str = lines.next().context("missing chain ID")?;
-            let message_id_str = lines.next().context("missing message ID")?;
             let certificate_hash_str = lines.next().context("missing certificate hash")?;
             let outcome = ClaimOutcome {
                 chain_id: chain_id_str.parse().context("invalid chain ID")?,
-                message_id: message_id_str.parse().context("invalid message ID")?,
                 certificate_hash: certificate_hash_str
                     .parse()
                     .context("invalid certificate hash")?,
@@ -326,11 +329,9 @@ impl ClientWrapper {
         let stdout = command.spawn_and_wait_for_stdout().await?;
         let mut lines = stdout.split_whitespace();
         let chain_id_str = lines.next().context("missing chain ID")?;
-        let message_id_str = lines.next().context("missing message ID")?;
         let certificate_hash_str = lines.next().context("missing certificate hash")?;
         let outcome = ClaimOutcome {
             chain_id: chain_id_str.parse().context("invalid chain ID")?,
-            message_id: message_id_str.parse().context("invalid message ID")?,
             certificate_hash: certificate_hash_str
                 .parse()
                 .context("invalid certificate hash")?,
@@ -344,7 +345,7 @@ impl ClientWrapper {
     }
 
     /// Runs `linera wallet publish-and-create`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn publish_and_create<
         A: ContractAbi,
         Parameters: Serialize,
@@ -387,6 +388,7 @@ impl ClientWrapper {
         &self,
         contract: PathBuf,
         service: PathBuf,
+        vm_runtime: VmRuntime,
         publisher: impl Into<Option<ChainId>>,
     ) -> Result<ModuleId<Abi, Parameters, InstantiationArgument>> {
         let stdout = self
@@ -394,6 +396,7 @@ impl ClientWrapper {
             .await?
             .arg("publish-module")
             .args([contract, service])
+            .args(["--vm-runtime", &format!("{}", vm_runtime).to_lowercase()])
             .args(publisher.into().iter().map(ChainId::to_string))
             .spawn_and_wait_for_stdout()
             .await?;
@@ -679,7 +682,7 @@ impl ClientWrapper {
         from: ChainId,
         owner: Option<AccountOwner>,
         initial_balance: Amount,
-    ) -> Result<(MessageId, ChainId, AccountOwner)> {
+    ) -> Result<(ChainId, AccountOwner)> {
         let mut command = self.command().await?;
         command
             .arg("open-chain")
@@ -692,13 +695,12 @@ impl ClientWrapper {
 
         let stdout = command.spawn_and_wait_for_stdout().await?;
         let mut split = stdout.split('\n');
-        let message_id: MessageId = split.next().context("no message ID in output")?.parse()?;
         let chain_id = ChainId::from_str(split.next().context("no chain ID in output")?)?;
         let new_owner = AccountOwner::from_str(split.next().context("no owner in output")?)?;
         if let Some(owner) = owner {
             assert_eq!(owner, new_owner);
         }
-        Ok((message_id, chain_id, new_owner))
+        Ok((chain_id, new_owner))
     }
 
     /// Runs `linera open-chain` then `linera assign`.
@@ -712,10 +714,10 @@ impl ClientWrapper {
             .default_chain()
             .context("no default chain found")?;
         let owner = client.keygen().await?;
-        let (message_id, new_chain, _) = self
+        let (new_chain, _) = self
             .open_chain(our_chain, Some(owner), initial_balance)
             .await?;
-        assert_eq!(new_chain, client.assign(owner, message_id).await?);
+        client.assign(owner, new_chain).await?;
         Ok(new_chain)
     }
 
@@ -727,7 +729,7 @@ impl ClientWrapper {
         multi_leader_rounds: u32,
         balance: Amount,
         base_timeout_ms: u64,
-    ) -> Result<(MessageId, ChainId)> {
+    ) -> Result<ChainId> {
         let mut command = self.command().await?;
         command
             .arg("open-multi-owner-chain")
@@ -746,10 +748,9 @@ impl ClientWrapper {
 
         let stdout = command.spawn_and_wait_for_stdout().await?;
         let mut split = stdout.split('\n');
-        let message_id: MessageId = split.next().context("no message ID in output")?.parse()?;
         let chain_id = ChainId::from_str(split.next().context("no chain ID in output")?)?;
 
-        Ok((message_id, chain_id))
+        Ok(chain_id)
     }
 
     pub async fn change_ownership(
@@ -845,8 +846,16 @@ impl ClientWrapper {
         util::read_json(self.wallet_path())
     }
 
+    pub fn load_keystore(&self) -> Result<InMemorySigner> {
+        util::read_json(self.keystore_path())
+    }
+
     pub fn wallet_path(&self) -> PathBuf {
         self.path_provider.path().join(&self.wallet)
+    }
+
+    pub fn keystore_path(&self) -> PathBuf {
+        self.path_provider.path().join(&self.keystore)
     }
 
     pub fn storage_path(&self) -> &str {
@@ -856,8 +865,7 @@ impl ClientWrapper {
     pub fn get_owner(&self) -> Option<AccountOwner> {
         let wallet = self.load_wallet().ok()?;
         let chain_id = wallet.default_chain()?;
-        let public_key = wallet.get(chain_id)?.key_pair.as_ref()?.public();
-        Some(public_key.into())
+        wallet.get(chain_id)?.owner
     }
 
     pub async fn is_chain_present_in_wallet(&self, chain: ChainId) -> bool {
@@ -912,7 +920,7 @@ impl ClientWrapper {
             .arg("keygen")
             .spawn_and_wait_for_stdout()
             .await?;
-        AccountOwner::from_str(stdout.trim())
+        AccountOwner::from_str(stdout.as_str().trim())
     }
 
     /// Returns the default chain.
@@ -921,19 +929,36 @@ impl ClientWrapper {
     }
 
     /// Runs `linera assign`.
-    pub async fn assign(&self, owner: AccountOwner, message_id: MessageId) -> Result<ChainId> {
-        let stdout = self
+    pub async fn assign(&self, owner: AccountOwner, chain_id: ChainId) -> Result<()> {
+        let _stdout = self
             .command()
             .await?
             .arg("assign")
             .args(["--owner", &owner.to_string()])
-            .args(["--message-id", &message_id.to_string()])
+            .args(["--chain-id", &chain_id.to_string()])
             .spawn_and_wait_for_stdout()
             .await?;
+        Ok(())
+    }
 
-        let chain_id = ChainId::from_str(stdout.trim())?;
-
-        Ok(chain_id)
+    /// Runs `linera set-preferred-owner` for `chain_id`.
+    pub async fn set_preffered_owner(
+        &self,
+        chain_id: ChainId,
+        owner: Option<AccountOwner>,
+    ) -> Result<()> {
+        let mut owner_arg = vec!["--owner".to_string()];
+        if let Some(owner) = owner {
+            owner_arg.push(owner.to_string());
+        };
+        self.command()
+            .await?
+            .arg("set-preferred-owner")
+            .args(["--chain-id", &chain_id.to_string()])
+            .args(owner_arg)
+            .spawn_and_wait_for_stdout()
+            .await?;
+        Ok(())
     }
 
     pub async fn build_application(

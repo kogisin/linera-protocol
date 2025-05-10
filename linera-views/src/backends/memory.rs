@@ -32,11 +32,12 @@ pub struct MemoryStoreConfig {
 }
 
 impl MemoryStoreConfig {
-    /// Creates a `MemoryStoreConfig`. `max_concurrent_queries` and `cache_size` are not used.
+    /// Creates a `MemoryStoreConfig`. `max_concurrent_queries`, `cache_size` and `replication_factor` are not used.
     pub fn new(max_stream_queries: usize) -> Self {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         Self { common_config }
     }
@@ -281,6 +282,7 @@ impl MemoryStore {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         let config = MemoryStoreConfig { common_config };
         let kill_on_drop = false;
@@ -296,6 +298,7 @@ impl MemoryStore {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         let config = MemoryStoreConfig { common_config };
         let kill_on_drop = true;
@@ -323,6 +326,7 @@ impl AdminKeyValueStore for MemoryStore {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         let config = MemoryStoreConfig { common_config };
         let mut memory_stores = MEMORY_STORES
@@ -362,7 +366,7 @@ impl AdminKeyValueStore for MemoryStore {
             .lock()
             .expect("MEMORY_STORES lock should not be poisoned");
         if memory_stores.sync_exists(namespace) {
-            return Err(MemoryStoreError::StoreAlreadyExist);
+            return Err(MemoryStoreError::StoreAlreadyExists);
         }
         memory_stores.sync_create(namespace);
         Ok(())
@@ -384,6 +388,7 @@ impl TestKeyValueStore for MemoryStore {
         let common_config = CommonStoreInternalConfig {
             max_concurrent_queries: None,
             max_stream_queries,
+            replication_factor: 1,
         };
         Ok(MemoryStoreConfig { common_config })
     }
@@ -401,7 +406,7 @@ pub fn create_test_memory_store() -> MemoryStore {
 pub enum MemoryStoreError {
     /// Store already exists during a create operation
     #[error("Store already exists during a create operation")]
-    StoreAlreadyExist,
+    StoreAlreadyExists,
 
     /// Serialization error with BCS.
     #[error(transparent)]

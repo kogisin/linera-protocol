@@ -9,13 +9,13 @@ mod guard;
 use std::{env, path::PathBuf};
 
 use guard::INTEGRATION_TEST_GUARD;
-use linera_client::{
-    client_options::{
-        DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS, DEFAULT_PAUSE_AFTER_LINERA_SERVICE_SECS,
+use linera_service::{
+    test_name,
+    util::{
+        parse_secs, Markdown, DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS,
+        DEFAULT_PAUSE_AFTER_LINERA_SERVICE_SECS,
     },
-    util::parse_secs,
 };
-use linera_service::{test_name, util::Markdown};
 use tempfile::tempdir;
 use tokio::process::Command;
 
@@ -27,7 +27,7 @@ use tokio::process::Command;
 #[test_case::test_case("../examples/gen-nft" ; "gen-nft")]
 #[test_case::test_case("../examples/how-to/perform-http-requests" ; "how-to-perform-http-requests")]
 #[test_case::test_case("../examples/hex-game" ; "hex-game")]
-#[test_case::test_case("../examples/lmm" ; "lmm")]
+#[test_case::test_case("../examples/llm" ; "llm")]
 #[test_case::test_case("../examples/native-fungible" ; "native-fungible")]
 #[test_case::test_case("../examples/non-fungible" ; "non-fungible")]
 #[test_case::test_case("../examples/matching-engine" ; "matching engine")]

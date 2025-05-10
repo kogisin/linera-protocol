@@ -1,12 +1,10 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, iter};
+use std::{collections::HashMap, iter, sync::Arc};
 
 use linera_base::{
-    crypto::{AccountPublicKey, AccountSecretKey},
-    data_types::{Amount, Timestamp},
-    hashed::Hashed,
+    data_types::{Amount, Epoch, Timestamp},
     identifiers::{AccountOwner, ApplicationId, ChainId},
     listen_for_shutdown_signals,
     time::Instant,
@@ -15,18 +13,20 @@ use linera_chain::{
     data_types::{BlockProposal, ProposedBlock},
     types::ConfirmedBlock,
 };
-use linera_core::{client::ChainClient, local_node::LocalNodeClient};
+use linera_core::{client::ChainClient, local_node::LocalNodeClient, Environment};
 use linera_execution::{
-    committee::{Committee, Epoch},
+    committee::Committee,
     system::{Recipient, SystemOperation},
     Operation,
 };
-use linera_rpc::node_provider::NodeProvider;
 use linera_sdk::abis::fungible;
-use linera_storage::Storage;
 use num_format::{Locale, ToFormattedString};
 use prometheus_parse::{HistogramCount, Scrape, Value};
-use tokio::{runtime::Handle, task, time};
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, Barrier},
+    task, time,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Instrument as _};
 
@@ -38,9 +38,9 @@ pub enum BenchmarkError {
     #[error("Proxy of validator {0} unhealthy! Latency p99 is too high: {1} ms")]
     ProxyUnhealthy(String, f64),
     #[error("Failed to send message: {0}")]
-    SendError(#[from] crossbeam_channel::SendError<()>),
+    CrossbeamSendError(#[from] crossbeam_channel::SendError<()>),
     #[error("Failed to join task: {0}")]
-    JoinError(#[from] tokio::task::JoinError),
+    JoinError(#[from] task::JoinError),
     #[error("Failed to parse validator metrics port: {0}")]
     ParseValidatorMetricsPort(#[from] std::num::ParseIntError),
     #[error("Failed to parse validator metrics address: {0}")]
@@ -73,6 +73,8 @@ pub enum BenchmarkError {
     NoDataYetForP99Calculation,
     #[error("Unexpected empty bucket")]
     UnexpectedEmptyBucket,
+    #[error("Failed to send message: {0}")]
+    TokioSendError(#[from] mpsc::error::SendError<()>),
 }
 
 #[derive(Debug)]
@@ -82,27 +84,21 @@ struct HistogramSnapshot {
     sum: f64,
 }
 
-pub struct Benchmark<Storage>
-where
-    Storage: linera_storage::Storage,
-{
-    _phantom: std::marker::PhantomData<Storage>,
+pub struct Benchmark<Env: Environment> {
+    _phantom: std::marker::PhantomData<Env>,
 }
 
-impl<S> Benchmark<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    #[allow(clippy::too_many_arguments)]
+impl<Env: Environment> Benchmark<Env> {
+    #[expect(clippy::too_many_arguments)]
     pub async fn run_benchmark(
         num_chains: usize,
         transactions_per_block: usize,
         bps: Option<usize>,
-        chain_clients: HashMap<ChainId, ChainClient<NodeProvider, S>>,
+        chain_clients: HashMap<ChainId, ChainClient<Env>>,
         epoch: Epoch,
-        blocks_infos: Vec<(ChainId, Vec<Operation>, AccountSecretKey)>,
+        blocks_infos: Vec<(ChainId, Vec<Operation>, AccountOwner)>,
         committee: Committee,
-        local_node: LocalNodeClient<S>,
+        local_node: LocalNodeClient<Env::Storage>,
         health_check_endpoints: Option<String>,
     ) -> Result<(), BenchmarkError> {
         let shutdown_notifier = CancellationToken::new();
@@ -120,7 +116,7 @@ where
         // the desired BPS, the tasks would continue sending block proposals until the channel's
         // buffer is filled, which would cause us to not properly control the BPS rate.
         let (sender, receiver) = crossbeam_channel::bounded(0);
-        let bps_control_task = tokio::task::spawn_blocking(move || {
+        let bps_control_task = task::spawn_blocking(move || {
             handle.block_on(async move {
                 let mut recv_count = 0;
                 let mut start = time::Instant::now();
@@ -167,11 +163,25 @@ where
             })
         });
 
+        let (bps_tasks_logger_sender, mut bps_tasks_logger_receiver) = mpsc::channel(num_chains);
+        let bps_tasks_logger_task = task::spawn(async move {
+            let mut tasks_running = 0;
+            while let Some(()) = bps_tasks_logger_receiver.recv().await {
+                tasks_running += 1;
+                info!("{}/{} tasks ready to start", tasks_running, num_chains);
+                if tasks_running == num_chains {
+                    info!("All tasks are ready to start");
+                    break;
+                }
+            }
+        });
+
         let mut bps_remainder = bps.unwrap_or_default() % num_chains;
         let bps_share = bps.map(|bps| bps / num_chains);
 
+        let barrier = Arc::new(Barrier::new(num_chains));
         let mut join_set = task::JoinSet::<Result<(), BenchmarkError>>::new();
-        for (chain_id, operations, key_pair) in blocks_infos {
+        for (chain_id, operations, chain_owner) in blocks_infos {
             let bps_share = if bps_remainder > 0 {
                 bps_remainder -= 1;
                 bps_share.map(|share| share + 1)
@@ -185,20 +195,24 @@ where
             let committee = committee.clone();
             let local_node = local_node.clone();
             let chain_client = chain_clients[&chain_id].clone();
+            let bps_tasks_logger_sender = bps_tasks_logger_sender.clone();
+            let inner_barrier = barrier.clone();
             chain_client.process_inbox().await?;
             join_set.spawn_blocking(move || {
                 handle.block_on(
                     async move {
                         Box::pin(Self::run_benchmark_internal(
+                            chain_owner,
                             bps_share,
                             operations,
-                            key_pair,
                             epoch,
                             chain_client,
                             shutdown_notifier,
                             sender,
                             committee,
                             local_node,
+                            bps_tasks_logger_sender,
+                            inner_barrier,
                         ))
                         .await?;
 
@@ -225,6 +239,7 @@ where
         if let Some(metrics_watcher) = metrics_watcher {
             metrics_watcher.await??;
         }
+        bps_tasks_logger_task.await?;
 
         Ok(())
     }
@@ -474,32 +489,36 @@ where
         Err(BenchmarkError::CouldNotComputeQuantile)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn run_benchmark_internal(
+        signer: AccountOwner,
         bps: Option<usize>,
         operations: Vec<Operation>,
-        key_pair: AccountSecretKey,
         epoch: Epoch,
-        chain_client: ChainClient<NodeProvider, S>,
+        chain_client: ChainClient<Env>,
         shutdown_notifier: CancellationToken,
         sender: crossbeam_channel::Sender<()>,
         committee: Committee,
-        local_node: LocalNodeClient<S>,
+        local_node: LocalNodeClient<Env::Storage>,
+        bps_tasks_logger_sender: mpsc::Sender<()>,
+        barrier: Arc<Barrier>,
     ) -> Result<(), BenchmarkError> {
         let chain_id = chain_client.chain_id();
+        bps_tasks_logger_sender.send(()).await?;
+        barrier.wait().await;
         info!(
             "Starting benchmark at target BPS of {:?}, for chain {:?}",
             bps, chain_id
         );
         let cross_chain_message_delivery = chain_client.options().cross_chain_message_delivery;
         let mut num_sent_proposals = 0;
-        let authenticated_signer = Some(AccountOwner::from(key_pair.public()));
+        let authenticated_signer = Some(signer);
         loop {
             if shutdown_notifier.is_cancelled() {
                 info!("Shutdown signal received, stopping benchmark");
                 break;
             }
-            let block = ProposedBlock {
+            let proposed_block = ProposedBlock {
                 epoch,
                 chain_id,
                 incoming_bundles: Vec::new(),
@@ -509,15 +528,21 @@ where
                 authenticated_signer,
                 timestamp: chain_client.timestamp().max(Timestamp::now()),
             };
-            let executed_block = local_node
-                .stage_block_execution(block.clone(), None, Vec::new())
+            let block = local_node
+                .stage_block_execution(proposed_block.clone(), None, Vec::new())
                 .await
                 .map_err(BenchmarkError::LocalNode)?
                 .0;
 
-            let value = Hashed::new(ConfirmedBlock::new(executed_block));
-            let proposal =
-                BlockProposal::new_initial(linera_base::data_types::Round::Fast, block, &key_pair);
+            let value = ConfirmedBlock::new(block);
+            let proposal = BlockProposal::new_initial(
+                signer,
+                linera_base::data_types::Round::Fast,
+                proposed_block,
+                chain_client.signer(),
+            )
+            .await
+            .expect("Signer failure");
 
             chain_client
                 .submit_block_proposal(&committee, Box::new(proposal), value)
@@ -553,7 +578,7 @@ where
 
     /// Closes the chain that was created for the benchmark.
     pub async fn close_benchmark_chain(
-        chain_client: &ChainClient<NodeProvider, S>,
+        chain_client: &ChainClient<Env>,
     ) -> Result<(), BenchmarkError> {
         let start = Instant::now();
         chain_client
@@ -572,27 +597,22 @@ where
 
     /// Generates information related to one block per chain, up to `num_chains` blocks.
     pub fn make_benchmark_block_info(
-        key_pairs: HashMap<ChainId, AccountSecretKey>,
+        keys: HashMap<ChainId, AccountOwner>,
         transactions_per_block: usize,
         fungible_application_id: Option<ApplicationId>,
-    ) -> Vec<(ChainId, Vec<Operation>, AccountSecretKey)> {
+    ) -> Vec<(ChainId, Vec<Operation>, AccountOwner)> {
         let mut blocks_infos = Vec::new();
-        let mut previous_chain_id = *key_pairs
+        let mut previous_chain_id = *keys
             .iter()
             .last()
             .expect("There should be a last element")
             .0;
         let amount = Amount::from(1);
-        for (chain_id, key_pair) in key_pairs {
-            let public_key = key_pair.public();
+        for (chain_id, owner) in keys {
             let operation = match fungible_application_id {
-                Some(application_id) => Self::fungible_transfer(
-                    application_id,
-                    previous_chain_id,
-                    public_key,
-                    public_key,
-                    amount,
-                ),
+                Some(application_id) => {
+                    Self::fungible_transfer(application_id, previous_chain_id, owner, owner, amount)
+                }
                 None => Operation::system(SystemOperation::Transfer {
                     owner: AccountOwner::CHAIN,
                     recipient: Recipient::chain(previous_chain_id),
@@ -600,7 +620,7 @@ where
                 }),
             };
             let operations = iter::repeat_n(operation, transactions_per_block).collect();
-            blocks_infos.push((chain_id, operations, key_pair));
+            blocks_infos.push((chain_id, operations, owner));
             previous_chain_id = chain_id;
         }
         blocks_infos
@@ -610,16 +630,16 @@ where
     pub fn fungible_transfer(
         application_id: ApplicationId,
         chain_id: ChainId,
-        sender: AccountPublicKey,
-        receiver: AccountPublicKey,
+        sender: AccountOwner,
+        receiver: AccountOwner,
         amount: Amount,
     ) -> Operation {
         let target_account = fungible::Account {
             chain_id,
-            owner: AccountOwner::from(receiver),
+            owner: receiver,
         };
         let bytes = bcs::to_bytes(&fungible::Operation::Transfer {
-            owner: AccountOwner::from(sender),
+            owner: sender,
             amount,
             target_account,
         })

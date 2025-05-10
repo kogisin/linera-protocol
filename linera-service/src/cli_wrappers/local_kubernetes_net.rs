@@ -37,6 +37,27 @@ static SHARED_LOCAL_KUBERNETES_TESTING_NET: OnceCell<(
     ClientWrapper,
 )> = OnceCell::const_new();
 
+#[derive(Clone, clap::Parser, clap::ValueEnum, Debug, Default)]
+pub enum BuildMode {
+    Debug,
+    #[default]
+    Release,
+}
+
+impl std::str::FromStr for BuildMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        clap::ValueEnum::from_str(s, true)
+    }
+}
+
+impl std::fmt::Display for BuildMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
 /// The information needed to start a [`LocalKubernetesNet`].
 pub struct LocalKubernetesNetConfig {
     pub network: Network,
@@ -48,7 +69,9 @@ pub struct LocalKubernetesNetConfig {
     pub binaries: BuildArg,
     pub no_build: bool,
     pub docker_image_name: String,
+    pub build_mode: BuildMode,
     pub policy_config: ResourceControlPolicyConfig,
+    pub dual_store: bool,
 }
 
 /// A wrapper of [`LocalKubernetesNetConfig`] to create a shared local Kubernetes network
@@ -66,10 +89,12 @@ pub struct LocalKubernetesNet {
     binaries: BuildArg,
     no_build: bool,
     docker_image_name: String,
+    build_mode: BuildMode,
     kubectl_instance: Arc<Mutex<KubectlInstance>>,
     kind_clusters: Vec<KindCluster>,
     num_initial_validators: usize,
     num_shards: usize,
+    dual_store: bool,
 }
 
 #[cfg(with_testing)]
@@ -102,7 +127,9 @@ impl SharedLocalKubernetesNetTestingConfig {
             binaries,
             no_build: false,
             docker_image_name: String::from("linera:latest"),
+            build_mode: BuildMode::Release,
             policy_config: ResourceControlPolicyConfig::Testnet,
+            dual_store: false,
         })
     }
 }
@@ -130,10 +157,12 @@ impl LineraNetConfig for LocalKubernetesNetConfig {
             self.binaries,
             self.no_build,
             self.docker_image_name,
+            self.build_mode,
             KubectlInstance::new(Vec::new()),
             clusters,
             self.num_initial_validators,
             self.num_shards,
+            self.dual_store,
         )?;
 
         let client = net.make_client().await;
@@ -301,17 +330,19 @@ impl LineraNet for LocalKubernetesNet {
 }
 
 impl LocalKubernetesNet {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         network: Network,
         testing_prng_seed: Option<u64>,
         binaries: BuildArg,
         no_build: bool,
         docker_image_name: String,
+        build_mode: BuildMode,
         kubectl_instance: KubectlInstance,
         kind_clusters: Vec<KindCluster>,
         num_initial_validators: usize,
         num_shards: usize,
+        dual_store: bool,
     ) -> Result<Self> {
         Ok(Self {
             network,
@@ -321,10 +352,12 @@ impl LocalKubernetesNet {
             binaries,
             no_build,
             docker_image_name,
+            build_mode,
             kubectl_instance: Arc::new(Mutex::new(kubectl_instance)),
             kind_clusters,
             num_initial_validators,
             num_shards,
+            dual_store,
         })
     }
 
@@ -341,8 +374,6 @@ impl LocalKubernetesNet {
         let port = 19100 + server_number;
         let internal_port = 20100;
         let metrics_port = 21100;
-        let pyroscope_port = 4040;
-        let pyroscope_sample_rate = 10;
         let mut content = format!(
             r#"
                 server_config_path = "server_{n}.json"
@@ -351,9 +382,6 @@ impl LocalKubernetesNet {
                 internal_host = "proxy-internal.default.svc.cluster.local"
                 internal_port = {internal_port}
                 metrics_port = {metrics_port}
-                pyroscope_host = "linera-core-pyroscope.default.svc.cluster.local"
-                pyroscope_port = {pyroscope_port}
-                pyroscope_sample_rate = {pyroscope_sample_rate}
                 [external_protocol]
                 Grpc = "ClearText"
                 [internal_protocol]
@@ -363,7 +391,6 @@ impl LocalKubernetesNet {
         for k in 0..self.num_shards {
             let shard_port = 19100;
             let shard_metrics_port = 21100;
-            let shard_pyroscope_port = 4040;
             content.push_str(&format!(
                 r#"
 
@@ -371,9 +398,6 @@ impl LocalKubernetesNet {
                 host = "shards-{k}.shards.default.svc.cluster.local"
                 port = {shard_port}
                 metrics_port = {shard_metrics_port}
-                pyroscope_host = "linera-core-pyroscope.default.svc.cluster.local"
-                pyroscope_port = {shard_pyroscope_port}
-                pyroscope_sample_rate = {pyroscope_sample_rate}
                 "#
             ));
         }
@@ -410,7 +434,14 @@ impl LocalKubernetesNet {
         let docker_image_name = if self.no_build {
             self.docker_image_name.clone()
         } else {
-            DockerImage::build(&self.docker_image_name, &self.binaries, &github_root).await?;
+            DockerImage::build(
+                &self.docker_image_name,
+                &self.binaries,
+                &github_root,
+                &self.build_mode,
+                self.dual_store,
+            )
+            .await?;
             self.docker_image_name.clone()
         };
 
@@ -436,6 +467,7 @@ impl LocalKubernetesNet {
             let tmp_dir_path = tmp_dir_path_clone.clone();
 
             let docker_image_name = docker_image_name.clone();
+            let dual_store = self.dual_store;
             let future = async move {
                 let cluster_id = kind_cluster.id();
                 kind_cluster.load_docker_image(&docker_image_name).await?;
@@ -446,7 +478,15 @@ impl LocalKubernetesNet {
                     base_dir.join(&server_config_filename),
                 )?;
 
-                HelmFile::sync(i, &github_root, num_shards, cluster_id, docker_image_name).await?;
+                HelmFile::sync(
+                    i,
+                    &github_root,
+                    num_shards,
+                    cluster_id,
+                    docker_image_name,
+                    dual_store,
+                )
+                .await?;
 
                 let mut kubectl_instance = kubectl_instance.lock().await;
                 let output = kubectl_instance.get_pods(cluster_id).await?;

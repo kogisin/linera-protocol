@@ -6,16 +6,17 @@ interface contract-runtime-api {
     message-is-bouncing: func() -> option<bool>;
     authenticated-caller-id: func() -> option<application-id>;
     send-message: func(message: send-message-request);
-    subscribe: func(chain: chain-id, channel: channel-name);
-    unsubscribe: func(chain: chain-id, channel: channel-name);
     transfer: func(source: account-owner, destination: account, amount: amount);
     claim: func(source: account, destination: account, amount: amount);
-    open-chain: func(chain-ownership: chain-ownership, application-permissions: application-permissions, balance: amount) -> tuple<message-id, chain-id>;
+    open-chain: func(chain-ownership: chain-ownership, application-permissions: application-permissions, balance: amount) -> chain-id;
     close-chain: func() -> result<tuple<>, close-chain-error>;
     change-application-permissions: func(application-permissions: application-permissions) -> result<tuple<>, change-application-permissions-error>;
     create-application: func(module-id: module-id, parameters: list<u8>, argument: list<u8>, required-application-ids: list<application-id>) -> application-id;
     try-call-application: func(authenticated: bool, callee-id: application-id, argument: list<u8>) -> list<u8>;
     emit: func(name: stream-name, value: list<u8>) -> u32;
+    read-event: func(chain-id: chain-id, name: stream-name, index: u32) -> list<u8>;
+    subscribe-to-events: func(chain-id: chain-id, application-id: application-id, name: stream-name);
+    unsubscribe-from-events: func(chain-id: chain-id, application-id: application-id, name: stream-name);
     query-service: func(application-id: application-id, query: list<u8>) -> list<u8>;
     consume-fuel: func(fuel: u64);
     validation-round: func() -> option<u32>;
@@ -29,6 +30,7 @@ interface contract-runtime-api {
     variant account-owner {
         reserved(u8),
         address32(crypto-hash),
+        address20(array20),
     }
 
     record amount {
@@ -46,6 +48,12 @@ interface contract-runtime-api {
         change-application-permissions: list<application-id>,
         call-service-as-oracle: option<list<application-id>>,
         make-http-requests: option<list<application-id>>,
+    }
+
+    record array20 {
+        part1: u64,
+        part2: u64,
+        part3: u64,
     }
 
     record block-height {
@@ -68,10 +76,6 @@ interface contract-runtime-api {
         not-permitted,
     }
 
-    record channel-name {
-        inner0: list<u8>,
-    }
-
     enum close-chain-error {
         not-permitted,
     }
@@ -81,11 +85,6 @@ interface contract-runtime-api {
         part2: u64,
         part3: u64,
         part4: u64,
-    }
-
-    variant destination {
-        recipient(chain-id),
-        subscribers(channel-name),
     }
 
     record message-id {
@@ -101,7 +100,8 @@ interface contract-runtime-api {
     }
 
     record resources {
-        fuel: u64,
+        wasm-fuel: u64,
+        evm-fuel: u64,
         read-operations: u32,
         write-operations: u32,
         bytes-to-read: u32,
@@ -118,7 +118,7 @@ interface contract-runtime-api {
     }
 
     record send-message-request {
-        destination: destination,
+        destination: chain-id,
         authenticated: bool,
         is-tracked: bool,
         grant: resources,

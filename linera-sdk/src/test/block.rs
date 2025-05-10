@@ -7,26 +7,23 @@
 
 use linera_base::{
     abi::ContractAbi,
-    data_types::{Amount, ApplicationPermissions, Blob, Round, Timestamp},
-    hashed::Hashed,
+    data_types::{Amount, ApplicationPermissions, Blob, Epoch, Round, Timestamp},
     identifiers::{AccountOwner, ApplicationId, ChainId},
     ownership::TimeoutConfig,
 };
 use linera_chain::{
     data_types::{
-        IncomingBundle, LiteValue, LiteVote, Medium, MessageAction, Origin, ProposedBlock,
-        SignatureAggregator,
+        IncomingBundle, LiteValue, LiteVote, MessageAction, ProposedBlock, SignatureAggregator,
     },
     types::{ConfirmedBlock, ConfirmedBlockCertificate},
 };
+use linera_core::worker::WorkerError;
 use linera_execution::{
-    committee::Epoch,
     system::{Recipient, SystemOperation},
     Operation,
 };
 
 use super::TestValidator;
-use crate::ToBcsBytes;
 
 /// A helper type to build a block proposal using the builder pattern, and then signing them into
 /// [`ConfirmedBlockCertificate`]s using a [`TestValidator`].
@@ -144,12 +141,9 @@ impl BlockBuilder {
     where
         Abi: ContractAbi,
     {
-        self.with_raw_operation(
-            application_id.forget_abi(),
-            operation
-                .to_bcs_bytes()
-                .expect("Failed to serialize operation"),
-        )
+        let operation = Abi::serialize_operation(&operation)
+            .expect("Failed to serialize `Operation` in BlockBuilder");
+        self.with_raw_operation(application_id.forget_abi(), operation)
     }
 
     /// Adds an already serialized user `operation` to this block.
@@ -179,27 +173,24 @@ impl BlockBuilder {
 
     /// Receives all direct messages  that were sent to this chain by the given certificate.
     pub fn with_messages_from(&mut self, certificate: &ConfirmedBlockCertificate) -> &mut Self {
-        self.with_messages_from_by_medium(certificate, &Medium::Direct, MessageAction::Accept)
+        self.with_messages_from_by_action(certificate, MessageAction::Accept)
     }
 
     /// Receives all messages that were sent to this chain by the given certificate.
-    pub fn with_messages_from_by_medium(
+    pub fn with_messages_from_by_action(
         &mut self,
         certificate: &ConfirmedBlockCertificate,
-        medium: &Medium,
         action: MessageAction,
     ) -> &mut Self {
-        let origin = Origin {
-            sender: certificate.inner().chain_id(),
-            medium: medium.clone(),
-        };
-        let bundles = certificate
-            .message_bundles_for(medium, self.block.chain_id)
-            .map(|(_epoch, bundle)| IncomingBundle {
-                origin: origin.clone(),
-                bundle,
-                action,
-            });
+        let origin = certificate.inner().chain_id();
+        let bundles =
+            certificate
+                .message_bundles_for(self.block.chain_id)
+                .map(|(_epoch, bundle)| IncomingBundle {
+                    origin,
+                    bundle,
+                    action,
+                });
         self.with_incoming_bundles(bundles)
     }
 
@@ -208,7 +199,7 @@ impl BlockBuilder {
     pub(crate) async fn try_sign(
         self,
         blobs: &[Blob],
-    ) -> anyhow::Result<ConfirmedBlockCertificate> {
+    ) -> Result<ConfirmedBlockCertificate, WorkerError> {
         let published_blobs = self
             .block
             .published_blob_ids()
@@ -221,13 +212,13 @@ impl BlockBuilder {
                     .clone()
             })
             .collect();
-        let (executed_block, _) = self
+        let (block, _) = self
             .validator
             .worker()
             .stage_block_execution(self.block, None, published_blobs)
             .await?;
 
-        let value = Hashed::new(ConfirmedBlock::new(executed_block));
+        let value = ConfirmedBlock::new(block);
         let vote = LiteVote::new(
             LiteValue::new(&value),
             Round::Fast,

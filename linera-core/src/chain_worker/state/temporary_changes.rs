@@ -10,21 +10,19 @@ use linera_base::{
 };
 use linera_chain::{
     data_types::{
-        BlockExecutionOutcome, BlockProposal, ExecutedBlock, IncomingBundle, MessageAction,
-        ProposalContent, ProposedBlock,
+        BlockExecutionOutcome, BlockProposal, IncomingBundle, MessageAction, ProposalContent,
+        ProposedBlock,
     },
     manager,
+    types::Block,
 };
 use linera_execution::{Query, QueryOutcome};
 use linera_storage::{Clock as _, Storage};
-use linera_views::views::View;
+use linera_views::views::{ClonableView, View};
 #[cfg(with_testing)]
 use {
     linera_base::{crypto::CryptoHash, data_types::BlockHeight},
-    linera_chain::{
-        data_types::{MessageBundle, Origin},
-        types::ConfirmedBlockCertificate,
-    },
+    linera_chain::{data_types::MessageBundle, types::ConfirmedBlockCertificate},
 };
 
 use super::ChainWorkerState;
@@ -61,7 +59,7 @@ where
         &mut self,
         height: BlockHeight,
     ) -> Result<Option<ConfirmedBlockCertificate>, WorkerError> {
-        self.0.ensure_is_active()?;
+        self.0.ensure_is_active().await?;
         let certificate_hash = match self.0.chain.confirmed_log.get(height.try_into()?).await? {
             Some(hash) => hash,
             None => return Ok(None),
@@ -74,12 +72,12 @@ where
     #[cfg(with_testing)]
     pub(super) async fn find_bundle_in_inbox(
         &mut self,
-        inbox_id: Origin,
+        inbox_id: linera_base::identifiers::ChainId,
         certificate_hash: CryptoHash,
         height: BlockHeight,
         index: u32,
     ) -> Result<Option<MessageBundle>, WorkerError> {
-        self.0.ensure_is_active()?;
+        self.0.ensure_is_active().await?;
 
         let mut inbox = self.0.chain.inboxes.try_load_entry_mut(&inbox_id).await?;
         let mut bundles = inbox.added_bundles.iter_mut().await?;
@@ -98,7 +96,7 @@ where
         &mut self,
         query: Query,
     ) -> Result<QueryOutcome, WorkerError> {
-        self.0.ensure_is_active()?;
+        self.0.ensure_is_active().await?;
         let local_time = self.0.storage.clock().current_time();
         let outcome = self
             .0
@@ -113,7 +111,7 @@ where
         &mut self,
         application_id: ApplicationId,
     ) -> Result<ApplicationDescription, WorkerError> {
-        self.0.ensure_is_active()?;
+        self.0.ensure_is_active().await?;
         let response = self.0.chain.describe_application(application_id).await?;
         Ok(response)
     }
@@ -124,18 +122,16 @@ where
         block: ProposedBlock,
         round: Option<u32>,
         published_blobs: &[Blob],
-    ) -> Result<(ExecutedBlock, ChainInfoResponse), WorkerError> {
+    ) -> Result<(Block, ChainInfoResponse), WorkerError> {
+        self.0.ensure_is_active().await?;
         let local_time = self.0.storage.clock().current_time();
         let signer = block.authenticated_signer;
+        let (_, committee) = self.0.chain.current_committee()?;
+        block.check_proposal_size(committee.policy().maximum_block_proposal_size)?;
 
-        let executed_block =
-            Box::pin(
-                self.0
-                    .chain
-                    .execute_block(&block, local_time, round, published_blobs, None),
-            )
-            .await?
-            .with(block);
+        let outcome = self
+            .execute_block(&block, local_time, round, published_blobs)
+            .await?;
 
         let mut response = ChainInfoResponse::new(&self.0.chain, None);
         if let Some(signer) = signer {
@@ -149,7 +145,7 @@ where
                 .await?;
         }
 
-        Ok((executed_block, response))
+        Ok((outcome.with(block), response))
     }
 
     /// Validates a proposal's signatures; returns `manager::Outcome::Skip` if we already voted
@@ -214,36 +210,31 @@ where
         self.0.storage.clock().sleep_until(block.timestamp).await;
         let local_time = self.0.storage.clock().current_time();
 
-        let chain = &mut self.0.chain;
-        chain
+        self.0
+            .chain
             .remove_bundles_from_inboxes(block.timestamp, &block.incoming_bundles)
             .await?;
         let outcome = if let Some(outcome) = outcome {
             outcome.clone()
         } else {
-            Box::pin(chain.execute_block(
-                block,
-                local_time,
-                round.multi_leader(),
-                published_blobs,
-                None,
-            ))
-            .await?
+            self.execute_block(block, local_time, round.multi_leader(), published_blobs)
+                .await?
         };
 
-        let executed_block = outcome.with(block.clone());
         ensure!(
-            !round.is_fast() || !executed_block.outcome.has_oracle_responses(),
+            !round.is_fast() || !outcome.has_oracle_responses(),
             WorkerError::FastBlockUsingOracles
         );
+        let chain = &mut self.0.chain;
         // Check if the counters of tip_state would be valid.
-        chain
-            .tip_state
-            .get_mut()
-            .update_counters(block, &executed_block.outcome)?;
+        chain.tip_state.get_mut().update_counters(
+            &block.incoming_bundles,
+            &block.operations,
+            &outcome.messages,
+        )?;
         // Verify that the resulting chain would have no unconfirmed incoming messages.
         chain.validate_incoming_bundles().await?;
-        Ok(Some((executed_block.outcome, local_time)))
+        Ok(Some((outcome, local_time)))
     }
 
     /// Prepares a [`ChainInfoResponse`] for a [`ChainInfoQuery`].
@@ -251,6 +242,7 @@ where
         &mut self,
         query: ChainInfoQuery,
     ) -> Result<ChainInfoResponse, WorkerError> {
+        self.0.ensure_is_active().await?;
         let chain = &self.0.chain;
         let mut info = ChainInfo::from(chain);
         if query.request_committees {
@@ -286,7 +278,7 @@ where
             for (origin, inbox) in pairs {
                 for bundle in inbox.added_bundles.elements().await? {
                     messages.push(IncomingBundle {
-                        origin: origin.clone(),
+                        origin,
                         bundle,
                         action,
                     });
@@ -315,6 +307,28 @@ where
             info.manager.add_values(&chain.manager);
         }
         Ok(ChainInfoResponse::new(info, self.0.config.key_pair()))
+    }
+
+    /// Executes a block, caches the result, and returns the outcome.
+    async fn execute_block(
+        &mut self,
+        block: &ProposedBlock,
+        local_time: Timestamp,
+        round: Option<u32>,
+        published_blobs: &[Blob],
+    ) -> Result<BlockExecutionOutcome, WorkerError> {
+        let outcome =
+            Box::pin(
+                self.0
+                    .chain
+                    .execute_block(block, local_time, round, published_blobs, None),
+            )
+            .await?;
+        self.0.execution_state_cache.insert_owned(
+            &outcome.state_hash,
+            self.0.chain.execution_state.clone_unchecked()?,
+        );
+        Ok(outcome)
     }
 }
 

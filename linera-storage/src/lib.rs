@@ -14,44 +14,39 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use linera_base::{
     crypto::CryptoHash,
     data_types::{
-        Amount, ApplicationDescription, Blob, BlockHeight, CompressedBytecode, TimeDelta, Timestamp,
+        ApplicationDescription, Blob, ChainDescription, CompressedBytecode, Epoch, TimeDelta,
+        Timestamp,
     },
-    hashed::Hashed,
-    identifiers::{
-        AccountOwner, ApplicationId, BlobId, BlobType, ChainDescription, ChainId, EventId,
-    },
-    ownership::ChainOwnership,
+    identifiers::{ApplicationId, BlobId, ChainId, EventId},
     vm::VmRuntime,
 };
 use linera_chain::{
     types::{ConfirmedBlock, ConfirmedBlockCertificate},
     ChainError, ChainStateView,
 };
-use linera_execution::{
-    committee::{Committee, Epoch},
-    BlobState, ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext, UserContractCode,
-    UserServiceCode, WasmRuntime,
-};
 #[cfg(with_revm)]
 use linera_execution::{
-    revm::{EvmContractModule, EvmServiceModule},
+    evm::revm::{EvmContractModule, EvmServiceModule},
     EvmRuntime,
+};
+use linera_execution::{
+    BlobState, ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext, UserContractCode,
+    UserServiceCode, WasmRuntime,
 };
 #[cfg(with_wasm_runtime)]
 use linera_execution::{WasmContractModule, WasmServiceModule};
 use linera_views::{
     context::Context,
-    views::{CryptoHashView, RootView, ViewError},
+    views::{RootView, ViewError},
 };
+use serde::{Deserialize, Serialize};
 
 #[cfg(with_testing)]
 pub use crate::db_storage::TestClock;
-pub use crate::db_storage::{
-    list_all_blob_ids, list_all_chain_ids, ChainStatesFirstAssignment, DbStorage, WallClock,
-};
+pub use crate::db_storage::{ChainStatesFirstAssignment, DbStorage, WallClock};
 #[cfg(with_metrics)]
 pub use crate::db_storage::{
-    READ_CERTIFICATE_COUNTER, READ_HASHED_CONFIRMED_BLOCK_COUNTER, WRITE_CERTIFICATE_COUNTER,
+    READ_CERTIFICATE_COUNTER, READ_CONFIRMED_BLOCK_COUNTER, WRITE_CERTIFICATE_COUNTER,
 };
 
 /// The default namespace to be used when none is specified
@@ -61,11 +56,14 @@ pub const DEFAULT_NAMESPACE: &str = "table_linera";
 #[cfg_attr(not(web), async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
 pub trait Storage: Sized {
-    /// The low-level storage implementation in use.
+    /// The low-level storage implementation in use by the core protocol (chain workers etc).
     type Context: Context<Extra = ChainRuntimeContext<Self>> + Clone + Send + Sync + 'static;
 
     /// The clock type being used.
     type Clock: Clock;
+
+    /// The low-level storage implementation in use by the block exporter.
+    type BlockExporterContext: Context<Extra = u32> + Clone + Send + Sync + 'static;
 
     /// Returns the current wall clock time.
     fn clock(&self) -> &Self::Clock;
@@ -77,10 +75,6 @@ pub trait Storage: Sized {
     /// Each time this method is called, a new [`ChainStateView`] is created. If there are multiple
     /// instances of the same chain active at any given moment, they will race to access persistent
     /// storage. This can lead to invalid states and data corruption.
-    ///
-    /// Other methods that also create [`ChainStateView`] instances that can cause conflicts are:
-    /// [`load_active_chain`][`Self::load_active_chain`] and
-    /// [`create_chain`][`Self::create_chain`].
     async fn load_chain(&self, id: ChainId) -> Result<ChainStateView<Self::Context>, ViewError>;
 
     /// Tests the existence of a blob with the given blob ID.
@@ -93,10 +87,7 @@ pub trait Storage: Sized {
     async fn contains_blob_state(&self, blob_id: BlobId) -> Result<bool, ViewError>;
 
     /// Reads the hashed certificate value with the given hash.
-    async fn read_hashed_confirmed_block(
-        &self,
-        hash: CryptoHash,
-    ) -> Result<Hashed<ConfirmedBlock>, ViewError>;
+    async fn read_confirmed_block(&self, hash: CryptoHash) -> Result<ConfirmedBlock, ViewError>;
 
     /// Reads the blob with the given blob ID.
     async fn read_blob(&self, blob_id: BlobId) -> Result<Blob, ViewError>;
@@ -111,11 +102,11 @@ pub trait Storage: Sized {
     async fn read_blob_states(&self, blob_ids: &[BlobId]) -> Result<Vec<BlobState>, ViewError>;
 
     /// Reads the hashed certificate values in descending order from the given hash.
-    async fn read_hashed_confirmed_blocks_downward(
+    async fn read_confirmed_blocks_downward(
         &self,
         from: CryptoHash,
         limit: u32,
-    ) -> Result<Vec<Hashed<ConfirmedBlock>>, ViewError>;
+    ) -> Result<Vec<ConfirmedBlock>, ViewError>;
 
     /// Writes the given blob.
     async fn write_blob(&self, blob: &Blob) -> Result<(), ViewError>;
@@ -174,33 +165,23 @@ pub trait Storage: Sized {
     /// Reads the event with the given ID.
     async fn read_event(&self, id: EventId) -> Result<Vec<u8>, ViewError>;
 
+    /// Tests existence of the event with the given ID.
+    async fn contains_event(&self, id: EventId) -> Result<bool, ViewError>;
+
     /// Writes a vector of events.
     async fn write_events(
         &self,
         events: impl IntoIterator<Item = (EventId, Vec<u8>)> + Send,
     ) -> Result<(), ViewError>;
 
-    /// Loads the view of a chain state and checks that it is active.
-    ///
-    /// # Notes
-    ///
-    /// Each time this method is called, a new [`ChainStateView`] is created. If there are multiple
-    /// instances of the same chain active at any given moment, they will race to access persistent
-    /// storage. This can lead to invalid states and data corruption.
-    ///
-    /// Other methods that also create [`ChainStateView`] instances that can cause conflicts are:
-    /// [`load_chain`][`Self::load_chain`] and [`create_chain`][`Self::create_chain`].
-    async fn load_active_chain(
+    /// Reads the network description.
+    async fn read_network_description(&self) -> Result<Option<NetworkDescription>, ViewError>;
+
+    /// Writes the network description.
+    async fn write_network_description(
         &self,
-        id: ChainId,
-    ) -> Result<ChainStateView<Self::Context>, linera_chain::ChainError>
-    where
-        ChainRuntimeContext<Self>: ExecutionRuntimeContext,
-    {
-        let chain = self.load_chain(id).await?;
-        chain.ensure_is_active()?;
-        Ok(chain)
-    }
+        information: &NetworkDescription,
+    ) -> Result<(), ViewError>;
 
     /// Initializes a chain in a simple way (used for testing and to create a genesis state).
     ///
@@ -209,44 +190,18 @@ pub trait Storage: Sized {
     /// This method creates a new [`ChainStateView`] instance. If there are multiple instances of
     /// the same chain active at any given moment, they will race to access persistent storage.
     /// This can lead to invalid states and data corruption.
-    ///
-    /// Other methods that also create [`ChainStateView`] instances that can cause conflicts are:
-    /// [`load_chain`][`Self::load_chain`] and [`load_active_chain`][`Self::load_active_chain`].
-    async fn create_chain(
-        &self,
-        committee: Committee,
-        admin_id: ChainId,
-        description: ChainDescription,
-        owner: AccountOwner,
-        balance: Amount,
-        timestamp: Timestamp,
-    ) -> Result<(), ChainError>
+    async fn create_chain(&self, description: ChainDescription) -> Result<(), ChainError>
     where
         ChainRuntimeContext<Self>: ExecutionRuntimeContext,
     {
-        let id = description.into();
+        let id = description.id();
+        // Store the description blob.
+        self.write_blob(&Blob::new_chain_description(&description))
+            .await?;
         let mut chain = self.load_chain(id).await?;
         assert!(!chain.is_active(), "Attempting to create a chain twice");
-        chain.manager.reset(
-            ChainOwnership::single(owner),
-            BlockHeight(0),
-            self.clock().current_time(),
-            committee.account_keys_and_weights(),
-        )?;
-        let system_state = &mut chain.execution_state.system;
-        system_state.description.set(Some(description));
-        system_state.epoch.set(Some(Epoch::ZERO));
-        system_state.admin_id.set(Some(admin_id));
-        system_state
-            .committees
-            .get_mut()
-            .insert(Epoch::ZERO, committee);
-        system_state.ownership.set(ChainOwnership::single(owner));
-        system_state.balance.set(balance);
-        system_state.timestamp.set(timestamp);
-
-        let state_hash = chain.execution_state.crypto_hash().await?;
-        chain.execution_state_hash.set(Some(state_hash));
+        let current_time = self.clock().current_time();
+        chain.ensure_is_active(current_time).await?;
         chain.save().await?;
         Ok(())
     }
@@ -260,10 +215,7 @@ pub trait Storage: Sized {
         &self,
         application_description: &ApplicationDescription,
     ) -> Result<UserContractCode, ExecutionError> {
-        let contract_bytecode_blob_id = BlobId::new(
-            application_description.module_id.contract_blob_hash,
-            BlobType::ContractBytecode,
-        );
+        let contract_bytecode_blob_id = application_description.contract_bytecode_blob_id();
         let contract_blob = self.read_blob(contract_bytecode_blob_id).await?;
         let compressed_contract_bytecode = CompressedBytecode {
             compressed_bytes: contract_blob.into_bytes().to_vec(),
@@ -320,10 +272,7 @@ pub trait Storage: Sized {
         &self,
         application_description: &ApplicationDescription,
     ) -> Result<UserServiceCode, ExecutionError> {
-        let service_bytecode_blob_id = BlobId::new(
-            application_description.module_id.service_blob_hash,
-            BlobType::ServiceBytecode,
-        );
+        let service_bytecode_blob_id = application_description.service_bytecode_blob_id();
         let service_blob = self.read_blob(service_bytecode_blob_id).await?;
         let compressed_service_bytecode = CompressedBytecode {
             compressed_bytes: service_blob.into_bytes().to_vec(),
@@ -372,8 +321,22 @@ pub trait Storage: Sized {
             }
         }
     }
+
+    async fn block_exporter_context(
+        &self,
+        block_exporter_id: u32,
+    ) -> Result<Self::BlockExporterContext, ViewError>;
 }
 
+/// A description of the current Linera network to be stored in every node's database.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NetworkDescription {
+    pub name: String,
+    pub genesis_config_hash: CryptoHash,
+    pub genesis_timestamp: Timestamp,
+}
+
+/// An implementation of `ExecutionRuntimeContext` suitable for the core protocol.
 #[derive(Clone)]
 pub struct ChainRuntimeContext<S> {
     storage: S,
@@ -443,6 +406,10 @@ where
 
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError> {
         self.storage.contains_blob(blob_id).await
+    }
+
+    async fn contains_event(&self, event_id: EventId) -> Result<bool, ViewError> {
+        self.storage.contains_event(event_id).await
     }
 
     #[cfg(with_testing)]

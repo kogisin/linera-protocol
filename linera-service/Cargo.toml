@@ -15,9 +15,9 @@ version.workspace = true
 ethereum = []
 default = ["wasmer", "rocksdb", "storage-service"]
 revm = [
+    "linera-base/revm",
     "linera-execution/revm",
     "linera-storage/revm",
-    "linera-sdk/revm",
     "dep:alloy-sol-types",
 ]
 test = [
@@ -42,39 +42,16 @@ wasmtime = [
     "linera-execution/wasmtime",
     "linera-storage/wasmtime",
 ]
-rocksdb = [
-    "linera-client/rocksdb",
-    "linera-views/rocksdb",
-    "linera-core/rocksdb",
-]
-dynamodb = [
-    "linera-client/dynamodb",
-    "linera-views/dynamodb",
-    "linera-core/dynamodb",
-]
-scylladb = [
-    "linera-client/scylladb",
-    "linera-views/scylladb",
-    "linera-core/scylladb",
-]
-kubernetes = [
-    "linera-client/kubernetes",
-    "dep:k8s-openapi",
-    "dep:kube",
-    "dep:pathdiff",
-    "dep:fs_extra",
-]
+rocksdb = ["linera-views/rocksdb", "linera-core/rocksdb"]
+dynamodb = ["linera-views/dynamodb", "linera-core/dynamodb"]
+scylladb = ["linera-views/scylladb", "linera-core/scylladb"]
+kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:pathdiff", "dep:fs_extra"]
 remote-net = []
-metrics = [
-    "prometheus",
-    "linera-base/metrics",
-    "linera-client/metrics",
-    "pyroscope_pprofrs",
-    "pyroscope",
-]
-storage-service = ["linera-client/storage-service", "linera-storage-service"]
+metrics = ["prometheus", "linera-base/metrics", "linera-client/metrics"]
+storage-service = ["linera-storage-service"]
 
 [dependencies]
+alloy-primitives.workspace = true
 alloy-sol-types = { workspace = true, optional = true }
 anyhow.workspace = true
 assert_matches.workspace = true
@@ -84,7 +61,10 @@ async-lock.workspace = true
 async-trait.workspace = true
 async-tungstenite.workspace = true
 axum = { workspace = true, features = ["ws"] }
+bcs.workspace = true
+bincode.workspace = true
 cargo_toml.workspace = true
+cfg-if.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 clap.workspace = true
 clap-markdown.workspace = true
@@ -92,11 +72,11 @@ colored.workspace = true
 comfy-table.workspace = true
 convert_case.workspace = true
 current_platform = "0.2.0"
+dirs.workspace = true
 fs-err = { workspace = true, features = ["tokio"] }
 fs_extra = { workspace = true, optional = true }
 futures.workspace = true
 heck.workspace = true
-hex.workspace = true
 http.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
@@ -118,8 +98,6 @@ pathdiff = { workspace = true, optional = true }
 port-selector.workspace = true
 prometheus = { workspace = true, optional = true }
 prost = { workspace = true }
-pyroscope = { workspace = true, optional = true }
-pyroscope_pprofrs = { workspace = true, optional = true }
 rand.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
@@ -143,11 +121,9 @@ tracing.workspace = true
 cfg_aliases.workspace = true
 
 [dev-dependencies]
-alloy = { workspace = true, default-features = false, features = [
-    "rpc-types-eth",
-] }
 amm.workspace = true
 base64.workspace = true
+call-evm-counter.workspace = true
 counter.workspace = true
 counter-no-graphql.workspace = true
 criterion = { workspace = true, features = ["async_tokio"] }
@@ -197,6 +173,10 @@ path = "src/schema_export.rs"
 name = "linera-benchmark"
 path = "src/benchmark.rs"
 required-features = ["benchmark"]
+
+[[bin]]
+name = "linera-exporter"
+path = "src/linera-exporter/main.rs"
 
 [[bench]]
 name = "transfers"

@@ -4,16 +4,15 @@
 use std::{num::NonZeroU16, str::FromStr};
 
 use colored::Colorize as _;
-use linera_base::{
-    data_types::Amount, identifiers::ChainId, listen_for_shutdown_signals, time::Duration,
-};
-use linera_client::{
-    client_options::ResourceControlPolicyConfig,
+use linera_base::{data_types::Amount, listen_for_shutdown_signals, time::Duration};
+use linera_client::client_options::ResourceControlPolicyConfig;
+use linera_rpc::config::CrossChainConfig;
+use linera_service::{
+    cli_wrappers::{
+        local_net::{Database, LocalNetConfig, PathProvider, StorageConfigBuilder},
+        ClientWrapper, FaucetService, LineraNet, LineraNetConfig, Network, NetworkConfig,
+    },
     storage::{StorageConfig, StorageConfigNamespace},
-};
-use linera_service::cli_wrappers::{
-    local_net::{Database, LocalNetConfig, PathProvider, StorageConfigBuilder},
-    ClientWrapper, FaucetService, LineraNet, LineraNetConfig, Network, NetworkConfig,
 };
 #[cfg(feature = "storage-service")]
 use linera_storage_service::{
@@ -24,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 #[cfg(feature = "kubernetes")]
 use {
-    linera_service::cli_wrappers::local_kubernetes_net::LocalKubernetesNetConfig,
+    linera_service::cli_wrappers::local_kubernetes_net::{BuildMode, LocalKubernetesNetConfig},
     std::path::PathBuf,
 };
 
@@ -114,11 +113,13 @@ pub async fn handle_net_up_kubernetes(
     binaries: &Option<Option<PathBuf>>,
     no_build: bool,
     docker_image_name: String,
+    build_mode: BuildMode,
     policy_config: ResourceControlPolicyConfig,
     with_faucet: bool,
     faucet_chain: Option<u32>,
     faucet_port: NonZeroU16,
     faucet_amount: Amount,
+    dual_store: bool,
 ) -> anyhow::Result<()> {
     if num_initial_validators < 1 {
         panic!("The local test network must have at least one validator.");
@@ -146,7 +147,9 @@ pub async fn handle_net_up_kubernetes(
         binaries: binaries.clone().into(),
         no_build,
         docker_image_name,
+        build_mode,
         policy_config,
+        dual_store,
     };
     let (mut net, client) = config.instantiate().await?;
     let faucet_service = print_messages_and_create_faucet(
@@ -169,6 +172,7 @@ pub async fn handle_net_up_service(
     num_shards: usize,
     testing_prng_seed: Option<u64>,
     policy_config: ResourceControlPolicyConfig,
+    cross_chain_config: CrossChainConfig,
     path: &Option<String>,
     storage: &Option<String>,
     external_protocol: String,
@@ -176,6 +180,7 @@ pub async fn handle_net_up_service(
     faucet_chain: Option<u32>,
     faucet_port: NonZeroU16,
     faucet_amount: Amount,
+    num_block_exporters: u32,
 ) -> anyhow::Result<()> {
     if num_initial_validators < 1 {
         panic!("The local test network must have at least one validator.");
@@ -210,8 +215,10 @@ pub async fn handle_net_up_service(
         num_initial_validators,
         num_shards,
         policy_config,
+        cross_chain_config,
         storage_config_builder,
         path_provider,
+        num_block_exporters,
     };
     let (mut net, client) = config.instantiate().await?;
     let faucet_service = print_messages_and_create_faucet(
@@ -244,7 +251,6 @@ async fn wait_for_shutdown(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn print_messages_and_create_faucet(
     client: ClientWrapper,
     with_faucet: bool,
@@ -260,8 +266,9 @@ async fn print_messages_and_create_faucet(
     info!("Local test network successfully started.");
 
     eprintln!(
-        "To use the initial wallet of this test network, you may set \
-         the environment variables LINERA_WALLET and LINERA_STORAGE as follows.\n"
+        "To use the admin wallet of this test network, you may set \
+         the environment variables LINERA_WALLET, LINERA_KEYSTORE, \
+         and LINERA_STORAGE as follows.\n"
     );
     println!(
         "{}",
@@ -273,20 +280,34 @@ async fn print_messages_and_create_faucet(
     );
     println!(
         "{}",
+        format!(
+            "export LINERA_KEYSTORE=\"{}\"",
+            client.keystore_path().display()
+        )
+        .bold()
+    );
+    println!(
+        "{}",
         format!("export LINERA_STORAGE=\"{}\"\n", client.storage_path()).bold()
     );
 
+    let wallet = client.load_wallet()?;
+    let chains = wallet.chain_ids();
+
     // Run the faucet,
     let faucet_service = if with_faucet {
-        let faucet_chain = if let Some(faucet_chain) = faucet_chain {
-            ChainId::root(faucet_chain)
-        } else {
-            assert!(
-                num_other_initial_chains > 1,
-                "num_other_initial_chains must be greater than 1 if with_faucet is true"
-            );
-            ChainId::root(1)
-        };
+        let faucet_chain_idx = faucet_chain.unwrap_or(0);
+        assert!(
+            num_other_initial_chains > faucet_chain_idx,
+            "num_other_initial_chains must be strictly greater than the faucet chain index if \
+            with_faucet is true"
+        );
+        // This picks a lexicographically faucet_chain_idx-th non-admin chain.
+        let faucet_chain = chains
+            .into_iter()
+            .filter(|chain_id| *chain_id != wallet.genesis_admin_chain())
+            .nth(faucet_chain_idx as usize)
+            .unwrap(); // we checked that there are enough chains above, so this should be safe
         let service = client
             .run_faucet(Some(faucet_port.into()), faucet_chain, faucet_amount)
             .await?;

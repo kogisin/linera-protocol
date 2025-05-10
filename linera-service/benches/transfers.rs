@@ -7,9 +7,9 @@ use futures::{
     Stream, StreamExt,
 };
 use linera_base::{
-    crypto::{AccountSecretKey, Ed25519SecretKey, Secp256k1SecretKey},
+    crypto::{AccountSecretKey, Ed25519SecretKey, EvmSecretKey, Secp256k1SecretKey},
     data_types::Amount,
-    identifiers::{Account, AccountOwner, ChainId},
+    identifiers::{Account, AccountOwner},
     time::{Duration, Instant},
 };
 use linera_execution::system::Recipient;
@@ -65,17 +65,17 @@ async fn setup_native_token_balances(
     let validator = TestValidator::new().await;
     let chains = stream::iter(0..chain_count)
         .then(|idx| {
-            let key_pair = if idx % 2 == 0 {
-                AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate())
-            } else {
-                AccountSecretKey::Ed25519(Ed25519SecretKey::generate())
+            let key_pair = match idx % 3 {
+                0 => AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate()),
+                1 => AccountSecretKey::Ed25519(Ed25519SecretKey::generate()),
+                _ => AccountSecretKey::EvmSecp256k1(EvmSecretKey::generate()),
             };
             validator.new_chain_with_keypair(key_pair)
         })
         .collect::<Vec<_>>()
         .await;
 
-    let admin_chain = validator.get_chain(&ChainId::root(0));
+    let admin_chain = validator.get_chain(&validator.admin_chain_id());
 
     for chain in &chains {
         let recipient = Recipient::Account(Account {

@@ -26,7 +26,6 @@ web = ["linera-base/web", "linera-views/web", "linera-execution/web"]
 [dependencies]
 anyhow = { workspace = true, optional = true }
 async-graphql.workspace = true
-async-trait.workspace = true
 axum = { workspace = true, optional = true }
 custom_debug_derive.workspace = true
 futures.workspace = true
@@ -46,6 +45,7 @@ tracing.workspace = true
 anyhow.workspace = true
 assert_matches.workspace = true
 bcs.workspace = true
+hex.workspace = true
 linera-chain = { path = ".", default-features = false, features = ["test"] }
 test-case.workspace = true
 

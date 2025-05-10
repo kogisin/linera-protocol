@@ -7,10 +7,9 @@ use linera_base::{
     crypto::CryptoHash,
     data_types::{Amount, ApplicationPermissions, BlockHeight, SendMessageRequest, Timestamp},
     http,
-    identifiers::{
-        Account, AccountOwner, ApplicationId, ChainId, ChannelName, MessageId, StreamName,
-    },
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, StreamName},
     ownership::{ChainOwnership, ChangeApplicationPermissionsError, CloseChainError},
+    vm::VmRuntime,
 };
 use linera_views::batch::{Batch, WriteOperation};
 use linera_witty::{wit_export, Instance, RuntimeError};
@@ -441,32 +440,6 @@ where
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
-    /// Subscribes to a message channel from another chain.
-    fn subscribe(
-        caller: &mut Caller,
-        chain: ChainId,
-        channel: ChannelName,
-    ) -> Result<(), RuntimeError> {
-        caller
-            .user_data_mut()
-            .runtime
-            .subscribe(chain, channel)
-            .map_err(|error| RuntimeError::Custom(error.into()))
-    }
-
-    /// Unsubscribes to a message channel from another chain.
-    fn unsubscribe(
-        caller: &mut Caller,
-        chain: ChainId,
-        channel: ChannelName,
-    ) -> Result<(), RuntimeError> {
-        caller
-            .user_data_mut()
-            .runtime
-            .unsubscribe(chain, channel)
-            .map_err(|error| RuntimeError::Custom(error.into()))
-    }
-
     /// Transfers an `amount` of native tokens from `source` owner account (or the current chain's
     /// balance) to `destination`.
     fn transfer(
@@ -503,7 +476,7 @@ where
         chain_ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
         balance: Amount,
-    ) -> Result<(MessageId, ChainId), RuntimeError> {
+    ) -> Result<ChainId, RuntimeError> {
         caller
             .user_data_mut()
             .runtime
@@ -581,6 +554,50 @@ where
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
+    /// Reads an event from a stream. Returns the event's value.
+    ///
+    /// Returns an error if the event doesn't exist.
+    fn read_event(
+        caller: &mut Caller,
+        chain_id: ChainId,
+        name: StreamName,
+        index: u32,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .read_event(chain_id, name, index)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Subscribes this application to an event stream.
+    fn subscribe_to_events(
+        caller: &mut Caller,
+        chain_id: ChainId,
+        application_id: ApplicationId,
+        name: StreamName,
+    ) -> Result<(), RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .subscribe_to_events(chain_id, application_id, name)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Unsubscribes this application from an event stream.
+    fn unsubscribe_from_events(
+        caller: &mut Caller,
+        chain_id: ChainId,
+        application_id: ApplicationId,
+        name: StreamName,
+    ) -> Result<(), RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .unsubscribe_from_events(chain_id, application_id, name)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
     /// Queries a service and returns the response.
     fn query_service(
         caller: &mut Caller,
@@ -602,7 +619,7 @@ where
         caller
             .user_data_mut()
             .runtime_mut()
-            .consume_fuel(fuel)
+            .consume_fuel(fuel, VmRuntime::Wasm)
             .map_err(|e| RuntimeError::Custom(e.into()))
     }
 

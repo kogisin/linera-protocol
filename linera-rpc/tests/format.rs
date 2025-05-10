@@ -4,14 +4,13 @@
 
 use linera_base::{
     crypto::{AccountPublicKey, AccountSignature, TestString},
-    data_types::{BlobContent, OracleResponse, Round},
-    hashed::Hashed,
-    identifiers::{AccountOwner, BlobType, ChainDescription, Destination, GenericApplicationId},
+    data_types::{BlobContent, ChainDescription, ChainOrigin, OracleResponse, Round},
+    identifiers::{AccountOwner, BlobType, GenericApplicationId},
     ownership::ChainOwnership,
     vm::VmRuntime,
 };
 use linera_chain::{
-    data_types::{Medium, MessageAction},
+    data_types::MessageAction,
     manager::{ChainManagerInfo, LockingBlock},
     types::{Certificate, CertificateKind, ConfirmedBlock, Timeout, ValidatedBlock},
 };
@@ -41,6 +40,17 @@ fn get_registry() -> Result<Registry> {
         );
         tracer.trace_value(&mut samples, &validator_keypair.public_key)?;
         tracer.trace_value(&mut samples, &validator_signature)?;
+
+        // We also record separate samples for EVM-compatible keys,
+        // as the generated ones are not valid.
+        let evm_secret_key = linera_base::crypto::EvmSecretKey::generate();
+        let evm_public_key = evm_secret_key.public();
+        tracer.trace_value(&mut samples, &evm_public_key)?;
+        let evm_signature = linera_base::crypto::EvmSignature::new(
+            &TestString::new("signature".to_string()),
+            &evm_secret_key,
+        );
+        tracer.trace_value(&mut samples, &evm_signature)?;
     }
     // 2. Trace the main entry point(s) + every enum separately.
     tracer.trace_type::<AccountPublicKey>(&samples)?;
@@ -58,13 +68,11 @@ fn get_registry() -> Result<Registry> {
     tracer.trace_type::<MessageKind>(&samples)?;
     tracer.trace_type::<CertificateKind>(&samples)?;
     tracer.trace_type::<Certificate>(&samples)?;
-    tracer.trace_type::<Hashed<ConfirmedBlock>>(&samples)?;
     tracer.trace_type::<ConfirmedBlock>(&samples)?;
     tracer.trace_type::<ValidatedBlock>(&samples)?;
     tracer.trace_type::<Timeout>(&samples)?;
-    tracer.trace_type::<Medium>(&samples)?;
-    tracer.trace_type::<Destination>(&samples)?;
     tracer.trace_type::<ChainDescription>(&samples)?;
+    tracer.trace_type::<ChainOrigin>(&samples)?;
     tracer.trace_type::<ChainOwnership>(&samples)?;
     tracer.trace_type::<GenericApplicationId>(&samples)?;
     tracer.trace_type::<LockingBlock>(&samples)?;

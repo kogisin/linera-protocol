@@ -3,16 +3,16 @@
 
 //! The server component of the Linera faucet.
 
-use std::{net::SocketAddr, num::NonZeroU16, sync::Arc};
+use std::{future::IntoFuture, net::SocketAddr, num::NonZeroU16, sync::Arc};
 
 use async_graphql::{EmptySubscription, Error, Schema, SimpleObject};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse, GraphQLSubscription};
 use axum::{Extension, Router};
-use futures::lock::Mutex;
+use futures::{lock::Mutex, FutureExt as _};
 use linera_base::{
     crypto::{CryptoHash, ValidatorPublicKey},
     data_types::{Amount, ApplicationPermissions, Timestamp},
-    identifiers::{AccountOwner, ChainId, MessageId},
+    identifiers::{AccountOwner, ChainId},
     ownership::ChainOwnership,
 };
 use linera_client::{
@@ -22,6 +22,7 @@ use linera_client::{
 use linera_core::data_types::ClientOutcome;
 use linera_storage::{Clock as _, Storage};
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
@@ -58,8 +59,6 @@ pub struct MutationRoot<C> {
 /// The result of a successful `claim` mutation.
 #[derive(SimpleObject)]
 pub struct ClaimOutcome {
-    /// The ID of the message that created the new chain.
-    pub message_id: MessageId,
     /// The ID of the new chain.
     pub chain_id: ChainId,
     /// The hash of the parent chain's certificate containing the `OpenChain` operation.
@@ -89,7 +88,12 @@ where
 
     /// Returns the current committee's validators.
     async fn current_validators(&self) -> Result<Vec<Validator>, Error> {
-        let client = self.context.lock().await.make_chain_client(self.chain_id)?;
+        let client = self
+            .context
+            .lock()
+            .await
+            .make_chain_client(self.chain_id)
+            .await?;
         let committee = client.local_committee().await?;
         Ok(committee
             .validators()
@@ -118,7 +122,12 @@ where
     C: ClientContext,
 {
     async fn do_claim(&self, owner: AccountOwner) -> Result<ClaimOutcome, Error> {
-        let client = self.context.lock().await.make_chain_client(self.chain_id)?;
+        let client = self
+            .context
+            .lock()
+            .await
+            .make_chain_client(self.chain_id)
+            .await?;
 
         if self.start_timestamp < self.end_timestamp {
             let local_time = client.storage_client().clock().current_time();
@@ -149,7 +158,7 @@ where
             .open_chain(ownership, ApplicationPermissions::default(), self.amount)
             .await;
         self.context.lock().await.update_wallet(&client).await?;
-        let (message_id, certificate) = match result? {
+        let (chain_id, certificate) = match result? {
             ClientOutcome::Committed(result) => result,
             ClientOutcome::WaitForTimeout(timeout) => {
                 return Err(Error::new(format!(
@@ -159,9 +168,7 @@ where
                 )));
             }
         };
-        let chain_id = ChainId::child(message_id);
         Ok(ClaimOutcome {
-            message_id,
             chain_id,
             certificate_hash: certificate.hash(),
         })
@@ -189,7 +196,7 @@ where
     context: Arc<Mutex<C>>,
     genesis_config: Arc<GenesisConfig>,
     config: ChainListenerConfig,
-    storage: C::Storage,
+    storage: <C::Environment as linera_core::Environment>::Storage,
     port: NonZeroU16,
     amount: Amount,
     end_timestamp: Timestamp,
@@ -222,7 +229,7 @@ where
     C: ClientContext,
 {
     /// Creates a new instance of the faucet service.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn new(
         port: NonZeroU16,
         chain_id: ChainId,
@@ -231,9 +238,9 @@ where
         end_timestamp: Timestamp,
         genesis_config: Arc<GenesisConfig>,
         config: ChainListenerConfig,
-        storage: C::Storage,
+        storage: <C::Environment as linera_core::Environment>::Storage,
     ) -> anyhow::Result<Self> {
-        let client = context.make_chain_client(chain_id)?;
+        let client = context.make_chain_client(chain_id).await?;
         let context = Arc::new(Mutex::new(context));
         let start_timestamp = client.storage_client().clock().current_time();
         client.process_inbox().await?;
@@ -271,7 +278,7 @@ where
 
     /// Runs the faucet.
     #[tracing::instrument(name = "FaucetService::run", skip_all, fields(port = self.port, chain_id = ?self.chain_id))]
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(self, cancellation_token: CancellationToken) -> anyhow::Result<()> {
         let port = self.port.get();
         let index_handler = axum::routing::get(graphiql).post(Self::index_handler);
 
@@ -284,15 +291,15 @@ where
 
         info!("GraphiQL IDE: http://localhost:{}", port);
 
-        ChainListener::new(self.config.clone())
-            .run(Arc::clone(&self.context), self.storage.clone())
-            .await;
-
-        axum::serve(
-            tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?,
-            app,
-        )
-        .await?;
+        let chain_listener =
+            ChainListener::new(self.config, self.context, self.storage, cancellation_token).run();
+        let tcp_listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+        let server = axum::serve(tcp_listener, app).into_future();
+        futures::select! {
+            result = Box::pin(chain_listener).fuse() => result?,
+            result = Box::pin(server).fuse() => result?,
+        };
 
         Ok(())
     }

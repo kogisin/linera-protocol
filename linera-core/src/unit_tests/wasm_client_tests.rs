@@ -19,15 +19,16 @@ use assert_matches::assert_matches;
 use async_graphql::Request;
 use counter::CounterAbi;
 use linera_base::{
+    crypto::InMemorySigner,
     data_types::{Amount, Bytecode, Event, OracleResponse},
-    identifiers::{AccountOwner, ApplicationId, BlobId, BlobType, StreamId, StreamName},
+    identifiers::{ApplicationId, BlobId, BlobType, StreamId, StreamName},
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
 };
 use linera_chain::{data_types::MessageAction, ChainError, ChainExecutionContext};
 use linera_execution::{
     ExecutionError, Message, MessageKind, Operation, QueryOutcome, ResourceControlPolicy,
-    SystemMessage, WasmRuntime,
+    SystemMessage, SystemOperation, WasmRuntime,
 };
 use linera_storage::Storage as _;
 use serde_json::json;
@@ -97,6 +98,7 @@ async fn run_test_create_application<B>(storage_builder: B) -> anyhow::Result<()
 where
     B: StorageBuilder,
 {
+    let mut keys = InMemorySigner::new(None);
     let vm_runtime = VmRuntime::Wasm;
     let (contract_path, service_path) =
         linera_execution::wasm_test::get_example_bytecode_paths("counter")?;
@@ -111,7 +113,7 @@ where
         .len()
         .max(service_bytecode.bytes.len()) as u64;
     policy.maximum_blob_size = contract_compressed_len.max(service_compressed_len) as u64;
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(policy.clone());
     let publisher = builder.add_root_chain(0, Amount::from_tokens(3)).await?;
@@ -261,8 +263,9 @@ async fn run_test_run_application_with_dependency<B>(storage_builder: B) -> anyh
 where
     B: StorageBuilder,
 {
+    let mut keys = InMemorySigner::new(None);
     let vm_runtime = VmRuntime::Wasm;
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(ResourceControlPolicy::all_categories());
     // Will publish the module.
@@ -276,6 +279,7 @@ where
     // Handling the message causes an oracle request to the counter service, so no fast blocks
     // are allowed.
     let receiver_key = receiver.public_key().await.unwrap();
+
     receiver
         .change_ownership(ChainOwnership::multiple(
             [(receiver_key.into(), 100)],
@@ -284,6 +288,7 @@ where
         ))
         .await
         .unwrap();
+
     let creator_key = creator.public_key().await.unwrap();
     creator
         .change_ownership(ChainOwnership::multiple(
@@ -350,7 +355,7 @@ where
                 stream_name: StreamName(b"announcements".to_vec()),
             },
             index: 0,
-            value: b"instantiated".to_vec(),
+            value: bcs::to_bytes(&"instantiated".to_string()).unwrap(),
         }]]
     );
 
@@ -361,8 +366,8 @@ where
         .await
         .unwrap()
         .unwrap();
-    let executed_block = cert.block();
-    let responses = &executed_block.body.oracle_responses;
+    let block = cert.block();
+    let responses = &block.body.oracle_responses;
     let [_, responses] = &responses[..] else {
         panic!("Unexpected oracle responses: {:?}", responses);
     };
@@ -528,8 +533,9 @@ async fn run_test_cross_chain_message<B>(storage_builder: B) -> anyhow::Result<(
 where
     B: StorageBuilder,
 {
+    let mut keys = InMemorySigner::new(None);
     let vm_runtime = VmRuntime::Wasm;
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(ResourceControlPolicy::all_categories());
     let _admin = builder.add_root_chain(0, Amount::ONE).await?;
@@ -554,9 +560,9 @@ where
     let module_id = module_id
         .with_abi::<fungible::FungibleTokenAbi, fungible::Parameters, fungible::InitialState>();
 
-    let sender_owner = AccountOwner::from(sender.key_pair().await?.public());
-    let receiver_owner = AccountOwner::from(receiver.key_pair().await?.public());
-    let receiver2_owner = AccountOwner::from(receiver2.key_pair().await?.public());
+    let sender_owner = sender.preferred_owner.unwrap();
+    let receiver_owner = receiver.preferred_owner.unwrap();
+    let receiver2_owner = receiver2.preferred_owner.unwrap();
 
     let accounts = BTreeMap::from_iter([(sender_owner, Amount::from_tokens(1_000_000))]);
     let state = fungible::InitialState { accounts };
@@ -663,8 +669,8 @@ where
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_memory_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(MemoryStorageBuilder::with_wasm_runtime(wasm_runtime)).await
+async fn test_memory_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(MemoryStorageBuilder::with_wasm_runtime(wasm_runtime)).await
 }
 
 #[ignore]
@@ -672,9 +678,8 @@ async fn test_memory_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow:
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_service_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(ServiceStorageBuilder::with_wasm_runtime(wasm_runtime).await)
-        .await
+async fn test_service_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(ServiceStorageBuilder::with_wasm_runtime(wasm_runtime).await).await
 }
 
 #[ignore]
@@ -682,9 +687,8 @@ async fn test_service_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_rocks_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(RocksDbStorageBuilder::with_wasm_runtime(wasm_runtime).await)
-        .await
+async fn test_rocks_db_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(RocksDbStorageBuilder::with_wasm_runtime(wasm_runtime).await).await
 }
 
 #[ignore]
@@ -692,8 +696,8 @@ async fn test_rocks_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyho
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_dynamo_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(DynamoDbStorageBuilder::with_wasm_runtime(wasm_runtime)).await
+async fn test_dynamo_db_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(DynamoDbStorageBuilder::with_wasm_runtime(wasm_runtime)).await
 }
 
 #[ignore]
@@ -701,16 +705,17 @@ async fn test_dynamo_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyh
 #[cfg_attr(feature = "wasmer", test_case(WasmRuntime::Wasmer; "wasmer"))]
 #[cfg_attr(feature = "wasmtime", test_case(WasmRuntime::Wasmtime; "wasmtime"))]
 #[test_log::test(tokio::test)]
-async fn test_scylla_db_user_pub_sub_channels(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
-    run_test_user_pub_sub_channels(ScyllaDbStorageBuilder::with_wasm_runtime(wasm_runtime)).await
+async fn test_scylla_db_event_streams(wasm_runtime: WasmRuntime) -> anyhow::Result<()> {
+    run_test_event_streams(ScyllaDbStorageBuilder::with_wasm_runtime(wasm_runtime)).await
 }
 
-async fn run_test_user_pub_sub_channels<B>(storage_builder: B) -> anyhow::Result<()>
+async fn run_test_event_streams<B>(storage_builder: B) -> anyhow::Result<()>
 where
     B: StorageBuilder,
 {
+    let mut keys = InMemorySigner::new(None);
     let vm_runtime = VmRuntime::Wasm;
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(ResourceControlPolicy::all_categories());
     let sender = builder.add_root_chain(0, Amount::ONE).await?;
@@ -774,11 +779,21 @@ where
     let certs = receiver.process_inbox().await.unwrap().0;
     assert_eq!(certs.len(), 1);
 
-    // There should be a message receiving the new post.
-    let messages = &certs[0].block().body.incoming_bundles;
-    assert!(messages
-        .iter()
-        .any(|msg| matches!(&msg.bundle.messages[0].message, Message::User { .. })));
+    // There should be an UpdateStreams operation due to the new post.
+    let [Operation::System(operation)] = &*certs[0].block().body.operations else {
+        panic!(
+            "Expected one operation, got {:?}",
+            certs[0].block().body.operations
+        );
+    };
+    let stream_id = StreamId {
+        application_id: application_id.forget_abi().into(),
+        stream_name: b"posts".into(),
+    };
+    assert_eq!(
+        **operation,
+        SystemOperation::UpdateStreams(vec![(sender.chain_id(), stream_id, 1)])
+    );
 
     let query = async_graphql::Request::new("{ receivedPosts { keys { author, index } } }");
     let outcome = receiver
@@ -867,14 +882,15 @@ async fn test_memory_fuel_limit(wasm_runtime: WasmRuntime) -> anyhow::Result<()>
     // Set a fuel limit that is enough to instantiate the application and do one increment
     // operation, but not ten. We also verify blob fees for the bytecode.
     let policy = ResourceControlPolicy {
-        maximum_fuel_per_block: 30_000,
+        maximum_wasm_fuel_per_block: 30_000,
         blob_read: Amount::from_tokens(10), // Should not be charged.
         blob_published: Amount::from_attos(100),
         blob_byte_read: Amount::from_tokens(10), // Should not be charged.
         blob_byte_published: Amount::from_attos(1),
         ..ResourceControlPolicy::default()
     };
-    let mut builder = TestBuilder::new(storage_builder, 4, 1)
+    let mut keys = InMemorySigner::new(None);
+    let mut builder = TestBuilder::new(storage_builder, 4, 1, &mut keys)
         .await?
         .with_policy(policy.clone());
     let publisher = builder.add_root_chain(0, Amount::from_tokens(3)).await?;

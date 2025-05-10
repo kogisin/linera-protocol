@@ -10,30 +10,28 @@ use std::{
 };
 
 use futures::future::Either;
-#[cfg(with_testing)]
-use linera_base::crypto::AccountPublicKey;
 use linera_base::{
-    crypto::{AccountSecretKey, CryptoError, CryptoHash, ValidatorPublicKey, ValidatorSecretKey},
+    crypto::{CryptoError, CryptoHash, ValidatorPublicKey, ValidatorSecretKey},
     data_types::{
-        ApplicationDescription, ArithmeticError, Blob, BlockHeight, DecompressionError, Round,
+        ApplicationDescription, ArithmeticError, Blob, BlockHeight, DecompressionError, Epoch,
+        Round,
     },
     doc_scalar,
     hashed::Hashed,
     identifiers::{AccountOwner, ApplicationId, BlobId, ChainId},
     time::timer::{sleep, timeout},
 };
+#[cfg(with_testing)]
+use linera_chain::ChainExecutionContext;
 use linera_chain::{
-    data_types::{
-        BlockExecutionOutcome, BlockProposal, ExecutedBlock, MessageBundle, Origin, ProposedBlock,
-        Target,
-    },
+    data_types::{BlockExecutionOutcome, BlockProposal, MessageBundle, ProposedBlock},
     types::{
         Block, CertificateValue, ConfirmedBlock, ConfirmedBlockCertificate, GenericCertificate,
         LiteCertificate, Timeout, TimeoutCertificate, ValidatedBlock, ValidatedBlockCertificate,
     },
     ChainError, ChainStateView,
 };
-use linera_execution::{committee::Epoch, ExecutionError, Query, QueryOutcome};
+use linera_execution::{ExecutionError, ExecutionStateView, Query, QueryOutcome};
 use linera_storage::Storage;
 use linera_views::views::ViewError;
 use lru::LruCache;
@@ -136,7 +134,7 @@ pub enum Reason {
         hash: CryptoHash,
     },
     NewIncomingBundle {
-        origin: Origin,
+        origin: ChainId,
         height: BlockHeight,
     },
     NewRound {
@@ -251,8 +249,29 @@ impl From<ViewError> for WorkerError {
     }
 }
 
+#[cfg(with_testing)]
+impl WorkerError {
+    /// Returns the inner [`ExecutionError`] in this error.
+    ///
+    /// # Panics
+    ///
+    /// If this is not caused by an [`ExecutionError`].
+    pub fn expect_execution_error(self, expected_context: ChainExecutionContext) -> ExecutionError {
+        let WorkerError::ChainError(chain_error) = self else {
+            panic!("Expected an `ExecutionError`. Got: {self:#?}");
+        };
+
+        let ChainError::ExecutionError(execution_error, context) = *chain_error else {
+            panic!("Expected an `ExecutionError`. Got: {chain_error:#?}");
+        };
+
+        assert_eq!(context, expected_context);
+
+        *execution_error
+    }
+}
+
 /// State of a worker in a validator or a local node.
-#[derive(Clone)]
 pub struct WorkerState<StorageClient>
 where
     StorageClient: Storage,
@@ -263,7 +282,8 @@ where
     storage: StorageClient,
     /// Configuration options for the [`ChainWorker`]s.
     chain_worker_config: ChainWorkerConfig,
-    executed_block_cache: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
+    block_cache: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
+    execution_state_cache: Arc<ValueCache<CryptoHash, ExecutionStateView<StorageClient::Context>>>,
     /// Chain IDs that should be tracked by a worker.
     tracked_chains: Option<Arc<RwLock<HashSet<ChainId>>>>,
     /// One-shot channels to notify callers when messages of a particular chain have been
@@ -273,6 +293,25 @@ where
     chain_worker_tasks: Arc<Mutex<JoinSet>>,
     /// The cache of running [`ChainWorkerActor`]s.
     chain_workers: Arc<Mutex<LruCache<ChainId, ChainActorEndpoint<StorageClient>>>>,
+}
+
+impl<StorageClient> Clone for WorkerState<StorageClient>
+where
+    StorageClient: Storage + Clone,
+{
+    fn clone(&self) -> Self {
+        WorkerState {
+            nickname: self.nickname.clone(),
+            storage: self.storage.clone(),
+            chain_worker_config: self.chain_worker_config.clone(),
+            block_cache: self.block_cache.clone(),
+            execution_state_cache: self.execution_state_cache.clone(),
+            tracked_chains: self.tracked_chains.clone(),
+            delivery_notifiers: self.delivery_notifiers.clone(),
+            chain_worker_tasks: self.chain_worker_tasks.clone(),
+            chain_workers: self.chain_workers.clone(),
+        }
+    }
 }
 
 /// The sender endpoint for [`ChainWorkerRequest`]s.
@@ -290,7 +329,7 @@ where
     #[instrument(level = "trace", skip(nickname, key_pair, storage))]
     pub fn new(
         nickname: String,
-        key_pair: Option<(ValidatorSecretKey, AccountSecretKey)>,
+        key_pair: Option<ValidatorSecretKey>,
         storage: StorageClient,
         chain_worker_limit: NonZeroUsize,
     ) -> Self {
@@ -298,7 +337,8 @@ where
             nickname,
             storage,
             chain_worker_config: ChainWorkerConfig::default().with_key_pair(key_pair),
-            executed_block_cache: Arc::new(ValueCache::default()),
+            block_cache: Arc::new(ValueCache::default()),
+            execution_state_cache: Arc::new(ValueCache::default()),
             tracked_chains: None,
             delivery_notifiers: Arc::default(),
             chain_worker_tasks: Arc::default(),
@@ -317,7 +357,8 @@ where
             nickname,
             storage,
             chain_worker_config: ChainWorkerConfig::default(),
-            executed_block_cache: Arc::new(ValueCache::default()),
+            block_cache: Arc::new(ValueCache::default()),
+            execution_state_cache: Arc::new(ValueCache::default()),
             tracked_chains: Some(tracked_chains),
             delivery_notifiers: Arc::default(),
             chain_worker_tasks: Arc::default(),
@@ -397,25 +438,25 @@ where
         &self,
         certificate: LiteCertificate<'_>,
     ) -> Result<Either<ConfirmedBlockCertificate, ValidatedBlockCertificate>, WorkerError> {
-        let executed_block = self
-            .executed_block_cache
+        let block = self
+            .block_cache
             .get(&certificate.value.value_hash)
             .ok_or(WorkerError::MissingCertificateValue)?;
 
         match certificate.value.kind {
             linera_chain::types::CertificateKind::Confirmed => {
-                let value = ConfirmedBlock::from_hashed(executed_block);
+                let value = ConfirmedBlock::from_hashed(block);
                 Ok(Either::Left(
                     certificate
-                        .with_value(Hashed::new(value))
+                        .with_value(value)
                         .ok_or(WorkerError::InvalidLiteCertificate)?,
                 ))
             }
             linera_chain::types::CertificateKind::Validated => {
-                let value = ValidatedBlock::from_hashed(executed_block);
+                let value = ValidatedBlock::from_hashed(block);
                 Ok(Either::Right(
                     certificate
-                        .with_value(Hashed::new(value))
+                        .with_value(value)
                         .ok_or(WorkerError::InvalidLiteCertificate)?,
                 ))
             }
@@ -499,7 +540,7 @@ where
         block: ProposedBlock,
         round: Option<u32>,
         published_blobs: Vec<Blob>,
-    ) -> Result<(ExecutedBlock, ChainInfoResponse), WorkerError> {
+    ) -> Result<(Block, ChainInfoResponse), WorkerError> {
         self.query_chain_worker(block.chain_id, move |callback| {
             ChainWorkerRequest::StageBlockExecution {
                 block,
@@ -590,7 +631,7 @@ where
         &self,
         certificate: TimeoutCertificate,
     ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
-        let chain_id = certificate.inner().chain_id;
+        let chain_id = certificate.value().chain_id();
         self.query_chain_worker(chain_id, move |callback| {
             ChainWorkerRequest::ProcessTimeout {
                 certificate,
@@ -603,7 +644,7 @@ where
     #[instrument(level = "trace", skip(self, origin, recipient, bundles))]
     async fn process_cross_chain_update(
         &self,
-        origin: Origin,
+        origin: ChainId,
         recipient: ChainId,
         bundles: Vec<(Epoch, MessageBundle)>,
     ) -> Result<Option<BlockHeight>, WorkerError> {
@@ -699,7 +740,8 @@ where
             let actor_task = ChainWorkerActor::run(
                 self.chain_worker_config.clone(),
                 self.storage.clone(),
-                self.executed_block_cache.clone(),
+                self.block_cache.clone(),
+                self.execution_state_cache.clone(),
                 self.tracked_chains.clone(),
                 delivery_notifier,
                 chain_id,
@@ -808,7 +850,15 @@ where
                 self.handle_confirmed_certificate(confirmed, notify_when_messages_are_delivered)
                     .await
             }
-            Either::Right(validated) => self.handle_validated_certificate(validated).await,
+            Either::Right(validated) => {
+                if let Some(notifier) = notify_when_messages_are_delivered {
+                    // Nothing to wait for.
+                    if let Err(()) = notifier.send(()) {
+                        warn!("Failed to notify message delivery to caller");
+                    }
+                }
+                self.handle_validated_certificate(validated).await
+            }
         }
     }
 
@@ -885,8 +935,8 @@ where
     /// Processes a timeout certificate
     #[instrument(skip_all, fields(
         nick = self.nickname,
-        chain_id = format!("{:.8}", certificate.inner().chain_id),
-        height = %certificate.inner().height,
+        chain_id = format!("{:.8}", certificate.inner().chain_id()),
+        height = %certificate.inner().height(),
     ))]
     pub async fn handle_timeout_certificate(
         &self,
@@ -980,51 +1030,38 @@ where
             CrossChainRequest::UpdateRecipient {
                 sender,
                 recipient,
-                bundle_vecs,
+                bundles,
             } => {
-                let mut height_by_origin = Vec::new();
                 let mut actions = NetworkActions::default();
-                for (medium, bundles) in bundle_vecs {
-                    let origin = Origin { sender, medium };
-                    if let Some(height) = self
-                        .process_cross_chain_update(origin.clone(), recipient, bundles)
-                        .await?
-                    {
-                        height_by_origin.push((origin, height));
-                    }
-                }
-                if height_by_origin.is_empty() {
-                    return Ok(NetworkActions::default());
-                }
-                let mut latest_heights = Vec::new();
-                for (origin, height) in height_by_origin {
-                    latest_heights.push((origin.medium.clone(), height));
-                    actions.notifications.push(Notification {
-                        chain_id: recipient,
-                        reason: Reason::NewIncomingBundle { origin, height },
-                    });
-                }
+                let origin = sender;
+                let Some(height) = self
+                    .process_cross_chain_update(origin, recipient, bundles)
+                    .await?
+                else {
+                    return Ok(actions);
+                };
+                actions.notifications.push(Notification {
+                    chain_id: recipient,
+                    reason: Reason::NewIncomingBundle { origin, height },
+                });
                 actions
                     .cross_chain_requests
                     .push(CrossChainRequest::ConfirmUpdatedRecipient {
                         sender,
                         recipient,
-                        latest_heights,
+                        latest_height: height,
                     });
                 Ok(actions)
             }
             CrossChainRequest::ConfirmUpdatedRecipient {
                 sender,
                 recipient,
-                latest_heights,
+                latest_height,
             } => {
-                let latest_heights = latest_heights
-                    .into_iter()
-                    .map(|(medium, height)| (Target { recipient, medium }, height))
-                    .collect();
                 self.query_chain_worker(sender, move |callback| {
                     ChainWorkerRequest::ConfirmUpdatedRecipient {
-                        latest_heights,
+                        recipient,
+                        latest_height,
                         callback,
                     }
                 })
@@ -1067,22 +1104,6 @@ where
             .expect(
                 "Test validator should have a key pair assigned to it \
                 in order to obtain it's public key",
-            )
-            .public()
-    }
-
-    /// Gets a reference to the validator's [`AccountPublicKey`].
-    ///
-    /// # Panics
-    ///
-    /// If the validator doesn't have an account secret key assigned to it.
-    #[instrument(level = "trace", skip(self))]
-    pub fn account_key(&self) -> AccountPublicKey {
-        self.chain_worker_config
-            .account_key()
-            .expect(
-                "Test validator should have a key pair assigned to it \
-                in order to obtain it's account key",
             )
             .public()
     }
