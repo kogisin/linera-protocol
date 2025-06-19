@@ -29,8 +29,8 @@ use crate::{
     common::get_upper_bound_option,
     lru_caching::{LruCachingConfig, LruCachingStore},
     store::{
-        AdminKeyValueStore, CommonStoreInternalConfig, KeyValueStoreError, ReadableKeyValueStore,
-        WithError, WritableKeyValueStore,
+        AdminKeyValueStore, KeyValueStoreError, ReadableKeyValueStore, WithError,
+        WritableKeyValueStore,
     },
     value_splitting::{ValueSplittingError, ValueSplittingStore},
 };
@@ -43,17 +43,17 @@ static STORED_ROOT_KEYS_PREFIX: u8 = 1;
 #[cfg(with_testing)]
 const TEST_ROCKS_DB_MAX_STREAM_QUERIES: usize = 10;
 
-// The maximum size of values in RocksDB is 3 GB
-// That is 3221225472 and so for offset reason we decrease by 400
-const MAX_VALUE_SIZE: usize = 3221225072;
+// The maximum size of values in RocksDB is 3 GiB
+// For offset reasons we decrease by 400
+const MAX_VALUE_SIZE: usize = 3 * 1024 * 1024 * 1024 - 400;
 
-// The maximum size of keys in RocksDB is 8 MB
-// 8388608 and so for offset reason we decrease by 400
-const MAX_KEY_SIZE: usize = 8388208;
+// The maximum size of keys in RocksDB is 8 MiB
+// For offset reasons we decrease by 400
+const MAX_KEY_SIZE: usize = 8 * 1024 * 1024 - 400;
 
-const WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64 MB
-const MAX_WRITE_BUFFER_NUMBER: i32 = 32;
-const HYPER_CLOCK_CACHE_BLOCK_SIZE: usize = 8 * 1024; // 8 KB
+const WRITE_BUFFER_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+const MAX_WRITE_BUFFER_NUMBER: i32 = 6;
+const HYPER_CLOCK_CACHE_BLOCK_SIZE: usize = 8 * 1024; // 8 KiB
 
 /// The RocksDB client that we use.
 type DB = rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>;
@@ -272,9 +272,9 @@ pub struct RocksDbStoreInternalConfig {
     /// The path to the storage containing the namespaces
     pub path_with_guard: PathWithGuard,
     /// The chosen spawn mode
-    spawn_mode: RocksDbSpawnMode,
-    /// The common configuration of the key value store
-    common_config: CommonStoreInternalConfig,
+    pub spawn_mode: RocksDbSpawnMode,
+    /// Preferred buffer size for async streams.
+    pub max_stream_queries: usize,
 }
 
 impl RocksDbStoreInternal {
@@ -298,7 +298,7 @@ impl RocksDbStoreInternal {
         let mut path_with_guard = config.path_with_guard.clone();
         path_buf.push(namespace);
         path_with_guard.path_buf = path_buf.clone();
-        let max_stream_queries = config.common_config.max_stream_queries;
+        let max_stream_queries = config.max_stream_queries;
         let spawn_mode = config.spawn_mode;
         if !std::path::Path::exists(&path_buf) {
             std::fs::create_dir(path_buf.clone())?;
@@ -317,19 +317,19 @@ impl RocksDbStoreInternal {
         options.set_write_buffer_size(WRITE_BUFFER_SIZE);
         options.set_max_write_buffer_number(MAX_WRITE_BUFFER_NUMBER);
         options.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        options.set_level_zero_slowdown_writes_trigger(12);
-        options.set_level_zero_stop_writes_trigger(20);
-        // We use half the available CPUs for RocksDB parallelism to allow concurrent operations
-        // while leaving resources for other application tasks. Using a third of CPUs for background
-        // jobs (compactions, flushes) balances background maintenance with foreground operations,
-        // preventing RocksDB from consuming too many system resources, while still keeping good
-        // performance.
-        options.increase_parallelism((num_cpus / 2).max(1));
-        options.set_max_background_jobs((num_cpus / 3).max(1));
+        options.set_level_zero_slowdown_writes_trigger(8);
+        options.set_level_zero_stop_writes_trigger(12);
+        options.set_level_zero_file_num_compaction_trigger(2);
+        // We deliberately give RocksDB one background thread *per* CPU so that
+        // flush + (N-1) compactions can hammer the NVMe at full bandwidth while
+        // still leaving enough CPU time for the foreground application threads.
+        options.increase_parallelism(num_cpus);
+        options.set_max_background_jobs(num_cpus);
+        options.set_max_subcompactions(num_cpus as u32);
         options.set_level_compaction_dynamic_level_bytes(true);
 
         options.set_compaction_style(DBCompactionStyle::Level);
-        options.set_target_file_size_base(WRITE_BUFFER_SIZE as u64);
+        options.set_target_file_size_base(2 * WRITE_BUFFER_SIZE as u64);
 
         let mut block_options = BlockBasedOptions::default();
         block_options.set_pin_l0_filter_and_index_blocks_in_cache(true);
@@ -487,7 +487,7 @@ impl AdminKeyValueStore for RocksDbStoreInternal {
         RocksDbStoreInternal::build(config, namespace, start_key)
     }
 
-    fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, RocksDbStoreInternalError> {
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self, RocksDbStoreInternalError> {
         let mut store = self.clone();
         let mut start_key = ROOT_KEY_DOMAIN.to_vec();
         start_key.extend(root_key);
@@ -576,16 +576,12 @@ impl AdminKeyValueStore for RocksDbStoreInternal {
 impl TestKeyValueStore for RocksDbStoreInternal {
     async fn new_test_config() -> Result<RocksDbStoreInternalConfig, RocksDbStoreInternalError> {
         let path_with_guard = PathWithGuard::new_testing();
-        let common_config = CommonStoreInternalConfig {
-            max_concurrent_queries: None,
-            max_stream_queries: TEST_ROCKS_DB_MAX_STREAM_QUERIES,
-            replication_factor: 1,
-        };
         let spawn_mode = RocksDbSpawnMode::get_spawn_mode_from_runtime();
+        let max_stream_queries = TEST_ROCKS_DB_MAX_STREAM_QUERIES;
         Ok(RocksDbStoreInternalConfig {
             path_with_guard,
             spawn_mode,
-            common_config,
+            max_stream_queries,
         })
     }
 }
@@ -613,8 +609,8 @@ pub enum RocksDbStoreInternalError {
     #[error("error in the conversion from OsString: {0:?}")]
     IntoStringError(OsString),
 
-    /// The key must have at most 8 MB
-    #[error("The key must have at most 8 MB")]
+    /// The key must have at most 8 MiB
+    #[error("The key must have at most 8 MiB")]
     KeyTooLong,
 
     /// Namespace contains forbidden characters
@@ -685,22 +681,3 @@ pub type RocksDbStoreError = ValueSplittingError<RocksDbStoreInternalError>;
 
 /// The composed config type for the `RocksDbStore`
 pub type RocksDbStoreConfig = LruCachingConfig<RocksDbStoreInternalConfig>;
-
-impl RocksDbStoreConfig {
-    /// Creates a new `RocksDbStoreConfig` from the input.
-    pub fn new(
-        spawn_mode: RocksDbSpawnMode,
-        path_with_guard: PathWithGuard,
-        common_config: crate::store::CommonStoreConfig,
-    ) -> RocksDbStoreConfig {
-        let inner_config = RocksDbStoreInternalConfig {
-            path_with_guard,
-            spawn_mode,
-            common_config: common_config.reduced(),
-        };
-        RocksDbStoreConfig {
-            inner_config,
-            storage_cache_config: common_config.storage_cache_config,
-        }
-    }
-}

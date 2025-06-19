@@ -78,24 +78,27 @@ pub trait BlockTestExt: Sized {
     /// Returns the block with the specified epoch.
     fn with_epoch(self, epoch: impl Into<Epoch>) -> Self;
 
+    /// Returns the block with the burn operation appended at the end.
+    fn with_burn(self, amount: Amount) -> Self;
+
     /// Returns a block proposal in the first round in a default ownership configuration
     /// (`Round::MultiLeader(0)`) without any hashed certificate values or validated block.
-    async fn into_first_proposal(
+    async fn into_first_proposal<S: Signer + ?Sized>(
         self,
         owner: AccountOwner,
-        signer: &(impl Signer + ?Sized),
-    ) -> Result<BlockProposal, Box<dyn std::error::Error>> {
+        signer: &S,
+    ) -> Result<BlockProposal, S::Error> {
         self.into_proposal_with_round(owner, signer, Round::MultiLeader(0))
             .await
     }
 
     /// Returns a block proposal without any hashed certificate values or validated block.
-    async fn into_proposal_with_round(
+    async fn into_proposal_with_round<S: Signer + ?Sized>(
         self,
         owner: AccountOwner,
-        signer: &(impl Signer + ?Sized),
+        signer: &S,
         round: Round,
-    ) -> Result<BlockProposal, Box<dyn std::error::Error>>;
+    ) -> Result<BlockProposal, S::Error>;
 }
 
 impl BlockTestExt for ProposedBlock {
@@ -121,6 +124,14 @@ impl BlockTestExt for ProposedBlock {
         self.with_transfer(AccountOwner::CHAIN, Recipient::chain(chain_id), amount)
     }
 
+    fn with_burn(self, amount: Amount) -> Self {
+        self.with_operation(SystemOperation::Transfer {
+            owner: AccountOwner::CHAIN,
+            recipient: Recipient::Burn,
+            amount,
+        })
+    }
+
     fn with_incoming_bundle(mut self, incoming_bundle: IncomingBundle) -> Self {
         self.incoming_bundles.push(incoming_bundle);
         self
@@ -136,12 +147,12 @@ impl BlockTestExt for ProposedBlock {
         self
     }
 
-    async fn into_proposal_with_round(
+    async fn into_proposal_with_round<S: Signer + ?Sized>(
         self,
         owner: AccountOwner,
-        signer: &(impl Signer + ?Sized),
+        signer: &S,
         round: Round,
-    ) -> Result<BlockProposal, Box<dyn std::error::Error>> {
+    ) -> Result<BlockProposal, S::Error> {
         BlockProposal::new_initial(owner, round, self, signer).await
     }
 }

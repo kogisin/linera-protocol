@@ -139,12 +139,12 @@ impl ConfirmedBlock {
     }
 
     /// Returns a blob state that applies to all blobs used by this block.
-    pub fn to_blob_state(&self) -> BlobState {
+    pub fn to_blob_state(&self, is_stored_block: bool) -> BlobState {
         BlobState {
-            last_used_by: self.0.hash(),
+            last_used_by: is_stored_block.then_some(self.0.hash()),
             chain_id: self.chain_id(),
             block_height: self.height(),
-            epoch: self.epoch(),
+            epoch: is_stored_block.then_some(self.epoch()),
         }
     }
 }
@@ -511,6 +511,15 @@ impl Block {
         &self.body.messages
     }
 
+    /// Returns all recipients of messages in this block.
+    pub fn recipients(&self) -> BTreeSet<ChainId> {
+        self.body
+            .messages
+            .iter()
+            .flat_map(|messages| messages.iter().map(|message| message.destination))
+            .collect()
+    }
+
     /// Returns whether there are any oracle responses in this block.
     pub fn has_oracle_responses(&self) -> bool {
         self.body
@@ -539,26 +548,6 @@ impl Block {
             && *timestamp == self.header.timestamp
             && *authenticated_signer == self.header.authenticated_signer
             && *previous_block_hash == self.header.previous_block_hash
-    }
-
-    /// Returns whether this block matches the execution outcome.
-    pub fn matches_outcome(&self, outcome: &BlockExecutionOutcome) -> bool {
-        let BlockExecutionOutcome {
-            state_hash,
-            messages,
-            previous_message_blocks,
-            oracle_responses,
-            events,
-            blobs,
-            operation_results,
-        } = outcome;
-        *state_hash == self.header.state_hash
-            && *messages == self.body.messages
-            && *previous_message_blocks == self.body.previous_message_blocks
-            && *oracle_responses == self.body.oracle_responses
-            && *events == self.body.events
-            && *blobs == self.body.blobs
-            && *operation_results == self.body.operation_results
     }
 
     pub fn into_proposal(self) -> (ProposedBlock, BlockExecutionOutcome) {

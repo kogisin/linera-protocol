@@ -10,7 +10,7 @@ use std::{
 use futures::{future::Either, stream, StreamExt as _, TryStreamExt as _};
 use linera_base::{
     crypto::ValidatorPublicKey,
-    data_types::{ApplicationDescription, ArithmeticError, Blob, BlockHeight},
+    data_types::{ApplicationDescription, ArithmeticError, Blob, BlockHeight, Epoch},
     identifiers::{ApplicationId, BlobId, ChainId},
 };
 use linera_chain::{
@@ -18,15 +18,15 @@ use linera_chain::{
     types::{Block, ConfirmedBlockCertificate, GenericCertificate, LiteCertificate},
     ChainStateView,
 };
-use linera_execution::{Query, QueryOutcome};
+use linera_execution::{committee::Committee, BlobState, Query, QueryOutcome};
 use linera_storage::Storage;
-use linera_views::views::ViewError;
+use linera_views::ViewError;
 use thiserror::Error;
 use tokio::sync::OwnedRwLockReadGuard;
 use tracing::{instrument, warn};
 
 use crate::{
-    data_types::{BlockHeightRange, ChainInfo, ChainInfoQuery, ChainInfoResponse},
+    data_types::{ChainInfo, ChainInfoQuery, ChainInfoResponse},
     notifier::Notifier,
     worker::{ProcessableCertificate, WorkerError, WorkerState},
 };
@@ -55,15 +55,15 @@ pub enum LocalNodeError {
     ArithmeticError(#[from] ArithmeticError),
 
     #[error(transparent)]
-    ViewError(ViewError),
+    ViewError(#[from] ViewError),
 
-    #[error("Local node operation failed: {0}")]
+    #[error("Worker operation failed: {0}")]
     WorkerError(WorkerError),
 
     #[error("Failed to read blob {blob_id:?} of chain {chain_id:?}")]
     CannotReadLocalBlob { chain_id: ChainId, blob_id: BlobId },
 
-    #[error("The local node doesn't have an active chain {0:?}")]
+    #[error("The local node doesn't have an active chain {0}")]
     InactiveChain(ChainId),
 
     #[error("The chain info response received from the local node is invalid")]
@@ -78,15 +78,6 @@ impl From<WorkerError> for LocalNodeError {
         match error {
             WorkerError::BlobsNotFound(blob_ids) => LocalNodeError::BlobsNotFound(blob_ids),
             error => LocalNodeError::WorkerError(error),
-        }
-    }
-}
-
-impl From<ViewError> for LocalNodeError {
-    fn from(error: ViewError) -> Self {
-        match error {
-            ViewError::BlobsNotFound(blob_ids) => LocalNodeError::BlobsNotFound(blob_ids),
-            error => LocalNodeError::ViewError(error),
         }
     }
 }
@@ -134,6 +125,20 @@ where
         .await?)
     }
 
+    /// Preprocesses a block without executing it.
+    #[instrument(level = "trace", skip_all)]
+    pub async fn preprocess_certificate(
+        &self,
+        certificate: ConfirmedBlockCertificate,
+        notifier: &impl Notifier,
+    ) -> Result<(), LocalNodeError> {
+        self.node
+            .state
+            .fully_preprocess_certificate_with_notifications(certificate, notifier)
+            .await?;
+        Ok(())
+    }
+
     #[instrument(level = "trace", skip_all)]
     pub async fn handle_chain_info_query(
         &self,
@@ -143,34 +148,19 @@ where
         let (response, _actions) = self.node.state.handle_chain_info_query(query).await?;
         Ok(response)
     }
-}
 
-impl<S> LocalNodeClient<S>
-where
-    S: Storage,
-{
     #[instrument(level = "trace", skip_all)]
     pub fn new(state: WorkerState<S>) -> Self {
         Self {
             node: Arc::new(LocalNode { state }),
         }
     }
-}
 
-impl<S> LocalNodeClient<S>
-where
-    S: Storage + Clone,
-{
     #[instrument(level = "trace", skip_all)]
     pub(crate) fn storage_client(&self) -> S {
         self.node.state.storage_client().clone()
     }
-}
 
-impl<S> LocalNodeClient<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
     #[instrument(level = "trace", skip_all)]
     pub async fn stage_block_execution(
         &self,
@@ -194,6 +184,31 @@ where
         Ok(storage.read_blobs(blob_ids).await?.into_iter().collect())
     }
 
+    /// Reads blob states from storage
+    pub async fn read_blob_states_from_storage(
+        &self,
+        blob_ids: &[BlobId],
+    ) -> Result<Vec<BlobState>, LocalNodeError> {
+        let storage = self.storage_client();
+        let mut blobs_not_found = Vec::new();
+        let mut blob_states = Vec::new();
+        for (blob_state, blob_id) in storage
+            .read_blob_states(blob_ids)
+            .await?
+            .into_iter()
+            .zip(blob_ids)
+        {
+            match blob_state {
+                None => blobs_not_found.push(*blob_id),
+                Some(blob_state) => blob_states.push(blob_state),
+            }
+        }
+        if !blobs_not_found.is_empty() {
+            return Err(LocalNodeError::BlobsNotFound(blobs_not_found));
+        }
+        Ok(blob_states)
+    }
+
     /// Looks for the specified blobs in the local chain manager's locking blobs.
     /// Returns `Ok(None)` if any of the blobs is not found.
     pub async fn get_locking_blobs(
@@ -205,24 +220,6 @@ where
         let mut blobs = Vec::new();
         for blob_id in blob_ids {
             match chain.manager.locking_blobs.get(blob_id).await? {
-                None => return Ok(None),
-                Some(blob) => blobs.push(blob),
-            }
-        }
-        Ok(Some(blobs))
-    }
-
-    /// Looks for the specified blobs in the local chain manager's pending blobs.
-    /// Returns `Ok(None)` if any of the blobs is not found.
-    pub async fn get_pending_blobs(
-        &self,
-        blob_ids: &[BlobId],
-        chain_id: ChainId,
-    ) -> Result<Option<Vec<Blob>>, LocalNodeError> {
-        let chain = self.chain_state_view(chain_id).await?;
-        let mut blobs = Vec::new();
-        for blob_id in blob_ids {
-            match chain.manager.pending_blob(blob_id).await? {
                 None => return Ok(None),
                 Some(blob) => blobs.push(blob),
             }
@@ -294,35 +291,6 @@ where
         Ok(response)
     }
 
-    /// Obtains the certificate containing the specified message.
-    #[instrument(level = "trace", skip(self))]
-    pub async fn certificate_for_block(
-        &self,
-        chain_id: ChainId,
-        block_height: BlockHeight,
-    ) -> Result<ConfirmedBlockCertificate, LocalNodeError> {
-        let query = ChainInfoQuery::new(chain_id)
-            .with_sent_certificate_hashes_in_range(BlockHeightRange::single(block_height));
-        let info = self.handle_chain_info_query(query).await?.info;
-        let certificates = self
-            .storage_client()
-            .read_certificates(info.requested_sent_certificate_hashes)
-            .await?;
-        let certificate = certificates
-            .into_iter()
-            .find(|certificate| {
-                certificate.block().header.chain_id == chain_id
-                    && certificate.block().header.height == block_height
-            })
-            .ok_or_else(|| {
-                ViewError::not_found(
-                    "could not find certificate with block chain ID and height {}",
-                    (chain_id, block_height),
-                )
-            })?;
-        Ok(certificate)
-    }
-
     /// Handles any pending local cross-chain requests.
     #[instrument(level = "trace", skip(self))]
     pub async fn retry_pending_cross_chain_requests(
@@ -343,19 +311,25 @@ where
     }
 
     /// Given a list of chain IDs, returns a map that assigns to each of them the next block
-    /// height, i.e. the lowest block height that we have not processed in the local node yet.
+    /// height to schedule, i.e. the lowest block height for which we haven't added the messages
+    /// to `receiver_id` to the outbox yet.
     ///
     /// It makes at most `chain_worker_limit` requests to the local node in parallel.
-    pub async fn next_block_heights(
+    pub async fn next_outbox_heights(
         &self,
         chain_ids: impl IntoIterator<Item = &ChainId>,
         chain_worker_limit: usize,
+        receiver_id: ChainId,
     ) -> Result<BTreeMap<ChainId, BlockHeight>, LocalNodeError> {
         let futures = chain_ids
             .into_iter()
             .map(|chain_id| async move {
-                let local_info = self.chain_info(*chain_id).await?;
-                Ok::<_, LocalNodeError>((*chain_id, local_info.next_block_height))
+                let chain = self.chain_state_view(*chain_id).await?;
+                let mut next_height = chain.tip_state.get().next_block_height;
+                if let Some(outbox) = chain.outboxes.try_load_entry(&receiver_id).await? {
+                    next_height = next_height.max(*outbox.next_height_to_schedule.get());
+                }
+                Ok::<_, LocalNodeError>((*chain_id, next_height))
             })
             .collect::<Vec<_>>();
         stream::iter(futures)
@@ -374,5 +348,40 @@ where
             .update_received_certificate_trackers(chain_id, new_trackers)
             .await?;
         Ok(())
+    }
+}
+
+/// Extension trait for [`ChainInfo`]s from our local node. These should always be valid and
+/// contain the requested information.
+pub trait LocalChainInfoExt {
+    /// Returns the requested map of committees.
+    fn into_committees(self) -> Result<BTreeMap<Epoch, Committee>, LocalNodeError>;
+
+    /// Returns the current committee.
+    fn into_current_committee(self) -> Result<Committee, LocalNodeError>;
+
+    /// Returns a reference to the current committee.
+    fn current_committee(&self) -> Result<&Committee, LocalNodeError>;
+}
+
+impl LocalChainInfoExt for ChainInfo {
+    fn into_committees(self) -> Result<BTreeMap<Epoch, Committee>, LocalNodeError> {
+        self.requested_committees
+            .ok_or(LocalNodeError::InvalidChainInfoResponse)
+    }
+
+    fn into_current_committee(self) -> Result<Committee, LocalNodeError> {
+        self.requested_committees
+            .ok_or(LocalNodeError::InvalidChainInfoResponse)?
+            .remove(&self.epoch)
+            .ok_or(LocalNodeError::InactiveChain(self.chain_id))
+    }
+
+    fn current_committee(&self) -> Result<&Committee, LocalNodeError> {
+        self.requested_committees
+            .as_ref()
+            .ok_or(LocalNodeError::InvalidChainInfoResponse)?
+            .get(&self.epoch)
+            .ok_or(LocalNodeError::InactiveChain(self.chain_id))
     }
 }

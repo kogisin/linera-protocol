@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, ensure, Result};
 use async_trait::async_trait;
 use futures::{FutureExt as _, SinkExt, StreamExt};
 use linera_base::listen_for_shutdown_signals;
-use linera_client::config::{GenesisConfig, ValidatorServerConfig};
+use linera_client::config::ValidatorServerConfig;
 use linera_core::{node::NodeError, JoinSetExt as _};
 use linera_rpc::{
     config::{
@@ -23,11 +23,10 @@ use linera_sdk::linera_base_types::Blob;
 #[cfg(with_metrics)]
 use linera_service::prometheus_server;
 use linera_service::{
-    storage::{Runnable, StorageConfigNamespace},
+    storage::{CommonStorageOptions, Runnable, StorageConfig},
     util,
 };
 use linera_storage::Storage;
-use linera_views::{lru_caching::StorageCacheConfig, store::CommonStoreConfig};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument};
@@ -70,35 +69,15 @@ pub struct ProxyOptions {
 
     /// Storage configuration for the blockchain history, chain states and binary blobs.
     #[arg(long = "storage")]
-    storage_config: StorageConfigNamespace,
+    storage_config: StorageConfig,
 
-    /// The maximal number of simultaneous queries to the database
+    /// Common storage options.
+    #[command(flatten)]
+    common_storage_options: CommonStorageOptions,
+
+    /// Runs a specific proxy instance.
     #[arg(long)]
-    max_concurrent_queries: Option<usize>,
-
-    /// The maximal number of stream queries to the database
-    #[arg(long, default_value = "10")]
-    max_stream_queries: usize,
-
-    /// The maximal memory used in the storage cache.
-    #[arg(long, default_value = "10000000")]
-    pub max_cache_size: usize,
-
-    /// The maximal size of an entry in the storage cache.
-    #[arg(long, default_value = "1000000")]
-    pub max_entry_size: usize,
-
-    /// The maximal number of entries in the storage cache.
-    #[arg(long, default_value = "1000")]
-    pub max_cache_entries: usize,
-
-    /// Path to the file describing the initial user chains (aka genesis state)
-    #[arg(long = "genesis")]
-    genesis_config_path: PathBuf,
-
-    /// The replication factor for the keyspace
-    #[arg(long, default_value = "1")]
-    storage_replication_factor: u32,
+    id: Option<usize>,
 }
 
 /// A Linera Proxy, either gRPC or over 'Simple Transport', meaning TCP or UDP.
@@ -116,6 +95,7 @@ struct ProxyContext {
     config: ValidatorServerConfig,
     send_timeout: Duration,
     recv_timeout: Duration,
+    id: usize,
 }
 
 impl ProxyContext {
@@ -125,6 +105,7 @@ impl ProxyContext {
             config,
             send_timeout: options.send_timeout,
             recv_timeout: options.recv_timeout,
+            id: options.id.unwrap_or(0),
         })
     }
 }
@@ -158,12 +139,12 @@ where
         let proxy = match (internal_protocol, external_protocol) {
             (NetworkProtocol::Grpc { .. }, NetworkProtocol::Grpc(tls)) => {
                 Self::Grpc(GrpcProxy::new(
-                    context.config.validator.network,
                     context.config.internal_network,
                     context.send_timeout,
                     context.recv_timeout,
                     tls,
                     storage,
+                    context.id,
                 ))
             }
             (
@@ -182,6 +163,7 @@ where
                 send_timeout: context.send_timeout,
                 recv_timeout: context.recv_timeout,
                 storage,
+                id: context.id,
             })),
             _ => {
                 bail!(
@@ -206,6 +188,7 @@ where
     send_timeout: Duration,
     recv_timeout: Duration,
     storage: S,
+    id: usize,
 }
 
 #[async_trait]
@@ -257,17 +240,14 @@ impl<S> SimpleProxy<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    #[instrument(name = "SimpleProxy::run", skip_all, fields(port = self.public_config.port, metrics_port = self.internal_config.metrics_port), err)]
+    #[instrument(name = "SimpleProxy::run", skip_all, fields(port = self.public_config.port, metrics_port = self.metrics_port()), err)]
     async fn run(self, shutdown_signal: CancellationToken) -> Result<()> {
         info!("Starting proxy");
         let mut join_set = JoinSet::new();
-        let address = self.get_listen_address(self.public_config.port);
+        let address = self.get_listen_address();
 
         #[cfg(with_metrics)]
-        Self::start_metrics(
-            self.get_listen_address(self.internal_config.metrics_port),
-            shutdown_signal.clone(),
-        );
+        Self::start_metrics(address, shutdown_signal.clone());
 
         self.public_config
             .protocol
@@ -280,13 +260,29 @@ where
         Ok(())
     }
 
+    fn port(&self) -> u16 {
+        self.internal_config
+            .proxies
+            .get(self.id)
+            .unwrap_or_else(|| panic!("proxy with id {} must be present", self.id))
+            .public_port
+    }
+
+    fn metrics_port(&self) -> u16 {
+        self.internal_config
+            .proxies
+            .get(self.id)
+            .unwrap_or_else(|| panic!("proxy with id {} must be present", self.id))
+            .metrics_port
+    }
+
     #[cfg(with_metrics)]
     pub fn start_metrics(address: SocketAddr, shutdown_signal: CancellationToken) {
         prometheus_server::start_metrics(address, shutdown_signal)
     }
 
-    fn get_listen_address(&self, port: u16) -> SocketAddr {
-        SocketAddr::from(([0, 0, 0, 0], port))
+    fn get_listen_address(&self) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], self.port()))
     }
 
     async fn try_proxy_message(
@@ -319,7 +315,7 @@ where
                     .storage
                     .read_network_description()
                     .await?
-                    .ok_or(anyhow!("Cannot find network description in the database"))?;
+                    .ok_or_else(|| anyhow!("Cannot find network description in the database"))?;
                 Ok(Some(RpcMessage::NetworkDescriptionResponse(Box::new(
                     description,
                 ))))
@@ -334,7 +330,9 @@ where
                 Ok(Some(RpcMessage::UploadBlobResponse(Box::new(id))))
             }
             DownloadBlob(blob_id) => {
-                let content = self.storage.read_blob(*blob_id).await?.into_content();
+                let blob = self.storage.read_blob(*blob_id).await?;
+                let blob = blob.ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                let content = blob.into_content();
                 Ok(Some(RpcMessage::DownloadBlobResponse(Box::new(content))))
             }
             DownloadConfirmedBlock(hash) => Ok(Some(RpcMessage::DownloadConfirmedBlockResponse(
@@ -344,9 +342,16 @@ where
                 let certificates = self.storage.read_certificates(hashes).await?;
                 Ok(Some(RpcMessage::DownloadCertificatesResponse(certificates)))
             }
-            BlobLastUsedBy(blob_id) => Ok(Some(RpcMessage::BlobLastUsedByResponse(Box::new(
-                self.storage.read_blob_state(*blob_id).await?.last_used_by,
-            )))),
+            BlobLastUsedBy(blob_id) => {
+                let blob_state = self.storage.read_blob_state(*blob_id).await?;
+                let blob_state = blob_state.ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                let last_used_by = blob_state
+                    .last_used_by
+                    .ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                Ok(Some(RpcMessage::BlobLastUsedByResponse(Box::new(
+                    last_used_by,
+                ))))
+            }
             MissingBlobIds(blob_ids) => Ok(Some(RpcMessage::MissingBlobIdsResponse(
                 self.storage.missing_blobs(&blob_ids).await?,
             ))),
@@ -404,21 +409,12 @@ fn main() -> Result<()> {
 
 impl ProxyOptions {
     async fn run(&self) -> Result<()> {
-        let storage_cache_config = StorageCacheConfig {
-            max_cache_size: self.max_cache_size,
-            max_entry_size: self.max_entry_size,
-            max_cache_entries: self.max_cache_entries,
-        };
-        let common_config = CommonStoreConfig {
-            max_concurrent_queries: self.max_concurrent_queries,
-            max_stream_queries: self.max_stream_queries,
-            storage_cache_config,
-            replication_factor: self.storage_replication_factor,
-        };
-        let genesis_config: GenesisConfig = util::read_json(&self.genesis_config_path)?;
-        let store_config = self.storage_config.add_common_config(common_config).await?;
+        let store_config = self
+            .storage_config
+            .add_common_storage_options(&self.common_storage_options)
+            .await?;
         store_config
-            .run_with_storage(&genesis_config, None, ProxyContext::from_options(self)?)
+            .run_with_storage(None, ProxyContext::from_options(self)?)
             .boxed()
             .await?
     }

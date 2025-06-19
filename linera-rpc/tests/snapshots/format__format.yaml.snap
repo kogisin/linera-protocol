@@ -41,16 +41,27 @@ AccountSignature:
   ENUM:
     0:
       Ed25519:
-        NEWTYPE:
-          TYPENAME: Ed25519Signature
+        STRUCT:
+          - signature:
+              TYPENAME: Ed25519Signature
+          - public_key:
+              TYPENAME: Ed25519PublicKey
     1:
       Secp256k1:
-        NEWTYPE:
-          TYPENAME: Secp256k1Signature
+        STRUCT:
+          - signature:
+              TYPENAME: Secp256k1Signature
+          - public_key:
+              TYPENAME: Secp256k1PublicKey
     2:
       EvmSecp256k1:
-        NEWTYPE:
-          TYPENAME: EvmSignature
+        STRUCT:
+          - signature:
+              TYPENAME: EvmSignature
+          - address:
+              TUPLEARRAY:
+                CONTENT: U8
+                SIZE: 20
 AdminOperation:
   ENUM:
     0:
@@ -224,13 +235,11 @@ BlockProposal:
   STRUCT:
     - content:
         TYPENAME: ProposalContent
-    - public_key:
-        TYPENAME: AccountPublicKey
     - signature:
         TYPENAME: AccountSignature
-    - validated_block_certificate:
+    - original_proposal:
         OPTION:
-          TYPENAME: LiteCertificate
+          TYPENAME: OriginalProposal
 Certificate:
   ENUM:
     0:
@@ -275,8 +284,7 @@ ChainInfo:
     - chain_id:
         TYPENAME: ChainId
     - epoch:
-        OPTION:
-          TYPENAME: Epoch
+        TYPENAME: Epoch
     - description:
         OPTION:
           TYPENAME: ChainDescription
@@ -491,7 +499,7 @@ EvmSignature:
   NEWTYPESTRUCT:
     TUPLEARRAY:
       CONTENT: U8
-      SIZE: 64
+      SIZE: 65
 GenericApplicationId:
   ENUM:
     0:
@@ -534,9 +542,6 @@ InitialChainConfig:
   STRUCT:
     - ownership:
         TYPENAME: ChainOwnership
-    - admin_id:
-        OPTION:
-          TYPENAME: ChainId
     - epoch:
         TYPENAME: Epoch
     - committees:
@@ -643,6 +648,8 @@ NetworkDescription:
         TYPENAME: CryptoHash
     - genesis_timestamp:
         TYPENAME: Timestamp
+    - admin_chain_id:
+        TYPENAME: ChainId
 NodeError:
   ENUM:
     0:
@@ -693,48 +700,44 @@ NodeError:
     10:
       MissingVoteInValidatorResponse: UNIT
     11:
-      InactiveLocalChain:
-        NEWTYPE:
-          TYPENAME: ChainId
-    12:
       InvalidChainInfoResponse: UNIT
-    13:
+    12:
       UnexpectedCertificateValue: UNIT
-    14:
+    13:
       InvalidDecoding: UNIT
-    15:
+    14:
       UnexpectedMessage: UNIT
-    16:
+    15:
       GrpcError:
         STRUCT:
           - error: STR
-    17:
+    16:
       ClientIoError:
         STRUCT:
           - error: STR
-    18:
+    17:
       CannotResolveValidatorAddress:
         STRUCT:
           - address: STR
-    19:
+    18:
       SubscriptionError:
         STRUCT:
           - transport: STR
-    20:
+    19:
       SubscriptionFailed:
         STRUCT:
           - status: STR
-    21:
+    20:
       InvalidCertificateForBlob:
         NEWTYPE:
           TYPENAME: BlobId
-    22:
+    21:
       DuplicatesInBlobsNotFound: UNIT
-    23:
+    22:
       UnexpectedEntriesInBlobsNotFound: UNIT
-    24:
+    23:
       EmptyBlobsNotFound: UNIT
-    25:
+    24:
       ResponseHandlingError:
         STRUCT:
           - error: STR
@@ -784,6 +787,17 @@ OracleResponse:
         TUPLE:
           - TYPENAME: EventId
           - SEQ: U8
+OriginalProposal:
+  ENUM:
+    0:
+      Fast:
+        NEWTYPE:
+          TYPENAME: AccountSignature
+    1:
+      Regular:
+        STRUCT:
+          - certificate:
+              TYPENAME: LiteCertificate
 OutgoingMessage:
   STRUCT:
     - destination:
@@ -856,8 +870,6 @@ Recipient:
           TYPENAME: Account
 ResourceControlPolicy:
   STRUCT:
-    - block:
-        TYPENAME: Amount
     - wasm_fuel_unit:
         TYPENAME: Amount
     - evm_fuel_unit:

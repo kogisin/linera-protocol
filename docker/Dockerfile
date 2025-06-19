@@ -57,9 +57,11 @@ COPY linera-service-graphql-client linera-service-graphql-client
 COPY linera-storage linera-storage
 COPY linera-storage-service linera-storage-service
 COPY linera-summary linera-summary
+COPY linera-persistent linera-persistent
 COPY linera-version linera-version
 COPY linera-views linera-views
 COPY linera-views-derive linera-views-derive
+COPY linera-web linera-web
 COPY linera-witty linera-witty
 COPY linera-witty-macros linera-witty-macros
 COPY scripts scripts

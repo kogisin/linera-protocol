@@ -13,31 +13,17 @@ use thiserror::Error;
 use crate::{
     batch::{Batch, WriteOperation},
     common::get_upper_bound_option,
-    lru_caching::DEFAULT_STORAGE_CACHE_CONFIG,
     store::{
-        AdminKeyValueStore, CommonStoreConfig, KeyValueStoreError, ReadableKeyValueStore,
-        WithError, WritableKeyValueStore,
+        AdminKeyValueStore, KeyValueStoreError, ReadableKeyValueStore, WithError,
+        WritableKeyValueStore,
     },
 };
 
 /// The initial configuration of the system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedDbStoreConfig {
-    /// The common configuration of the key value store
-    pub common_config: CommonStoreConfig,
-}
-
-impl IndexedDbStoreConfig {
-    /// Creates a `IndexedDbStoreConfig`. `max_concurrent_queries` and `storage_cache_config` are not used.
-    pub fn new(max_stream_queries: usize) -> Self {
-        let common_config = CommonStoreConfig {
-            max_concurrent_queries: None,
-            max_stream_queries,
-            storage_cache_config: DEFAULT_STORAGE_CACHE_CONFIG,
-            replication_factor: 1,
-        };
-        Self { common_config }
-    }
+    /// Preferred buffer size for async streams.
+    pub max_stream_queries: usize,
 }
 
 /// The prefixes being used in the system
@@ -101,7 +87,7 @@ impl IndexedDbStore {
         Ok(IndexedDbStore {
             database,
             object_store_name,
-            max_stream_queries: config.common_config.max_stream_queries,
+            max_stream_queries: config.max_stream_queries,
             start_key,
         })
     }
@@ -279,7 +265,7 @@ impl AdminKeyValueStore for IndexedDbStore {
         Self::connect_internal(config, namespace, start_key).await
     }
 
-    fn clone_with_root_key(&self, root_key: &[u8]) -> Result<Self, IndexedDbStoreError> {
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self, IndexedDbStoreError> {
         let database = self.database.clone();
         let object_store_name = self.object_store_name.clone();
         let max_stream_queries = self.max_stream_queries;
@@ -343,7 +329,7 @@ mod testing {
     pub async fn create_indexed_db_store_stream_queries(
         max_stream_queries: usize,
     ) -> IndexedDbStore {
-        let config = IndexedDbStoreConfig::new(max_stream_queries);
+        let config = IndexedDbStoreConfig { max_stream_queries };
         let namespace = generate_test_namespace();
         IndexedDbStore::connect(&config, &namespace).await.unwrap()
     }
@@ -365,28 +351,25 @@ pub enum IndexedDbStoreError {
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
 
-    /// The value is too large for the `IndexedDbStore`
-    #[error("The value is too large for the IndexedDbStore")]
-    TooLargeValue,
-
     /// A DOM exception occurred in the IndexedDB operations
     #[error("DOM exception: {0:?}")]
-    Dom(web_sys::DomException),
+    Dom(gloo_utils::errors::JsError),
 
     /// JavaScript threw an exception whilst handling IndexedDB operations
     #[error("JavaScript exception: {0:?}")]
-    Js(wasm_bindgen::JsValue),
+    Js(gloo_utils::errors::JsError),
 }
 
 impl From<web_sys::DomException> for IndexedDbStoreError {
     fn from(dom_exception: web_sys::DomException) -> Self {
-        Self::Dom(dom_exception)
+        let value: &wasm_bindgen::JsValue = dom_exception.as_ref();
+        Self::Dom(value.clone().try_into().unwrap())
     }
 }
 
 impl From<wasm_bindgen::JsValue> for IndexedDbStoreError {
     fn from(js_value: wasm_bindgen::JsValue) -> Self {
-        Self::Js(js_value)
+        Self::Js(js_value.try_into().unwrap())
     }
 }
 

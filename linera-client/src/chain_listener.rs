@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use futures::{
     future::{join_all, select_all},
     lock::Mutex,
@@ -29,7 +28,10 @@ use linera_storage::{Clock as _, Storage as _};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn, Instrument as _};
 
-use crate::{wallet::Wallet, Error};
+use crate::{
+    wallet::{UserChain, Wallet},
+    Error,
+};
 
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct ChainListenerConfig {
@@ -60,19 +62,31 @@ pub struct ChainListenerConfig {
 
 type ContextChainClient<C> = ChainClient<<C as ClientContext>::Environment>;
 
-#[cfg_attr(not(web), async_trait, trait_variant::make(Send))]
-#[cfg_attr(web, async_trait(?Send))]
-pub trait ClientContext: 'static {
+#[cfg_attr(not(web), trait_variant::make(Send))]
+#[allow(async_fn_in_trait)]
+pub trait ClientContext {
     type Environment: linera_core::Environment;
 
     fn wallet(&self) -> &Wallet;
 
     fn storage(&self) -> &<Self::Environment as linera_core::Environment>::Storage;
 
-    async fn make_chain_client(&self, chain_id: ChainId)
-        -> Result<ContextChainClient<Self>, Error>;
+    fn client(&self) -> &Arc<linera_core::client::Client<Self::Environment>>;
 
-    fn client(&self) -> &linera_core::client::Client<Self::Environment>;
+    fn make_chain_client(&self, chain_id: ChainId) -> ChainClient<Self::Environment> {
+        let chain = self
+            .wallet()
+            .get(chain_id)
+            .cloned()
+            .unwrap_or_else(|| UserChain::make_other(chain_id, Timestamp::from(0)));
+        self.client().create_chain_client(
+            chain_id,
+            chain.block_hash,
+            chain.next_block_height,
+            chain.pending_proposal,
+            chain.owner,
+        )
+    }
 
     async fn update_wallet_for_new_chain(
         &mut self,
@@ -82,15 +96,21 @@ pub trait ClientContext: 'static {
     ) -> Result<(), Error>;
 
     async fn update_wallet(&mut self, client: &ContextChainClient<Self>) -> Result<(), Error>;
+}
 
-    async fn clients(&self) -> Result<Vec<ContextChainClient<Self>>, Error> {
+#[allow(async_fn_in_trait)]
+pub trait ClientContextExt: ClientContext {
+    fn clients(&self) -> Vec<ContextChainClient<Self>> {
+        let chain_ids = self.wallet().chain_ids();
         let mut clients = vec![];
-        for chain_id in &self.wallet().chain_ids() {
-            clients.push(self.make_chain_client(*chain_id).await?);
+        for chain_id in chain_ids {
+            clients.push(self.make_chain_client(chain_id));
         }
-        Ok(clients)
+        clients
     }
 }
+
+impl<T: ClientContext> ClientContextExt for T {}
 
 /// A chain client together with the stream of notifications from the local node.
 ///
@@ -171,7 +191,9 @@ impl<C: ClientContext> ChainListener<C> {
     pub async fn run(mut self) -> Result<(), Error> {
         let chain_ids = {
             let guard = self.context.lock().await;
-            BTreeSet::from_iter(guard.wallet().chain_ids())
+            let mut chain_ids = BTreeSet::from_iter(guard.wallet().chain_ids());
+            chain_ids.insert(guard.wallet().genesis_admin_chain());
+            chain_ids
         };
         self.listen_recursively(chain_ids).await?;
         loop {
@@ -287,18 +309,8 @@ impl<C: ClientContext> ChainListener<C> {
         if self.listening.contains_key(&chain_id) {
             return Ok(BTreeSet::new());
         }
-        let client = self
-            .context
-            .lock()
-            .await
-            .make_chain_client(chain_id)
-            .await?;
+        let client = self.context.lock().await.make_chain_client(chain_id);
         let (listener, abort_handle, notification_stream) = client.listen().await?;
-        if client.is_tracked() {
-            client.synchronize_from_validators().await?;
-        } else {
-            client.synchronize_chain_state(chain_id).await?;
-        }
         let join_handle = linera_base::task::spawn(listener.in_current_span());
         let listening_client =
             ListeningClient::new(client, abort_handle, join_handle, notification_stream);

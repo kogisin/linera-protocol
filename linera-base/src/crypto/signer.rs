@@ -1,18 +1,45 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use async_trait::async_trait;
+/*!
+An interface for cryptographic signers that can be used by the Linera client to sign blocks.
+*/
+
+use std::error::Error as StdError;
+
 pub use in_mem::InMemorySigner;
 
 use super::CryptoHash;
-use crate::{
-    crypto::{AccountPublicKey, AccountSignature},
-    identifiers::AccountOwner,
-};
+use crate::{crypto::AccountSignature, identifiers::AccountOwner};
+
+cfg_if::cfg_if! {
+    if #[cfg(web)] {
+        #[doc(hidden)]
+        pub trait TaskSendable {}
+        impl<T> TaskSendable for T {}
+    } else {
+        #[doc(hidden)]
+        pub trait TaskSendable: Send + Sync {}
+        impl<T: Send + Sync> TaskSendable for T {}
+    }
+}
+
+/// Errors that can be returned from signers.
+pub trait Error: StdError + TaskSendable {}
+impl<T: StdError + TaskSendable> Error for T {}
+
+impl StdError for Box<dyn Error + '_> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        (**self).source()
+    }
+}
 
 /// A trait for signing keys.
-#[async_trait]
-pub trait Signer: Send + Sync {
+#[cfg_attr(not(web), trait_variant::make(Send))]
+pub trait Signer {
+    /// The type of errors arising from operations on this `Signer`.
+    type Error: Error;
+
     /// Creates a signature for the given `value` using the provided `owner`.
     // DEV: We sign `CryptoHash` type, rather than `&[u8]` to make sure we don't sign
     // things accidentally. See [`CryptoHash::new`] for how the type's name is included
@@ -21,38 +48,10 @@ pub trait Signer: Send + Sync {
         &self,
         owner: &AccountOwner,
         value: &CryptoHash,
-    ) -> Result<AccountSignature, Box<dyn std::error::Error>>;
-
-    /// Returns the public key corresponding to the given `owner`.
-    async fn get_public_key(
-        &self,
-        owner: &AccountOwner,
-    ) -> Result<AccountPublicKey, Box<dyn std::error::Error>>;
+    ) -> Result<AccountSignature, Self::Error>;
 
     /// Returns whether the given `owner` is a known signer.
-    async fn contains_key(&self, owner: &AccountOwner) -> Result<bool, Box<dyn std::error::Error>>;
-}
-
-#[async_trait]
-impl Signer for Box<dyn Signer> {
-    async fn sign(
-        &self,
-        owner: &AccountOwner,
-        value: &CryptoHash,
-    ) -> Result<AccountSignature, Box<dyn std::error::Error>> {
-        (**self).sign(owner, value).await
-    }
-
-    async fn get_public_key(
-        &self,
-        owner: &AccountOwner,
-    ) -> Result<AccountPublicKey, Box<dyn std::error::Error>> {
-        (**self).get_public_key(owner).await
-    }
-
-    async fn contains_key(&self, owner: &AccountOwner) -> Result<bool, Box<dyn std::error::Error>> {
-        (**self).contains_key(owner).await
-    }
+    async fn contains_key(&self, owner: &AccountOwner) -> Result<bool, Self::Error>;
 }
 
 /// In-memory implementation of the [`Signer`] trait.
@@ -62,15 +61,20 @@ mod in_mem {
         sync::{Arc, RwLock},
     };
 
-    use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
 
     #[cfg(with_getrandom)]
-    use crate::crypto::CryptoRng;
+    use crate::crypto::{AccountPublicKey, CryptoRng};
     use crate::{
-        crypto::{AccountPublicKey, AccountSecretKey, AccountSignature, CryptoHash, Signer},
+        crypto::{AccountSecretKey, AccountSignature, CryptoHash, Signer},
         identifiers::AccountOwner,
     };
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum Error {
+        #[error("no key found for the given owner")]
+        NoSuchOwner,
+    }
 
     /// In-memory signer.
     #[derive(Clone)]
@@ -173,42 +177,27 @@ mod in_mem {
         }
     }
 
-    #[async_trait]
     impl Signer for InMemorySigner {
+        type Error = Error;
+
         /// Creates a signature for the given `value` using the provided `owner`.
         async fn sign(
             &self,
             owner: &AccountOwner,
             value: &CryptoHash,
-        ) -> Result<AccountSignature, Box<dyn std::error::Error>> {
+        ) -> Result<AccountSignature, Error> {
             let inner = self.0.read().unwrap();
             if let Some(secret) = inner.keys.get(owner) {
                 let signature = secret.sign_prehash(*value);
                 Ok(signature)
             } else {
-                Err("No key found for the given owner".into())
-            }
-        }
-
-        /// Returns the public key corresponding to the given `owner`.
-        async fn get_public_key(
-            &self,
-            owner: &AccountOwner,
-        ) -> Result<AccountPublicKey, Box<dyn std::error::Error>> {
-            let inner = self.0.read().unwrap();
-            match inner.keys.get(owner).map(|s| s.public()) {
-                Some(public) => Ok(public),
-                None => Err("No key found for the given owner".into()),
+                Err(Error::NoSuchOwner)
             }
         }
 
         /// Returns whether the given `owner` is a known signer.
-        async fn contains_key(
-            &self,
-            owner: &AccountOwner,
-        ) -> Result<bool, Box<dyn std::error::Error>> {
-            let inner = self.0.read().unwrap();
-            Ok(inner.keys.contains_key(owner))
+        async fn contains_key(&self, owner: &AccountOwner) -> Result<bool, Error> {
+            Ok(self.0.read().unwrap().keys.contains_key(owner))
         }
     }
 

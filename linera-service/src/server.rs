@@ -18,16 +18,15 @@ use linera_base::{
     crypto::{CryptoRng, Ed25519SecretKey},
     listen_for_shutdown_signals,
 };
-use linera_client::{
-    config::{CommitteeConfig, GenesisConfig, ValidatorConfig, ValidatorServerConfig},
-    persistent::{self, Persist},
-};
+use linera_client::config::{CommitteeConfig, ValidatorConfig, ValidatorServerConfig};
 use linera_core::{worker::WorkerState, JoinSetExt as _};
 use linera_execution::{WasmRuntime, WithWasmDefault};
+use linera_persistent::{self as persistent, Persist};
 use linera_rpc::{
     config::{
-        CrossChainConfig, ExporterServiceConfig, NetworkProtocol, NotificationConfig, ShardConfig,
-        ShardId, TlsConfig, ValidatorInternalNetworkConfig, ValidatorPublicNetworkConfig,
+        CrossChainConfig, ExporterServiceConfig, NetworkProtocol, NotificationConfig, ProxyConfig,
+        ShardConfig, ShardId, TlsConfig, ValidatorInternalNetworkConfig,
+        ValidatorPublicNetworkConfig,
     },
     grpc, simple,
 };
@@ -35,11 +34,10 @@ use linera_sdk::linera_base_types::{AccountSecretKey, ValidatorKeypair};
 #[cfg(with_metrics)]
 use linera_service::prometheus_server;
 use linera_service::{
-    storage::{Runnable, StorageConfigNamespace},
+    storage::{CommonStorageOptions, Runnable, StorageConfig},
     util,
 };
 use linera_storage::Storage;
-use linera_views::{lru_caching::StorageCacheConfig, store::CommonStoreConfig};
 use serde::Deserialize;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -270,15 +268,6 @@ struct ValidatorOptions {
     #[serde(default)]
     block_exporters: Vec<ExporterServiceConfig>,
 
-    /// The port for the metrics endpoint
-    metrics_port: u16,
-
-    /// The host of the proxy in the internal network.
-    internal_host: String,
-
-    /// The port of the proxy on the internal network.
-    internal_port: u16,
-
     /// The network protocol for the frontend.
     external_protocol: NetworkProtocol,
 
@@ -287,6 +276,9 @@ struct ValidatorOptions {
 
     /// The public name and the port of each of the shards
     shards: Vec<ShardConfig>,
+
+    /// The name and the port of the proxies
+    proxies: Vec<ProxyConfig>,
 }
 
 fn make_server_config<R: CryptoRng>(
@@ -306,10 +298,8 @@ fn make_server_config<R: CryptoRng>(
         public_key,
         protocol: options.internal_protocol,
         shards: options.shards,
-        host: options.internal_host,
-        port: options.internal_port,
         block_exporters: options.block_exporters,
-        metrics_port: options.metrics_port,
+        proxies: options.proxies,
     };
     let validator = ValidatorConfig {
         network,
@@ -337,7 +327,11 @@ enum ServerCommand {
 
         /// Storage configuration for the blockchain history, chain states and binary blobs.
         #[arg(long = "storage")]
-        storage_config: StorageConfigNamespace,
+        storage_config: StorageConfig,
+
+        /// Common storage options.
+        #[command(flatten)]
+        common_storage_options: CommonStorageOptions,
 
         /// Configuration for cross-chain requests
         #[command(flatten)]
@@ -346,10 +340,6 @@ enum ServerCommand {
         /// Configuration for notifications
         #[command(flatten)]
         notification_config: NotificationConfig,
-
-        /// Path to the file describing the initial user chains (aka genesis state)
-        #[arg(long = "genesis")]
-        genesis_config_path: PathBuf,
 
         /// Runs a specific shard (from 0 to shards-1)
         #[arg(long)]
@@ -367,30 +357,6 @@ enum ServerCommand {
         /// The maximal number of chains loaded in memory at a given time.
         #[arg(long, default_value = "400")]
         max_loaded_chains: NonZeroUsize,
-
-        /// The maximal number of simultaneous queries to the database
-        #[arg(long)]
-        max_concurrent_queries: Option<usize>,
-
-        /// The maximal number of stream queries to the database
-        #[arg(long, default_value = "10")]
-        max_stream_queries: usize,
-
-        /// The maximal memory used in the storage cache.
-        #[arg(long, default_value = "10000000")]
-        max_cache_size: usize,
-
-        /// The maximal size of an entry in the storage cache.
-        #[arg(long, default_value = "1000000")]
-        max_entry_size: usize,
-
-        /// The maximal number of entries in the storage cache.
-        #[arg(long, default_value = "1000")]
-        max_cache_entries: usize,
-
-        /// The replication factor for the storage.
-        #[arg(long, default_value = "1")]
-        storage_replication_factor: u32,
     },
 
     /// Act as a trusted third-party and generate all server configurations
@@ -408,42 +374,6 @@ enum ServerCommand {
         /// TESTING ONLY.
         #[arg(long)]
         testing_prng_seed: Option<u64>,
-    },
-
-    /// Initialize the database
-    #[command(name = "initialize")]
-    Initialize {
-        /// Storage configuration for the blockchain history, chain states and binary blobs.
-        #[arg(long = "storage")]
-        storage_config: StorageConfigNamespace,
-
-        /// Path to the file describing the initial user chains (aka genesis state)
-        #[arg(long = "genesis")]
-        genesis_config_path: PathBuf,
-
-        /// The maximal number of simultaneous queries to the database
-        #[arg(long)]
-        max_concurrent_queries: Option<usize>,
-
-        /// The maximal number of stream queries to the database
-        #[arg(long, default_value = "10")]
-        max_stream_queries: usize,
-
-        /// The maximal memory used in the storage cache.
-        #[arg(long, default_value = "10000000")]
-        max_cache_size: usize,
-
-        /// The maximal size of an entry in the storage cache.
-        #[arg(long, default_value = "1000000")]
-        max_entry_size: usize,
-
-        /// The maximal number of entries in the storage cache.
-        #[arg(long, default_value = "1000")]
-        max_cache_entries: usize,
-
-        /// The replication factor for the storage.
-        #[arg(long, default_value = "1")]
-        storage_replication_factor: u32,
     },
 
     /// Replaces the configurations of the shards by following the given template.
@@ -523,9 +453,7 @@ fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
             }
             .into()
         }
-        ServerCommand::Generate { .. }
-        | ServerCommand::Initialize { .. }
-        | ServerCommand::EditShards { .. } => "server".into(),
+        ServerCommand::Generate { .. } | ServerCommand::EditShards { .. } => "server".into(),
     }
 }
 
@@ -534,24 +462,16 @@ async fn run(options: ServerOptions) {
         ServerCommand::Run {
             server_config_path,
             storage_config,
+            common_storage_options,
             cross_chain_config,
             notification_config,
-            genesis_config_path,
             shard,
             grace_period,
             wasm_runtime,
             max_loaded_chains,
-            max_concurrent_queries,
-            max_stream_queries,
-            max_cache_size,
-            max_entry_size,
-            max_cache_entries,
-            storage_replication_factor,
         } => {
             linera_version::VERSION_INFO.log();
 
-            let genesis_config: GenesisConfig =
-                util::read_json(&genesis_config_path).expect("Failed to read initial chain config");
             let server_config: ValidatorServerConfig =
                 util::read_json(&server_config_path).expect("Failed to read server config");
 
@@ -564,23 +484,12 @@ async fn run(options: ServerOptions) {
                 max_loaded_chains,
             };
             let wasm_runtime = wasm_runtime.with_wasm_default();
-            let storage_cache_config = StorageCacheConfig {
-                max_cache_size,
-                max_entry_size,
-                max_cache_entries,
-            };
-            let common_config = CommonStoreConfig {
-                max_concurrent_queries,
-                max_stream_queries,
-                storage_cache_config,
-                replication_factor: storage_replication_factor,
-            };
             let store_config = storage_config
-                .add_common_config(common_config)
+                .add_common_storage_options(&common_storage_options)
                 .await
                 .unwrap();
             store_config
-                .run_with_storage(&genesis_config, wasm_runtime, job)
+                .run_with_storage(wasm_runtime, job)
                 .boxed()
                 .await
                 .unwrap()
@@ -599,7 +508,9 @@ async fn run(options: ServerOptions) {
                     .await
                     .expect("Unable to read validator options file");
                 let options: ValidatorOptions =
-                    toml::from_str(&options_string).expect("Invalid options file format");
+                    toml::from_str(&options_string).unwrap_or_else(|_| {
+                        panic!("Invalid options file format: \n {}", options_string)
+                    });
                 let path = options.server_config_path.clone();
                 let mut server = make_server_config(&path, &mut rng, options)
                     .expect("Unable to open server config file");
@@ -626,40 +537,6 @@ async fn run(options: ServerOptions) {
                     .expect("Unable to write committee description");
                 info!("Wrote committee config {}", committee.to_str().unwrap());
             }
-        }
-
-        ServerCommand::Initialize {
-            storage_config,
-            genesis_config_path,
-            max_concurrent_queries,
-            max_stream_queries,
-            max_cache_size,
-            max_entry_size,
-            max_cache_entries,
-            storage_replication_factor,
-        } => {
-            let genesis_config: GenesisConfig =
-                util::read_json(&genesis_config_path).expect("Failed to read initial chain config");
-            let storage_cache_config = StorageCacheConfig {
-                max_cache_size,
-                max_entry_size,
-                max_cache_entries,
-            };
-            let common_config = CommonStoreConfig {
-                max_concurrent_queries,
-                max_stream_queries,
-                storage_cache_config,
-                replication_factor: storage_replication_factor,
-            };
-            let store_config = storage_config
-                .add_common_config(common_config)
-                .await
-                .unwrap();
-            tracing::info!(
-                "server::ServerCommand::Initialize, storage_config={:?}",
-                storage_config
-            );
-            store_config.initialize(&genesis_config).await.unwrap();
         }
 
         ServerCommand::EditShards {
@@ -732,11 +609,15 @@ mod test {
             server_config_path = "server.json"
             host = "host"
             port = 9000
-            internal_host = "internal_host"
-            internal_port = 10000
-            metrics_port = 5000
             external_protocol = { Simple = "Tcp" }
             internal_protocol = { Simple = "Udp" }
+
+            [[proxies]]
+            host = "proxy"
+            public_port = 20100
+            private_port = 20200
+            metrics_host = "proxy"
+            metrics_port = 21100
 
             [[shards]]
             host = "host1"
@@ -761,13 +642,16 @@ mod test {
                 internal_protocol: NetworkProtocol::Simple(TransportProtocol::Udp),
                 host: "host".into(),
                 port: 9000,
+                proxies: vec![ProxyConfig {
+                    host: "proxy".into(),
+                    public_port: 20100,
+                    private_port: 20200,
+                    metrics_port: 21100,
+                }],
                 block_exporters: vec![ExporterServiceConfig {
                     host: "exporter".into(),
                     port: 12000
                 }],
-                internal_host: "internal_host".into(),
-                internal_port: 10000,
-                metrics_port: 5000,
                 shards: vec![
                     ShardConfig {
                         host: "host1".into(),

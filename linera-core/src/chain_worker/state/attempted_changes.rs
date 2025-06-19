@@ -10,10 +10,12 @@ use linera_base::{
     crypto::ValidatorPublicKey,
     data_types::{Blob, BlockHeight, Epoch, Timestamp},
     ensure,
-    identifiers::{AccountOwner, ChainId},
+    identifiers::ChainId,
 };
 use linera_chain::{
-    data_types::{BlockExecutionOutcome, BlockProposal, MessageBundle, ProposalContent},
+    data_types::{
+        BlockExecutionOutcome, BlockProposal, MessageBundle, OriginalProposal, ProposalContent,
+    },
     manager,
     types::{ConfirmedBlockCertificate, TimeoutCertificate, ValidatedBlockCertificate},
     ChainExecutionContext, ChainStateView, ExecutionResultExt as _,
@@ -122,6 +124,7 @@ where
         &mut self,
         proposal: &BlockProposal,
     ) -> Result<Vec<Blob>, WorkerError> {
+        let owner = proposal.owner();
         let BlockProposal {
             content:
                 ProposalContent {
@@ -129,12 +132,10 @@ where
                     round,
                     outcome: _,
                 },
-            public_key,
-            validated_block_certificate,
+            original_proposal,
             signature: _,
         } = proposal;
 
-        let owner = AccountOwner::from(*public_key);
         let mut maybe_blobs = self
             .state
             .maybe_get_required_blobs(proposal.required_blob_ids(), None)
@@ -146,11 +147,12 @@ where
                 // TODO(#3203): Allow multiple pending proposals on permissionless chains.
                 chain.pending_proposed_blobs.clear();
             }
+            let validated = matches!(original_proposal, Some(OriginalProposal::Regular { .. }));
             chain
                 .pending_proposed_blobs
                 .try_load_entry_mut(&owner)
                 .await?
-                .update(*round, validated_block_certificate.is_some(), maybe_blobs)
+                .update(*round, validated, maybe_blobs)
                 .await?;
             self.save().await?;
             return Err(WorkerError::BlobsNotFound(missing_blob_ids));
@@ -302,7 +304,6 @@ where
             return Ok((info, actions));
         }
         let local_time = self.state.storage.clock().current_time();
-        // TODO(#2351): This sets the committee and then checks that committee's signatures.
         self.state.ensure_is_active().await?;
         // Verify the certificate.
         let (epoch, committee) = self.state.chain.current_committee()?;
@@ -318,7 +319,7 @@ where
         let created_blobs: BTreeMap<_, _> = block.iter_created_blobs().collect();
         let blobs_result = self
             .state
-            .get_required_blobs(block.required_blob_ids(), &created_blobs)
+            .get_required_blobs(required_blob_ids.iter().copied(), &created_blobs)
             .await
             .map(|blobs| blobs.into_values().collect::<Vec<_>>());
 
@@ -337,12 +338,11 @@ where
         }
 
         // Update the blob state with last used certificate hash.
-        let blob_state = certificate.value().to_blob_state();
-        let overwrite = blobs_result.is_ok(); // Overwrite only if we wrote the certificate.
+        let blob_state = certificate.value().to_blob_state(blobs_result.is_ok());
         let blob_ids = required_blob_ids.into_iter().collect::<Vec<_>>();
         self.state
             .storage
-            .maybe_write_blob_states(&blob_ids, blob_state, overwrite)
+            .maybe_write_blob_states(&blob_ids, blob_state)
             .await?;
         let mut blobs = blobs_result?
             .into_iter()
@@ -410,6 +410,53 @@ where
         let info = ChainInfoResponse::new(&self.state.chain, self.state.config.key_pair());
 
         Ok((info, actions))
+    }
+
+    /// Stores a block's blobs, and adds its messages to the outbox where possible.
+    /// Does not execute the block.
+    pub(super) async fn preprocess_certificate(
+        &mut self,
+        certificate: ConfirmedBlockCertificate,
+    ) -> Result<NetworkActions, WorkerError> {
+        let block = certificate.block();
+        // Check that the chain is active and ready for this confirmation.
+        let tip = self.state.chain.tip_state.get().clone();
+        if tip.next_block_height > block.header.height {
+            // We already processed this block.
+            return self.state.create_network_actions().await;
+        }
+
+        let required_blob_ids = block.required_blob_ids();
+        let created_blobs: BTreeMap<_, _> = block.iter_created_blobs().collect();
+        let blobs_result = self
+            .state
+            .get_required_blobs(required_blob_ids.iter().copied(), &created_blobs)
+            .await
+            .map(|blobs| blobs.into_values().collect::<Vec<_>>());
+
+        if let Ok(blobs) = &blobs_result {
+            self.state
+                .storage
+                .write_blobs_and_certificate(blobs, &certificate)
+                .await?;
+        }
+
+        // Update the blob state with last used certificate hash.
+        let blob_state = certificate.value().to_blob_state(blobs_result.is_ok());
+        let blob_ids = required_blob_ids.into_iter().collect::<Vec<_>>();
+        self.state
+            .storage
+            .maybe_write_blob_states(&blob_ids, blob_state)
+            .await?;
+        blobs_result?;
+        // Update the outboxes.
+        self.state
+            .chain
+            .preprocess_block(certificate.value())
+            .await?;
+        // Persist chain.
+        self.save().await?;
+        self.state.create_network_actions().await
     }
 
     /// Schedules a notification for when cross-chain messages are delivered up to the given
@@ -533,17 +580,16 @@ where
     /// Attempts to vote for a leader timeout, if possible.
     pub(super) async fn vote_for_leader_timeout(&mut self) -> Result<(), WorkerError> {
         let chain = &mut self.state.chain;
-        if let Some(epoch) = chain.execution_state.system.epoch.get() {
-            let chain_id = chain.chain_id();
-            let height = chain.tip_state.get().next_block_height;
-            let key_pair = self.state.config.key_pair();
-            let local_time = self.state.storage.clock().current_time();
-            if chain
-                .manager
-                .vote_timeout(chain_id, height, *epoch, key_pair, local_time)
-            {
-                self.save().await?;
-            }
+        let epoch = chain.execution_state.system.epoch.get();
+        let chain_id = chain.chain_id();
+        let height = chain.tip_state.get().next_block_height;
+        let key_pair = self.state.config.key_pair();
+        let local_time = self.state.storage.clock().current_time();
+        if chain
+            .manager
+            .vote_timeout(chain_id, height, *epoch, key_pair, local_time)
+        {
+            self.save().await?;
         }
         Ok(())
     }
@@ -551,7 +597,7 @@ where
     /// Votes for falling back to a public chain.
     pub(super) async fn vote_for_fallback(&mut self) -> Result<(), WorkerError> {
         let chain = &mut self.state.chain;
-        if let (Some(epoch), Some(entry)) = (
+        if let (epoch, Some(entry)) = (
             chain.execution_state.system.epoch.get(),
             chain.unskippable_bundles.front(),
         ) {
@@ -650,7 +696,7 @@ where
 /// Helper type for handling cross-chain updates.
 pub(crate) struct CrossChainUpdateHelper<'a> {
     pub allow_messages_from_deprecated_epochs: bool,
-    pub current_epoch: Option<Epoch>,
+    pub current_epoch: Epoch,
     pub committees: &'a BTreeMap<Epoch, Committee>,
 }
 
@@ -701,7 +747,7 @@ impl<'a> CrossChainUpdateHelper<'a> {
             // Check if the height is trusted or the epoch is trusted.
             if self.allow_messages_from_deprecated_epochs
                 || Some(bundle.height) <= last_anticipated_block_height
-                || Some(*epoch) >= self.current_epoch
+                || *epoch >= self.current_epoch
                 || self.committees.contains_key(epoch)
             {
                 trusted_len = i + 1;

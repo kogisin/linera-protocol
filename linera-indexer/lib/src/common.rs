@@ -15,7 +15,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum IndexerError {
     #[error(transparent)]
-    ViewError(#[from] linera_views::views::ViewError),
+    ViewError(#[from] linera_views::ViewError),
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
     #[error(transparent)]
@@ -46,8 +46,8 @@ pub enum IndexerError {
     PluginAlreadyRegistered,
     #[error("Invalid certificate content: {0:?}")]
     InvalidCertificateValue(CryptoHash),
-    #[error("Clone with root key error")]
-    CloneWithRootKeyError,
+    #[error("Open exclusive error")]
+    OpenExclusiveError,
 
     #[cfg(feature = "rocksdb")]
     #[error(transparent)]

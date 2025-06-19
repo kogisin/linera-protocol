@@ -155,44 +155,39 @@ impl<N: ValidatorNode> RemoteNode<N> {
         ensure!(
             proposed.is_none_or(|proposal| proposal.content.block.chain_id == chain_id)
                 && locking.is_none_or(|cert| cert.chain_id() == chain_id)
-                && response.check(&self.public_key).is_ok(),
+                && response.check(self.public_key).is_ok(),
             NodeError::InvalidChainInfoResponse
         );
         Ok(response.info)
     }
 
     #[instrument(level = "trace", skip_all)]
-    pub(crate) async fn try_query_certificates_from(
+    pub(crate) async fn query_certificates_from(
         &self,
         chain_id: ChainId,
         start: BlockHeight,
         limit: u64,
-    ) -> Result<Option<Vec<ConfirmedBlockCertificate>>, NodeError> {
+    ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError> {
         tracing::debug!(name = ?self.public_key, ?chain_id, ?start, ?limit, "Querying certificates");
         let range = BlockHeightRange {
             start,
             limit: Some(limit),
         };
         let query = ChainInfoQuery::new(chain_id).with_sent_certificate_hashes_in_range(range);
-        match self.handle_chain_info_query(query).await {
-            Ok(info) => {
-                let certificates = self
-                    .node
-                    .download_certificates(info.requested_sent_certificate_hashes)
-                    .await?
-                    .into_iter()
-                    .map(|c| {
-                        ConfirmedBlockCertificate::try_from(c)
-                            .map_err(|_| NodeError::InvalidChainInfoResponse)
-                    })
-                    .collect::<Result<_, _>>()?;
-                Ok(Some(certificates))
-            }
-            Err(error) => {
-                tracing::warn!("Failed to query certificates: {error}");
-                Ok(None)
-            }
-        }
+        let info = self.handle_chain_info_query(query).await?;
+        self.node
+            .download_certificates(info.requested_sent_certificate_hashes)
+            .await?
+            .into_iter()
+            .map(|c| {
+                ensure!(
+                    c.inner().chain_id() == chain_id,
+                    NodeError::UnexpectedCertificateValue
+                );
+                ConfirmedBlockCertificate::try_from(c)
+                    .map_err(|_| NodeError::InvalidChainInfoResponse)
+            })
+            .collect()
     }
 
     #[instrument(level = "trace")]
@@ -234,20 +229,6 @@ impl<N: ValidatorNode> RemoteNode<N> {
             .map(|blob| self.node.handle_pending_blob(chain_id, blob.into_content()));
         try_join_all(tasks).await?;
         Ok(())
-    }
-
-    /// Tries to download the given blobs from this node. Returns `None` if not all could be found.
-    #[instrument(level = "trace")]
-    pub(crate) async fn try_download_blobs(&self, blob_ids: &[BlobId]) -> Option<Vec<Blob>> {
-        let mut stream = blob_ids
-            .iter()
-            .map(|blob_id| self.try_download_blob(*blob_id))
-            .collect::<FuturesUnordered<_>>();
-        let mut blobs = Vec::new();
-        while let Some(maybe_blob) = stream.next().await {
-            blobs.push(maybe_blob?);
-        }
-        Some(blobs)
     }
 
     #[instrument(level = "trace")]

@@ -9,10 +9,7 @@ use linera_base::{
     ensure,
     identifiers::{AccountOwner, ChainId},
 };
-use linera_core::{
-    client::{ChainClient, PendingProposal},
-    Environment,
-};
+use linera_core::{client::PendingProposal, data_types::ChainInfo};
 use serde::{Deserialize, Serialize};
 
 use crate::{config::GenesisConfig, error, Error};
@@ -27,7 +24,9 @@ pub struct Wallet {
 impl Extend<UserChain> for Wallet {
     fn extend<Chains: IntoIterator<Item = UserChain>>(&mut self, chains: Chains) {
         for chain in chains.into_iter() {
-            self.insert(chain);
+            if !self.chains.contains_key(&chain.chain_id) {
+                self.insert(chain);
+            }
         }
     }
 }
@@ -79,6 +78,12 @@ impl Wallet {
         self.default
     }
 
+    pub fn first_non_admin_chain(&self) -> Option<ChainId> {
+        self.chain_ids()
+            .into_iter()
+            .find(|chain_id| *chain_id != self.genesis_config.admin_id())
+    }
+
     pub fn chain_ids(&self) -> Vec<ChainId> {
         self.chains.keys().copied().collect()
     }
@@ -93,10 +98,6 @@ impl Wallet {
 
     pub fn num_chains(&self) -> usize {
         self.chains.len()
-    }
-
-    pub fn last_chain(&self) -> Option<&UserChain> {
-        self.chains.values().last()
     }
 
     pub fn chains_mut(&mut self) -> impl Iterator<Item = &mut UserChain> {
@@ -130,21 +131,24 @@ impl Wallet {
         Ok(())
     }
 
-    pub fn update_from_state<Env: Environment>(&mut self, chain_client: &ChainClient<Env>) {
-        let client_owner = chain_client.preferred_owner();
-        let state = chain_client.state();
+    pub fn update_from_info(
+        &mut self,
+        pending_proposal: Option<PendingProposal>,
+        owner: Option<AccountOwner>,
+        info: &ChainInfo,
+    ) {
         self.insert(UserChain {
-            chain_id: chain_client.chain_id(),
-            owner: client_owner,
-            block_hash: state.block_hash(),
-            next_block_height: state.next_block_height(),
-            timestamp: state.timestamp(),
-            pending_proposal: state.pending_proposal().clone(),
+            chain_id: info.chain_id,
+            owner,
+            block_hash: info.block_hash,
+            next_block_height: info.next_block_height,
+            timestamp: info.timestamp,
+            pending_proposal,
         });
     }
 
     pub fn genesis_admin_chain(&self) -> ChainId {
-        self.genesis_config.admin_id
+        self.genesis_config.admin_id()
     }
 
     pub fn genesis_config(&self) -> &GenesisConfig {
