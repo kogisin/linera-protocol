@@ -34,10 +34,9 @@ use crate::{
     system::CreateApplicationResult,
     util::{ReceiverExt, UnboundedSenderExt},
     ApplicationDescription, ApplicationId, BaseRuntime, ContractRuntime, ExecutionError,
-    FinalizeContext, Message, MessageContext, MessageKind, ModuleId, Operation, OperationContext,
-    OutgoingMessage, QueryContext, QueryOutcome, ServiceRuntime, TransactionTracker,
-    UserContractCode, UserContractInstance, UserServiceCode, UserServiceInstance,
-    MAX_STREAM_NAME_LEN,
+    FinalizeContext, Message, MessageContext, MessageKind, ModuleId, Operation, OutgoingMessage,
+    QueryContext, QueryOutcome, ServiceRuntime, TransactionTracker, UserContractCode,
+    UserContractInstance, UserServiceCode, UserServiceInstance, MAX_STREAM_NAME_LEN,
 };
 
 #[cfg(test)]
@@ -442,7 +441,7 @@ impl SyncRuntimeInternal<UserContractInstance> {
         this: ContractSyncRuntimeHandle,
         authenticated: bool,
         callee_id: ApplicationId,
-    ) -> Result<(Arc<Mutex<UserContractInstance>>, OperationContext), ExecutionError> {
+    ) -> Result<Arc<Mutex<UserContractInstance>>, ExecutionError> {
         self.check_for_reentrancy(callee_id)?;
 
         ensure!(
@@ -465,15 +464,6 @@ impl SyncRuntimeInternal<UserContractInstance> {
             _ => None,
         };
         let authenticated_caller_id = authenticated.then_some(caller_id);
-        let timestamp = self.user_context;
-        let callee_context = OperationContext {
-            chain_id: self.chain_id,
-            authenticated_signer,
-            authenticated_caller_id,
-            height: self.height,
-            round: self.round,
-            timestamp,
-        };
         self.push_application(ApplicationStatus {
             caller_id: authenticated_caller_id,
             id: callee_id,
@@ -481,7 +471,7 @@ impl SyncRuntimeInternal<UserContractInstance> {
             // Allow further nested calls to be authenticated if this one is.
             signer: authenticated_signer,
         });
-        Ok((application.instance, callee_context))
+        Ok(application.instance)
     }
 
     /// Cleans up the runtime after the execution of a call to a different contract.
@@ -615,74 +605,101 @@ where
     type FindKeyValuesByPrefix = u32;
 
     fn chain_id(&mut self) -> Result<ChainId, ExecutionError> {
-        Ok(self.inner().chain_id)
+        let mut this = self.inner();
+        let chain_id = this.chain_id;
+        this.resource_controller.track_runtime_chain_id()?;
+        Ok(chain_id)
     }
 
     fn block_height(&mut self) -> Result<BlockHeight, ExecutionError> {
-        Ok(self.inner().height)
+        let mut this = self.inner();
+        let height = this.height;
+        this.resource_controller.track_runtime_block_height()?;
+        Ok(height)
     }
 
     fn application_id(&mut self) -> Result<ApplicationId, ExecutionError> {
-        Ok(self.inner().current_application().id)
+        let mut this = self.inner();
+        let application_id = this.current_application().id;
+        this.resource_controller.track_runtime_application_id()?;
+        Ok(application_id)
     }
 
     fn application_creator_chain_id(&mut self) -> Result<ChainId, ExecutionError> {
-        Ok(self
-            .inner()
-            .current_application()
-            .description
-            .creator_chain_id)
+        let mut this = self.inner();
+        let application_creator_chain_id = this.current_application().description.creator_chain_id;
+        this.resource_controller.track_runtime_application_id()?;
+        Ok(application_creator_chain_id)
     }
 
     fn application_parameters(&mut self) -> Result<Vec<u8>, ExecutionError> {
-        Ok(self
-            .inner()
-            .current_application()
-            .description
-            .parameters
-            .clone())
+        let mut this = self.inner();
+        let parameters = this.current_application().description.parameters.clone();
+        this.resource_controller
+            .track_runtime_application_parameters(&parameters)?;
+        Ok(parameters)
     }
 
     fn read_system_timestamp(&mut self) -> Result<Timestamp, ExecutionError> {
-        self.inner()
+        let mut this = self.inner();
+        let timestamp = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::SystemTimestamp { callback })?
-            .recv_response()
+            .recv_response()?;
+        this.resource_controller.track_runtime_timestamp()?;
+        Ok(timestamp)
     }
 
     fn read_chain_balance(&mut self) -> Result<Amount, ExecutionError> {
-        self.inner()
+        let mut this = self.inner();
+        let balance = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::ChainBalance { callback })?
-            .recv_response()
+            .recv_response()?;
+        this.resource_controller.track_runtime_balance()?;
+        Ok(balance)
     }
 
     fn read_owner_balance(&mut self, owner: AccountOwner) -> Result<Amount, ExecutionError> {
-        self.inner()
+        let mut this = self.inner();
+        let balance = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::OwnerBalance { owner, callback })?
-            .recv_response()
+            .recv_response()?;
+        this.resource_controller.track_runtime_balance()?;
+        Ok(balance)
     }
 
     fn read_owner_balances(&mut self) -> Result<Vec<(AccountOwner, Amount)>, ExecutionError> {
-        self.inner()
+        let mut this = self.inner();
+        let owner_balances = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::OwnerBalances { callback })?
-            .recv_response()
+            .recv_response()?;
+        this.resource_controller
+            .track_runtime_owner_balances(&owner_balances)?;
+        Ok(owner_balances)
     }
 
     fn read_balance_owners(&mut self) -> Result<Vec<AccountOwner>, ExecutionError> {
-        self.inner()
+        let mut this = self.inner();
+        let owners = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::BalanceOwners { callback })?
-            .recv_response()
+            .recv_response()?;
+        this.resource_controller.track_runtime_owners(&owners)?;
+        Ok(owners)
     }
 
     fn chain_ownership(&mut self) -> Result<ChainOwnership, ExecutionError> {
-        self.inner()
+        let mut this = self.inner();
+        let chain_ownership = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::ChainOwnership { callback })?
-            .recv_response()
+            .recv_response()?;
+        this.resource_controller
+            .track_runtime_chain_ownership(&chain_ownership)?;
+        Ok(chain_ownership)
     }
 
     fn contains_key_new(&mut self, key: Vec<u8>) -> Result<Self::ContainsKey, ExecutionError> {
@@ -1298,9 +1315,9 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         callee_id: ApplicationId,
         argument: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError> {
-        let (contract, _context) =
-            self.inner()
-                .prepare_for_call(self.clone(), authenticated, callee_id)?;
+        let contract = self
+            .inner()
+            .prepare_for_call(self.clone(), authenticated, callee_id)?;
 
         let value = contract
             .try_lock()
@@ -1561,7 +1578,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
 
         self.inner().transaction_tracker = txn_tracker_moved;
 
-        let (contract, _context) = self.inner().prepare_for_call(self.clone(), true, app_id)?;
+        let contract = self.inner().prepare_for_call(self.clone(), true, app_id)?;
 
         contract
             .try_lock()

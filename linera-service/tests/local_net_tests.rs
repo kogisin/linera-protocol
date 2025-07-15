@@ -22,7 +22,11 @@ use linera_base::{
     data_types::{Amount, BlockHeight, Epoch},
     identifiers::{Account, AccountOwner},
 };
+use linera_client::config::{
+    BlockExporterConfig, Destination, DestinationConfig, DestinationKind, LimitsConfig,
+};
 use linera_core::{data_types::ChainInfoQuery, node::ValidatorNode};
+use linera_rpc::config::{ExporterServiceConfig, TlsConfig};
 use linera_sdk::linera_base_types::AccountSecretKey;
 use linera_service::{
     cli_wrappers::{
@@ -210,26 +214,19 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
 
     let recipient =
         AccountOwner::from(AccountSecretKey::Secp256k1(Secp256k1SecretKey::generate()).public());
+    let account_recipient = Account::new(chain_2, recipient);
     client
         .transfer_with_accounts(
             Amount::from_tokens(5),
             Account::chain(chain_1),
-            Account::new(chain_2, recipient),
+            account_recipient,
         )
         .await?;
 
     if let Some(mut service) = node_service_2 {
         service.process_inbox(&chain_2).await?;
-        let query = format!(
-            "query {{ chain(chainId:\"{chain_2}\") {{
-                executionState {{ system {{ balances {{
-                    entry(key:\"{recipient}\") {{ value }}
-                }} }} }}
-            }} }}"
-        );
-        let response = service.query_node(query).await?;
-        let balances = &response["chain"]["executionState"]["system"]["balances"];
-        assert_eq!(balances["entry"]["value"].as_str(), Some("5."));
+        let balance = service.balance(&account_recipient).await?;
+        assert_eq!(balance, Amount::from_tokens(5));
         let committees = service.query_committees(&chain_2).await?;
         let epochs = committees.into_keys().collect::<Vec<_>>();
         assert_eq!(&epochs, &[Epoch(7)]);
@@ -239,9 +236,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         client_2.sync(chain_2).await?;
         client_2.process_inbox(chain_2).await?;
         assert_eq!(
-            client_2
-                .local_balance(Account::new(chain_2, recipient))
-                .await?,
+            client_2.local_balance(account_recipient).await?,
             Amount::from_tokens(5),
         );
     }
@@ -808,12 +803,14 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
     // Launch local benchmark using some additional chains.
     client
         .benchmark(BenchmarkCommand {
-            num_chains: 4,
+            num_chain_groups: Some(2),
             transactions_per_block: 10,
+            runtime_in_seconds: Some(1),
+            close_chains: true,
             ..Default::default()
         })
         .await?;
-    assert_eq!(client.load_wallet()?.num_chains(), 7);
+    assert_eq!(client.load_wallet()?.num_chains(), 3);
 
     // Now we run the benchmark again, with the fungible token application instead of the
     // native token.
@@ -835,9 +832,12 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
         .await?;
     client
         .benchmark(BenchmarkCommand {
-            num_chains: 5,
+            bps: 1,
+            num_chain_groups: Some(2),
             transactions_per_block: 10,
+            runtime_in_seconds: Some(1),
             fungible_application_id: Some(application_id.forget_abi()),
+            close_chains: true,
             ..Default::default()
         })
         .await?;
@@ -910,6 +910,199 @@ async fn test_sync_validator(config: LocalNetConfig) -> Result<()> {
     assert_eq!(
         state_after_sync.info.next_block_height,
         BlockHeight(BLOCKS_TO_CREATE as u64 + 1)
+    );
+
+    Ok(())
+}
+
+/// Tests if a validator can process blocks on a child chain without syncing the parent
+/// chain.
+// #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Udp) ; "scylladb_udp"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
+// #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+// #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
+// #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Tcp) ; "aws_tcp"))]
+// #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Udp) ; "aws_udp"))]
+#[test_log::test(tokio::test)]
+async fn test_sync_child_chain(config: LocalNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    const BLOCKS_TO_CREATE: usize = 5;
+    const LAGGING_VALIDATOR_INDEX: usize = 0;
+
+    let (mut net, client) = config.instantiate().await?;
+
+    // Stop a validator to force it to lag behind the others
+    net.stop_validator(LAGGING_VALIDATOR_INDEX).await?;
+
+    // Create some blocks
+    let sender_chain = client.default_chain().expect("Client has no default chain");
+    let (receiver_chain, _) = client
+        .open_chain(sender_chain, None, Amount::from_tokens(1_000))
+        .await?;
+
+    for amount in 1..=BLOCKS_TO_CREATE {
+        client
+            .transfer(
+                Amount::from_tokens(amount as u128),
+                sender_chain,
+                receiver_chain,
+            )
+            .await?;
+    }
+
+    // Create a second child chain at a point in the sender chain the stopped validator
+    // won't be aware of.
+    let (second_child_chain, _) = client
+        .open_chain(sender_chain, None, Amount::from_tokens(1000))
+        .await?;
+
+    for amount in 1..=BLOCKS_TO_CREATE {
+        client
+            .transfer(
+                Amount::from_tokens(amount as u128),
+                second_child_chain,
+                receiver_chain,
+            )
+            .await?;
+    }
+
+    // Restart the stopped validator
+    net.restart_validator(LAGGING_VALIDATOR_INDEX).await?;
+
+    let lagging_validator = net.validator_client(LAGGING_VALIDATOR_INDEX).await?;
+
+    let state_before_sync = lagging_validator
+        .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
+        .await?;
+    assert_eq!(state_before_sync.info.next_block_height, BlockHeight::ZERO);
+
+    // Synchronize the second chain without synchronizing the parent chain.
+    let validator_address = net.validator_address(LAGGING_VALIDATOR_INDEX);
+    client
+        .sync_validator([&second_child_chain], validator_address)
+        .await
+        .expect("Missing lagging validator name");
+
+    // The parent chain should remain out of sync.
+    let state_after_sync = lagging_validator
+        .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
+        .await?;
+    assert_eq!(state_after_sync.info.next_block_height, BlockHeight::ZERO);
+
+    // But the second child chain should be synchronized properly.
+    let second_chain_state_after_sync = lagging_validator
+        .handle_chain_info_query(ChainInfoQuery::new(second_child_chain))
+        .await?;
+    assert_eq!(
+        second_chain_state_after_sync.info.next_block_height,
+        BlockHeight(BLOCKS_TO_CREATE as u64)
+    );
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
+#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_update_validator_sender_gaps(config: LocalNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    const UNAWARE_VALIDATOR_INDEX: usize = 0;
+    const STOPPED_VALIDATOR_INDEX: usize = 1;
+
+    let (mut net, client) = config.instantiate().await?;
+
+    let sender_client = net.make_client().await;
+    sender_client.wallet_init(None).await?;
+
+    let sender_chain = client
+        .open_and_assign(&sender_client, Amount::from_tokens(1000))
+        .await?;
+
+    let receiver_client = net.make_client().await;
+    receiver_client.wallet_init(None).await?;
+
+    let receiver_chain = client
+        .open_and_assign(&receiver_client, Amount::from_tokens(1000))
+        .await?;
+
+    // Stop a validator so that it is not aware of the blocks on the sender chain
+    net.stop_validator(UNAWARE_VALIDATOR_INDEX).await?;
+
+    // Create some blocks
+    sender_client
+        .transfer(Amount::from_tokens(1), sender_chain, receiver_chain)
+        .await?;
+    // send to itself so that this doesn't generate messages to receiver_chain
+    sender_client
+        .transfer(Amount::from_tokens(2), sender_chain, sender_chain)
+        .await?;
+    // transfer some more to create a gap in the chain from the recipient's perspective
+    sender_client
+        .transfer(Amount::from_tokens(3), sender_chain, receiver_chain)
+        .await?;
+
+    receiver_client.process_inbox(receiver_chain).await?;
+
+    // Restart the stopped validator and stop another one.
+    net.restart_validator(UNAWARE_VALIDATOR_INDEX).await?;
+    net.stop_validator(STOPPED_VALIDATOR_INDEX).await?;
+
+    let unaware_validator = net.validator_client(UNAWARE_VALIDATOR_INDEX).await?;
+
+    let sender_state_before_sync = unaware_validator
+        .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
+        .await?;
+    assert_eq!(
+        sender_state_before_sync.info.next_block_height,
+        BlockHeight::ZERO
+    );
+
+    let receiver_state_before_sync = unaware_validator
+        .handle_chain_info_query(ChainInfoQuery::new(receiver_chain))
+        .await?;
+    assert_eq!(
+        receiver_state_before_sync.info.next_block_height,
+        BlockHeight::ZERO
+    );
+
+    // Try to send tokens from receiver to sender. Receiver should have a gap in the
+    // sender chain at this point.
+    receiver_client
+        .transfer(Amount::from_tokens(4), receiver_chain, sender_chain)
+        .await?;
+
+    // Synchronize the validator
+    let validator_address = net.validator_address(UNAWARE_VALIDATOR_INDEX);
+    receiver_client
+        .sync_validator([&receiver_chain], validator_address)
+        .await
+        .expect("Missing lagging validator name");
+
+    let sender_state_after_sync = unaware_validator
+        .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
+        .await?;
+    // The next block height should be 1 - only block 0 has been processed fully, block 2
+    // has only been preprocessed.
+    assert_eq!(
+        sender_state_after_sync.info.next_block_height,
+        BlockHeight(1)
+    );
+
+    let receiver_state_after_sync = unaware_validator
+        .handle_chain_info_query(ChainInfoQuery::new(receiver_chain))
+        .await?;
+    // On the receiver side, block 0 received the transfers from sender and block 1 made a
+    // transfer.
+    assert_eq!(
+        receiver_state_after_sync.info.next_block_height,
+        BlockHeight(2)
     );
 
     Ok(())
@@ -1067,16 +1260,53 @@ async fn test_linera_exporter(database: Database, network: Network) -> Result<()
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
 
+    let destination = Destination {
+        tls: TlsConfig::ClearText,
+        kind: DestinationKind::Validator,
+        endpoint: "127.0.0.1".to_owned(),
+        port: LocalNet::proxy_public_port(1, 0) as u16,
+    };
+
+    let destination_config = DestinationConfig {
+        committee_destination: false,
+        destinations: vec![destination],
+    };
+
+    let block_exporter_config = BlockExporterConfig {
+        destination_config,
+        id: 0,
+        service_config: ExporterServiceConfig {
+            host: "".to_owned(),
+            port: 0,
+        },
+        limits: LimitsConfig::default(),
+    };
+
     let config = LocalNetConfig {
         num_initial_validators: 1,
         num_shards: 1,
-        num_block_exporters: 1,
+        block_exporters: vec![block_exporter_config],
         ..LocalNetConfig::new_test(database, network)
     };
 
-    let (_net, client) = config.instantiate().await?;
+    let (mut net, client) = config.instantiate().await?;
+
+    net.generate_validator_config(1).await?;
+    net.start_validator(1).await?;
+
     let chain = client.default_chain().expect("Client has no default chain");
     client
         .transfer_with_silent_logs(1.into(), chain, chain)
-        .await
+        .await?;
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let validator_client = net.validator_client(1).await?;
+    let chain_info = validator_client
+        .handle_chain_info_query(ChainInfoQuery::new(chain))
+        .await?;
+
+    assert!(chain_info.info.next_block_height == 1.into());
+
+    Ok(())
 }

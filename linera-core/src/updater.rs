@@ -9,7 +9,10 @@ use std::{
     mem,
 };
 
-use futures::{stream, stream::TryStreamExt, Future, StreamExt};
+use futures::{
+    stream::{FuturesUnordered, TryStreamExt},
+    Future, StreamExt,
+};
 use linera_base::{
     data_types::{BlockHeight, Round},
     identifiers::{BlobId, ChainId},
@@ -20,7 +23,7 @@ use linera_chain::{
     types::{ConfirmedBlock, GenericCertificate, ValidatedBlock, ValidatedBlockCertificate},
 };
 use linera_execution::committee::Committee;
-use linera_storage::Storage;
+use linera_storage::{ResultReadCertificates, Storage};
 use thiserror::Error;
 
 use crate::{
@@ -71,7 +74,6 @@ pub struct ValidatorUpdater<A, S>
 where
     S: Storage,
 {
-    pub chain_worker_count: usize,
     pub remote_node: RemoteNode<A>,
     pub local_node: LocalNodeClient<S>,
 }
@@ -229,7 +231,7 @@ where
                 // The certificate is confirmed, so the blobs must be in storage.
                 let maybe_blobs = self.local_node.read_blobs_from_storage(blob_ids).await?;
                 let blobs = maybe_blobs.ok_or_else(|| original_err.clone())?;
-                self.remote_node.upload_blobs(blobs.clone()).await?;
+                self.remote_node.node.upload_blobs(blobs.clone()).await?;
                 self.remote_node
                     .handle_confirmed_certificate(certificate, delivery)
                     .await
@@ -364,9 +366,16 @@ where
         if !keys.is_empty() {
             // Send the requested certificates in order.
             let storage = self.local_node.storage_client();
-            let certs = storage.read_certificates(keys.into_iter()).await?;
-            for cert in certs {
-                self.send_confirmed_certificate(cert, delivery).await?;
+            let certificates = storage.read_certificates(keys.clone()).await?;
+            let certificates = match ResultReadCertificates::new(certificates, keys) {
+                ResultReadCertificates::Certificates(certificates) => certificates,
+                ResultReadCertificates::InvalidHashes(hashes) => {
+                    return Err(ChainClientError::ReadCertificatesError(hashes))
+                }
+            };
+            for certificate in certificates {
+                self.send_confirmed_certificate(certificate, delivery)
+                    .await?;
             }
         }
         if let Some(cert) = timeout {
@@ -384,16 +393,15 @@ where
         chain_heights: BTreeMap<ChainId, BlockHeight>,
         delivery: CrossChainMessageDelivery,
     ) -> Result<(), ChainClientError> {
-        let stream = stream::iter(chain_heights)
-            .map(|(chain_id, height)| {
+        let stream =
+            FuturesUnordered::from_iter(chain_heights.into_iter().map(|(chain_id, height)| {
                 let mut updater = self.clone();
                 async move {
                     updater
                         .send_chain_information(chain_id, height, delivery)
                         .await
                 }
-            })
-            .buffer_unordered(self.chain_worker_count);
+            }));
         stream.try_collect::<Vec<_>>().await?;
         Ok(())
     }

@@ -1,5 +1,6 @@
 ---
 source: linera-rpc/tests/format.rs
+assertion_line: 92
 expression: get_registry().unwrap()
 ---
 Account:
@@ -160,7 +161,9 @@ BlockBody:
           KEY:
             TYPENAME: ChainId
           VALUE:
-            TYPENAME: CryptoHash
+            TUPLE:
+              - TYPENAME: CryptoHash
+              - TYPENAME: BlockHeight
     - oracle_responses:
         SEQ:
           SEQ:
@@ -187,7 +190,9 @@ BlockExecutionOutcome:
           KEY:
             TYPENAME: ChainId
           VALUE:
-            TYPENAME: CryptoHash
+            TUPLE:
+              - TYPENAME: CryptoHash
+              - TYPENAME: BlockHeight
     - state_hash:
         TYPENAME: CryptoHash
     - oracle_responses:
@@ -544,12 +549,10 @@ InitialChainConfig:
         TYPENAME: ChainOwnership
     - epoch:
         TYPENAME: Epoch
-    - committees:
-        MAP:
-          KEY:
-            TYPENAME: Epoch
-          VALUE:
-            SEQ: U8
+    - min_active_epoch:
+        TYPENAME: Epoch
+    - max_active_epoch:
+        TYPENAME: Epoch
     - balance:
         TYPENAME: Amount
     - application_permissions:
@@ -648,6 +651,8 @@ NetworkDescription:
         TYPENAME: CryptoHash
     - genesis_timestamp:
         TYPENAME: Timestamp
+    - genesis_committee_blob_hash:
+        TYPENAME: CryptoHash
     - admin_chain_id:
         TYPENAME: ChainId
 NodeError:
@@ -736,8 +741,17 @@ NodeError:
     22:
       UnexpectedEntriesInBlobsNotFound: UNIT
     23:
-      EmptyBlobsNotFound: UNIT
+      UnexpectedCertificates:
+        STRUCT:
+          - returned:
+              SEQ:
+                TYPENAME: CryptoHash
+          - requested:
+              SEQ:
+                TYPENAME: CryptoHash
     24:
+      EmptyBlobsNotFound: UNIT
+    25:
       ResponseHandlingError:
         STRUCT:
           - error: STR
@@ -877,6 +891,8 @@ ResourceControlPolicy:
     - read_operation:
         TYPENAME: Amount
     - write_operation:
+        TYPENAME: Amount
+    - byte_runtime:
         TYPENAME: Amount
     - byte_read:
         TYPENAME: Amount

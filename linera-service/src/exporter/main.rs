@@ -25,6 +25,9 @@ mod runloops;
 mod state;
 mod storage;
 
+#[cfg(test)]
+mod test_utils;
+
 /// Options for running the linera block exporter.
 #[derive(clap::Parser, Debug, Clone)]
 #[command(
@@ -33,7 +36,7 @@ mod storage;
 )]
 struct ExporterOptions {
     /// Path to the TOML file describing the configuration for the block exporter.
-    #[arg(long = "config_path")]
+    #[arg(long)]
     config_path: PathBuf,
 
     /// Storage configuration for the blockchain history, chain states and binary blobs.
@@ -44,9 +47,9 @@ struct ExporterOptions {
     #[command(flatten)]
     common_storage_options: CommonStorageOptions,
 
-    /// Clients per thread
+    /// Maximum number of threads to use for exporters
     #[arg(long, default_value = "16")]
-    max_clients_per_thread: usize,
+    max_exporter_threads: usize,
 
     /// Timeout in milliseconds for sending queries.
     #[arg(long = "send-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
@@ -70,7 +73,6 @@ struct ExporterOptions {
 }
 
 struct ExporterContext {
-    clients_per_thread: usize,
     node_options: NodeOptions,
     config: BlockExporterConfig,
 }
@@ -86,31 +88,27 @@ impl Runnable for ExporterContext {
         let shutdown_notifier = CancellationToken::new();
         tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
 
-        let sender = start_block_processor_task(
+        let (sender, handle) = start_block_processor_task(
             storage,
             ExporterCancellationSignal::new(shutdown_notifier.clone()),
             self.config.limits,
             self.node_options,
             self.config.id,
-            self.clients_per_thread,
             self.config.destination_config,
         )?;
 
         let service = ExporterService::new(sender);
-        let port = self.config.service_config.port;
-        service.run(shutdown_notifier, port).await
+        service
+            .run(shutdown_notifier, self.config.service_config.port)
+            .await?;
+        handle.join().unwrap()
     }
 }
 
 impl ExporterContext {
-    fn new(
-        clients_per_thread: usize,
-        node_options: NodeOptions,
-        config: BlockExporterConfig,
-    ) -> ExporterContext {
+    fn new(node_options: NodeOptions, config: BlockExporterConfig) -> ExporterContext {
         Self {
             config,
-            clients_per_thread,
             node_options,
         }
     }
@@ -136,7 +134,13 @@ impl ExporterOptions {
             max_retries: self.max_retries,
         };
 
-        let context = ExporterContext::new(self.max_clients_per_thread, node_options, config);
+        let context = ExporterContext::new(node_options, config);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .thread_name("block-exporter-worker")
+            .worker_threads(self.max_exporter_threads)
+            .enable_all()
+            .build()?;
 
         let future = async {
             let store_config = self
@@ -147,9 +151,6 @@ impl ExporterOptions {
             store_config.run_with_storage(None, context).boxed().await
         };
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
         runtime.block_on(future)?.map_err(|e| e.into())
     }
 }

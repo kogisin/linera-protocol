@@ -1,8 +1,13 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{future::IntoFuture, time::Duration};
+use std::{
+    future::{Future, IntoFuture},
+    time::Duration,
+};
 
+use linera_client::config::DestinationId;
+use linera_execution::committee::Committee;
 use linera_storage::Storage;
 use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -11,35 +16,47 @@ use tokio::{
 
 use crate::{
     common::{BlockId, ExporterError},
-    runloops::block_processor::walker::Walker,
+    runloops::{block_processor::walker::Walker, ThreadPoolState},
     storage::BlockProcessorStorage,
 };
 
 mod walker;
 
-pub(super) struct BlockProcessor<T>
+pub(super) struct BlockProcessor<F, T>
 where
     T: Storage + Clone + Send + Sync + 'static,
 {
+    pool_state: ThreadPoolState<F, T>,
     storage: BlockProcessorStorage<T>,
     queue_rear: UnboundedSender<BlockId>,
     queue_front: UnboundedReceiver<BlockId>,
+    committee_destination_update: bool,
 }
 
-impl<T> BlockProcessor<T>
+impl<S, T> BlockProcessor<S, T>
 where
     T: Storage + Clone + Send + Sync + 'static,
+    S: IntoFuture<Output = ()> + Clone + Send + Sync + 'static,
+    <S as IntoFuture>::IntoFuture: Future<Output = ()> + Send + Sync + 'static,
 {
     pub(super) fn new(
+        pool_state: ThreadPoolState<S, T>,
         storage: BlockProcessorStorage<T>,
         queue_rear: UnboundedSender<BlockId>,
         queue_front: UnboundedReceiver<BlockId>,
+        committee_destination_update: bool,
     ) -> Self {
         Self {
             storage,
+            pool_state,
             queue_rear,
             queue_front,
+            committee_destination_update,
         }
+    }
+
+    pub(super) fn pool_state(self) -> ThreadPoolState<S, T> {
+        self.pool_state
     }
 
     pub(super) async fn run_with_shutdown<F>(
@@ -56,6 +73,8 @@ where
         let mut interval = interval(Duration::from_millis(persistence_period.into()));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+        self.pool_state.start_startup_exporters();
+
         loop {
             tokio::select! {
 
@@ -68,7 +87,36 @@ where
                 Some(next_block_notification) = self.queue_front.recv() => {
                     let walker = Walker::new(&mut self.storage);
                     match walker.walk(next_block_notification).await {
-                        Ok(_) => {},
+                        Ok(maybe_new_committee) if self.committee_destination_update => {
+                            tracing::trace!("new committee blob found, updating the committee destination.");
+                            if let Some(blob_id) = maybe_new_committee {
+                                let blob = match self.storage.get_blob(blob_id).await {
+                                    Ok(blob) => blob,
+                                    Err(error) => {
+                                        tracing::error!("unable to get the committee blob: {:?} from storage, , received error: {:?}", blob_id, error);
+                                        return Err(error);
+                                    },
+                                };
+
+                                let committee: Committee = match bcs::from_bytes(blob.bytes()) {
+                                    Ok(committee) => committee,
+                                    Err(e) => {
+                                        tracing::error!("unable to serialize the committee blob: {:?}, received error: {:?}", blob_id, e);
+                                        continue;
+                                    }
+                                };
+
+                                let committee_destinations = committee.validator_addresses().map(|(_, address)| DestinationId::validator(address.to_owned())).collect::<Vec<_>>();
+                                self.pool_state.shutdown_old_committee(committee_destinations.clone()).await;
+                                self.storage.new_committee(committee_destinations.clone());
+                                self.pool_state.start_committee_exporters(committee_destinations.clone());
+                            }
+                        },
+
+                        Ok(_) => {
+                            tracing::info!(block=?next_block_notification, "New committee blob found but exporter is not configured \
+                             to update the committee destination, skipping.");
+                        },
 
                         // this error variant is safe to retry as this block is already confirmed so this error will
                         // originate from things like missing dependencies or io error.
@@ -114,25 +162,34 @@ mod test {
     };
     use linera_client::config::LimitsConfig;
     use linera_sdk::test::MessageAction;
-    use linera_storage::{DbStorage, Storage};
+    use linera_storage::{DbStorage, Storage, TestClock};
     use linera_views::memory::MemoryStore;
     use tokio::sync::mpsc::unbounded_channel;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        common::BlockId, runloops::BlockProcessor, storage::BlockProcessorStorage,
+        common::BlockId,
+        runloops::{BlockProcessor, ThreadPoolState},
+        storage::BlockProcessorStorage,
+        test_utils::make_simple_state_with_blobs,
         ExporterCancellationSignal,
     };
 
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_topological_sort() -> anyhow::Result<()> {
         let (tx, rx) = unbounded_channel();
         let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
         let (block_processor_storage, exporter_storage) =
-            BlockProcessorStorage::load(storage.clone(), 0, 0, LimitsConfig::default()).await?;
-        let mut block_processor = BlockProcessor::new(block_processor_storage, tx.clone(), rx);
+            BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
+                .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
+        let pool_state = ThreadPoolState::<
+            ExporterCancellationSignal,
+            DbStorage<MemoryStore, TestClock>,
+        >::new(vec![], vec![]);
+        let mut block_processor =
+            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
         let (block_ids, state) = make_state(&storage).await;
         for id in block_ids {
             let _ = tx.send(id);
@@ -156,7 +213,7 @@ mod test {
         ];
 
         for (i, (x, y)) in expected_state.into_iter().enumerate() {
-            let hash = exporter_storage.get_block(i).await?.hash();
+            let hash = exporter_storage.get_block_with_blob_ids(i).await?.0.hash();
             assert_eq!(hash, state[x][y]);
         }
 
@@ -215,7 +272,7 @@ mod test {
                 let block_b = ConfirmedBlock::new(BlockExecutionOutcome::default().with(
                     make_child_block(chain_b.last().unwrap()).with_incoming_bundle(incoming_bundle),
                 ));
-                let block_id = get_block_id(&block_b);
+                let block_id = BlockId::from_confirmed_block(&block_b);
                 notifications.push(block_id);
                 block_b
             };
@@ -240,19 +297,21 @@ mod test {
         )
     }
 
-    fn get_block_id(block: &ConfirmedBlock) -> BlockId {
-        BlockId::new(block.chain_id(), block.inner().hash(), block.height())
-    }
-
-    #[tokio::test]
+    #[test_log::test(tokio::test)]
     async fn test_topological_sort_2() -> anyhow::Result<()> {
         let (tx, rx) = unbounded_channel();
         let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
         let (block_processor_storage, exporter_storage) =
-            BlockProcessorStorage::load(storage.clone(), 0, 0, LimitsConfig::default()).await?;
-        let mut block_processor = BlockProcessor::new(block_processor_storage, tx.clone(), rx);
+            BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
+                .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
+        let pool_state = ThreadPoolState::<
+            ExporterCancellationSignal,
+            DbStorage<MemoryStore, TestClock>,
+        >::new(vec![], vec![]);
+        let mut block_processor =
+            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
         let (block_id, state) = make_state_2(&storage).await;
         let _ = tx.send(block_id);
 
@@ -264,7 +323,7 @@ mod test {
         let expected_state = [(2, 0), (1, 0), (0, 0), (0, 1), (1, 1), (2, 1)];
 
         for (i, (x, y)) in expected_state.into_iter().enumerate() {
-            let hash = exporter_storage.get_block(i).await?.hash();
+            let hash = exporter_storage.get_block_with_blob_ids(i).await?.0.hash();
             assert_eq!(hash, state[x][y]);
         }
 
@@ -317,7 +376,7 @@ mod test {
                 .with(make_child_block(&block_1_c).with_incoming_bundle(get_bundle(&block_2_b))),
         );
 
-        let notification = get_block_id(&block_2_c);
+        let notification = BlockId::from_confirmed_block(&block_2_c);
 
         state.push(vec![block_1_a, block_2_a]);
         state.push(vec![block_1_b, block_2_b]);
@@ -345,10 +404,16 @@ mod test {
         let (tx, rx) = unbounded_channel();
         let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
         let (block_processor_storage, exporter_storage) =
-            BlockProcessorStorage::load(storage.clone(), 0, 0, LimitsConfig::default()).await?;
-        let mut block_processor = BlockProcessor::new(block_processor_storage, tx.clone(), rx);
+            BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
+                .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
+        let pool_state = ThreadPoolState::<
+            ExporterCancellationSignal,
+            DbStorage<MemoryStore, TestClock>,
+        >::new(vec![], vec![]);
+        let mut block_processor =
+            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
         let (block_id, state) = make_state_3(&storage).await;
         let _ = tx.send(block_id);
 
@@ -358,7 +423,11 @@ mod test {
         }
 
         for (index, expected_hash) in state.iter().enumerate() {
-            let sorted_hash = exporter_storage.get_block(index).await?.hash();
+            let sorted_hash = exporter_storage
+                .get_block_with_blob_ids(index)
+                .await?
+                .0
+                .hash();
             assert_eq!(*expected_hash, sorted_hash);
         }
 
@@ -387,7 +456,7 @@ mod test {
             chain.push(block);
         }
 
-        let notification = get_block_id(chain.last().unwrap());
+        let notification = BlockId::from_confirmed_block(chain.last().unwrap());
 
         for block in &chain {
             let cert = ConfirmedBlockCertificate::new(block.clone(), Round::Fast, vec![]);
@@ -408,10 +477,16 @@ mod test {
         let (tx, rx) = unbounded_channel();
         let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
         let (block_processor_storage, exporter_storage) =
-            BlockProcessorStorage::load(storage.clone(), 0, 0, LimitsConfig::default()).await?;
-        let mut block_processor = BlockProcessor::new(block_processor_storage, tx.clone(), rx);
+            BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
+                .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
+        let pool_state = ThreadPoolState::<
+            ExporterCancellationSignal,
+            DbStorage<MemoryStore, TestClock>,
+        >::new(vec![], vec![]);
+        let mut block_processor =
+            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
         let (block_id, state) = make_state_4(&storage).await;
         let _ = tx.send(block_id);
 
@@ -421,7 +496,11 @@ mod test {
         }
 
         for (index, expected_hash) in state.iter().enumerate() {
-            let sorted_hash = exporter_storage.get_block(index).await?.hash();
+            let sorted_hash = exporter_storage
+                .get_block_with_blob_ids(index)
+                .await?
+                .0
+                .hash();
             assert_eq!(*expected_hash, sorted_hash);
         }
 
@@ -470,7 +549,7 @@ mod test {
             chain.push(block);
         }
 
-        let notification = get_block_id(chain.last().unwrap());
+        let notification = BlockId::from_confirmed_block(chain.last().unwrap());
 
         for block in &chain {
             let cert = ConfirmedBlockCertificate::new(block.clone(), Round::Fast, vec![]);
@@ -484,5 +563,44 @@ mod test {
             notification,
             chain.iter().map(|block| block.inner().hash()).collect(),
         )
+    }
+
+    // tests a simple scenario for a chain with two blocks
+    // and some blobs
+    #[tokio::test]
+    async fn test_topological_sort_5() -> anyhow::Result<()> {
+        let (tx, rx) = unbounded_channel();
+        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
+        let (block_processor_storage, exporter_storage) =
+            BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
+                .await?;
+        let token = CancellationToken::new();
+        let signal = ExporterCancellationSignal::new(token.clone());
+        let pool_state = ThreadPoolState::<
+            ExporterCancellationSignal,
+            DbStorage<MemoryStore, TestClock>,
+        >::new(vec![], vec![]);
+        let mut block_processor =
+            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
+        let (block_id, expected_state) = make_simple_state_with_blobs(&storage).await;
+        let _ = tx.send(block_id);
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+            _ = block_processor.run_with_shutdown(signal, 5) => {},
+        }
+
+        for (i, block_with_blobs) in expected_state.iter().enumerate() {
+            let (actual_block, actual_blobs) = exporter_storage.get_block_with_blobs(i).await?;
+            assert_eq!(actual_block.hash(), block_with_blobs.block_hash);
+            assert!(!actual_blobs.is_empty());
+            assert_eq!(actual_blobs.len(), block_with_blobs.blobs.len());
+            assert!(actual_blobs
+                .iter()
+                .map(|blob| blob.id())
+                .eq(block_with_blobs.blobs.iter().copied()));
+        }
+
+        Ok(())
     }
 }

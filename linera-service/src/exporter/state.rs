@@ -1,12 +1,19 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
-use linera_base::{crypto::CryptoHash, data_types::BlockHeight, identifiers::ChainId};
+use dashmap::DashMap;
+use linera_base::{
+    data_types::BlockHeight,
+    identifiers::{BlobId, ChainId},
+};
 use linera_client::config::DestinationId;
 use linera_sdk::{
     ensure,
@@ -14,17 +21,21 @@ use linera_sdk::{
 };
 use linera_views::{
     context::Context, log_view::LogView, map_view::MapView, register_view::RegisterView,
-    views::ClonableView,
+    set_view::SetView, views::ClonableView,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::common::{BlockId, ExporterError, LiteBlockId};
+use crate::common::{BlockId, CanonicalBlock, ExporterError, LiteBlockId};
 
 /// State of the linera exporter as a view.
 #[derive(Debug, RootView, ClonableView)]
 pub struct BlockExporterStateView<C> {
     /// Ordered collection of block hashes from all microchains, as indexed by the exporter.
-    canonical_state: LogView<C, CryptoHash>,
+    canonical_state: LogView<C, CanonicalBlock>,
+    /// The global blob state.
+    /// These blobs have been seen, processed
+    /// and indexed by the exporter at least once.
+    blob_state: SetView<C, BlobId>,
     /// Tracks the highest block already processed with its hash.
     chain_states: MapView<C, ChainId, LiteBlockId>,
     /// The exporter state per destination.
@@ -37,18 +48,21 @@ where
 {
     pub async fn initiate(
         context: C,
-        number_of_destinations: u16,
-    ) -> Result<(Self, LogView<C, CryptoHash>, DestinationStates), ExporterError> {
+        destinations: Vec<DestinationId>,
+    ) -> Result<(Self, LogView<C, CanonicalBlock>, DestinationStates), ExporterError> {
         let mut view = BlockExporterStateView::load(context)
             .await
             .map_err(ExporterError::StateError)?;
+
+        let destinations_len = destinations.len();
+
         if view.destination_states.get().states.is_empty() {
-            let states = DestinationStates::new(number_of_destinations);
+            let states = DestinationStates::new(destinations);
             view.destination_states.set(states);
         }
 
         ensure!(
-            view.destination_states.get().states.len() == number_of_destinations as usize,
+            view.destination_states.get().states.len() == destinations_len,
             ExporterError::GenericError(
                 "inconsistent number of destinations in the toml file".into()
             )
@@ -58,6 +72,10 @@ where
         let canonical_state = view.canonical_state.clone_unchecked()?;
 
         Ok((view, canonical_state, states))
+    }
+
+    pub fn index_blob(&mut self, blob: BlobId) -> Result<(), ExporterError> {
+        Ok(self.blob_state.insert(&blob)?)
     }
 
     pub async fn index_block(&mut self, block: BlockId) -> Result<bool, ExporterError> {
@@ -100,6 +118,10 @@ where
         Ok(self.chain_states.get(chain_id).await?)
     }
 
+    pub async fn is_blob_indexed(&self, blob: BlobId) -> Result<bool, ExporterError> {
+        Ok(self.blob_state.contains(&blob).await?)
+    }
+
     pub fn set_destination_states(&mut self, destination_states: DestinationStates) {
         self.destination_states.set(destination_states);
     }
@@ -107,13 +129,13 @@ where
 
 #[derive(Debug, Clone)]
 pub(super) struct DestinationStates {
-    states: Arc<[AtomicU64]>,
+    states: Arc<DashMap<DestinationId, Arc<AtomicU64>>>,
 }
 
 impl Default for DestinationStates {
     fn default() -> Self {
         Self {
-            states: Arc::from([]),
+            states: Arc::new(DashMap::new()),
         }
     }
 }
@@ -121,7 +143,7 @@ impl Default for DestinationStates {
 #[derive(Serialize, Deserialize)]
 #[serde(rename = "DestinationStates")]
 struct SerializableDestinationStates {
-    states: Vec<u64>,
+    states: HashMap<DestinationId, u64>,
 }
 
 impl Serialize for DestinationStates {
@@ -132,8 +154,8 @@ impl Serialize for DestinationStates {
         let states = self
             .states
             .iter()
-            .map(|x| x.load(std::sync::atomic::Ordering::Acquire))
-            .collect::<Vec<_>>();
+            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Acquire)))
+            .collect::<HashMap<_, _>>();
 
         SerializableDestinationStates::serialize(
             &SerializableDestinationStates { states },
@@ -149,34 +171,39 @@ impl<'de> Deserialize<'de> for DestinationStates {
     {
         let SerializableDestinationStates { states } =
             SerializableDestinationStates::deserialize(deserializer)?;
-        let states = states
-            .iter()
-            .map(|state| AtomicU64::new(*state))
-            .collect::<Arc<_>>();
-        Ok(Self { states })
+        let map = DashMap::new();
+        for (id, state) in states {
+            map.insert(id, Arc::new(AtomicU64::new(state)));
+        }
+        Ok(Self {
+            states: Arc::from(map),
+        })
     }
 }
 
 impl DestinationStates {
-    pub fn new(number_of_destinations: u16) -> Self {
-        let slice = vec![0u64; number_of_destinations.into()]
+    fn new(destinations: Vec<DestinationId>) -> Self {
+        let states = destinations
             .into_iter()
-            .map(AtomicU64::new)
-            .collect::<Vec<_>>();
-        let states = Arc::from(slice);
-        Self { states }
-    }
-
-    pub fn increment_destination(&self, id: DestinationId) {
-        if let Some(atomic) = self.states.get(id as usize) {
-            let _ = atomic.fetch_add(1, Ordering::Release);
+            .map(|id| (id, Arc::new(AtomicU64::new(0))))
+            .collect::<DashMap<_, _>>();
+        Self {
+            states: Arc::from(states),
         }
     }
 
-    pub fn load_state(&self, id: DestinationId) -> u64 {
+    pub fn load_state(&self, id: &DestinationId) -> Arc<AtomicU64> {
         self.states
-            .get(id as usize)
-            .expect("DestinationId should correspond")
-            .load(Ordering::Acquire)
+            .get(id)
+            .unwrap_or_else(|| panic!("{:?} not found in DestinationStates", id))
+            .clone()
+    }
+
+    pub fn get(&self, id: &DestinationId) -> Option<Arc<AtomicU64>> {
+        self.states.get(id).map(|state| state.clone())
+    }
+
+    pub fn insert(&mut self, id: DestinationId, state: Arc<AtomicU64>) {
+        self.states.insert(id, state);
     }
 }

@@ -10,7 +10,6 @@ mod wasm;
 use std::{
     collections::{BTreeMap, BTreeSet},
     iter,
-    num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -81,20 +80,6 @@ use crate::{
 /// The test worker accepts blocks with a timestamp this far in the future.
 const TEST_GRACE_PERIOD_MICROS: u64 = 500_000;
 
-fn serialize_committees(
-    committees: impl IntoIterator<Item = (Epoch, Committee)>,
-) -> BTreeMap<Epoch, Vec<u8>> {
-    committees
-        .into_iter()
-        .map(|(epoch, committee)| {
-            (
-                epoch,
-                bcs::to_bytes(&committee).expect("serializing a committee should not fail"),
-            )
-        })
-        .collect()
-}
-
 struct TestEnvironment<S: Storage> {
     committee: Committee,
     worker: WorkerState<S>,
@@ -135,19 +120,26 @@ where
             balance: amount,
             ownership: ChainOwnership::single(account_secret.public().into()),
             epoch: Epoch::ZERO,
-            committees: serialize_committees([(Epoch::ZERO, committee.clone())]),
+            min_active_epoch: Epoch::ZERO,
+            max_active_epoch: Epoch::ZERO,
             application_permissions: Default::default(),
         };
         let admin_description = ChainDescription::new(origin, config, Timestamp::from(0));
+        let committee_blob = Blob::new_committee(bcs::to_bytes(&committee).unwrap());
         storage
             .write_blob(&Blob::new_chain_description(&admin_description))
             .await
             .expect("writing a blob should not fail");
         storage
+            .write_blob(&committee_blob)
+            .await
+            .expect("writing a blob should succeed");
+        storage
             .write_network_description(&NetworkDescription {
                 admin_chain_id: admin_description.id(),
                 genesis_config_hash: CryptoHash::test_hash("genesis config"),
                 genesis_timestamp: Timestamp::from(0),
+                genesis_committee_blob_hash: committee_blob.id().hash,
                 name: "test network".to_string(),
             })
             .await
@@ -157,7 +149,6 @@ where
             "Single validator node".to_string(),
             Some(validator_keypair.secret_key),
             storage,
-            NonZeroUsize::new(10).expect("Chain worker limit should not be zero"),
         )
         .with_allow_inactive_chains(is_client)
         .with_allow_messages_from_deprecated_epochs(is_client)
@@ -208,7 +199,8 @@ where
         let config = InitialChainConfig {
             epoch: self.admin_description.config().epoch,
             ownership,
-            committees: self.admin_description.config().committees.clone(),
+            min_active_epoch: self.admin_description.config().min_active_epoch,
+            max_active_epoch: self.admin_description.config().max_active_epoch,
             balance,
             application_permissions: Default::default(),
         };
@@ -237,7 +229,8 @@ where
         let config = InitialChainConfig {
             epoch: self.admin_description.config().epoch,
             ownership: ChainOwnership::single(owner),
-            committees: self.admin_description.config().committees.clone(),
+            min_active_epoch: self.admin_description.config().min_active_epoch,
+            max_active_epoch: self.admin_description.config().max_active_epoch,
             balance,
             application_permissions: Default::default(),
         };
@@ -283,7 +276,7 @@ where
         amount: Amount,
         incoming_bundles: Vec<IncomingBundle>,
         balance: Amount,
-        previous_confirmed_block: Option<&ConfirmedBlockCertificate>,
+        previous_confirmed_blocks: Vec<&ConfirmedBlockCertificate>,
     ) -> ConfirmedBlockCertificate {
         self.make_transfer_certificate_for_epoch(
             chain_description,
@@ -296,7 +289,7 @@ where
             Epoch::ZERO,
             balance,
             BTreeMap::new(),
-            previous_confirmed_block,
+            previous_confirmed_blocks,
         )
         .await
     }
@@ -313,7 +306,7 @@ where
         incoming_bundles: Vec<IncomingBundle>,
         balance: Amount,
         balances: BTreeMap<AccountOwner, Amount>,
-        previous_confirmed_block: Option<&ConfirmedBlockCertificate>,
+        previous_confirmed_blocks: Vec<&ConfirmedBlockCertificate>,
     ) -> ConfirmedBlockCertificate {
         self.make_transfer_certificate_for_epoch(
             chain_description,
@@ -326,7 +319,7 @@ where
             Epoch::ZERO,
             balance,
             balances,
-            previous_confirmed_block,
+            previous_confirmed_blocks,
         )
         .await
     }
@@ -348,7 +341,7 @@ where
         epoch: Epoch,
         balance: Amount,
         balances: BTreeMap<AccountOwner, Amount>,
-        previous_confirmed_block: Option<&ConfirmedBlockCertificate>,
+        previous_confirmed_blocks: Vec<&ConfirmedBlockCertificate>,
     ) -> ConfirmedBlockCertificate {
         let chain_id = chain_description.id();
         let system_state = SystemExecutionState {
@@ -359,7 +352,7 @@ where
             admin_id: Some(self.admin_id()),
             ..SystemExecutionState::new(chain_description)
         };
-        let block_template = match &previous_confirmed_block {
+        let block_template = match previous_confirmed_blocks.first() {
             None => make_first_block(chain_id),
             Some(cert) => make_child_block(cert.value()),
         };
@@ -424,13 +417,26 @@ where
             .iter()
             .flatten()
             .map(|message| message.destination)
-            .filter(|recipient| {
-                previous_confirmed_block
+            .filter_map(|recipient| {
+                previous_confirmed_blocks
                     .iter()
-                    .flat_map(|block| block.inner().block().body.messages.iter().flatten())
-                    .any(|message| message.destination == *recipient)
+                    .find(|block| {
+                        block
+                            .inner()
+                            .block()
+                            .body
+                            .messages
+                            .iter()
+                            .flatten()
+                            .any(|message| message.destination == recipient)
+                    })
+                    .map(|block| {
+                        (
+                            recipient,
+                            (block.hash(), block.inner().block().header.height),
+                        )
+                    })
             })
-            .map(|recipient| (recipient, previous_confirmed_block.unwrap().hash()))
             .collect();
         let value = ConfirmedBlock::new(
             BlockExecutionOutcome {
@@ -459,6 +465,9 @@ where
         SystemExecutionState {
             admin_id: Some(self.admin_id()),
             timestamp: description.timestamp(),
+            committees: [(Epoch::ZERO, self.committee.clone())]
+                .into_iter()
+                .collect(),
             ..SystemExecutionState::new(description.clone())
         }
     }
@@ -787,7 +796,7 @@ where
             Amount::ONE,
             Vec::new(),
             Amount::from_tokens(4),
-            None,
+            vec![],
         )
         .await;
     let block_proposal1 = make_child_block(certificate0.value())
@@ -866,6 +875,127 @@ where
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
 #[test_log::test(tokio::test)]
+async fn test_handle_block_proposal_sparse_chain<B>(mut storage_builder: B) -> anyhow::Result<()>
+where
+    B: StorageBuilder,
+{
+    let mut signer = InMemorySigner::new(None);
+    let sender_public_key = signer.generate_new();
+    let sender_owner = sender_public_key.into();
+    let mut env = TestEnvironment::new(storage_builder.build().await?, false, false).await;
+    let chain_desc = env
+        .add_root_chain(1, sender_owner, Amount::from_tokens(5))
+        .await;
+    let chain_1 = chain_desc.id();
+    let chain_2 = env.add_root_chain(2, sender_owner, Amount::ZERO).await.id();
+
+    let certificate0 = env
+        .make_simple_transfer_certificate(
+            chain_desc.clone(),
+            sender_public_key,
+            chain_2,
+            Amount::ONE,
+            Vec::new(),
+            Amount::from_tokens(4),
+            vec![],
+        )
+        .await;
+
+    let certificate1 = env
+        .make_simple_transfer_certificate(
+            chain_desc.clone(),
+            sender_public_key,
+            chain_1,
+            Amount::ONE,
+            Vec::new(),
+            Amount::from_tokens(3),
+            vec![&certificate0],
+        )
+        .await;
+
+    let certificate2 = env
+        .make_simple_transfer_certificate(
+            chain_desc.clone(),
+            sender_public_key,
+            chain_2,
+            Amount::ONE,
+            Vec::new(),
+            Amount::from_tokens(2),
+            vec![&certificate1, &certificate0],
+        )
+        .await;
+
+    let block_proposal1 = make_child_block(certificate2.value())
+        .with_simple_transfer(chain_2, Amount::from_tokens(1))
+        .into_first_proposal(sender_owner, &signer)
+        .await
+        .unwrap();
+
+    // The worker handles certificates 0 and 2 - this should succeed, and the worker
+    // should now have block 0 fully processed, and block 2 preprocessed.
+    env.worker()
+        .handle_confirmed_certificate(certificate0, None)
+        .await?;
+
+    env.worker()
+        .handle_confirmed_certificate(certificate2.clone(), None)
+        .await?;
+
+    let chain = env.worker().chain_state_view(chain_1).await?;
+    assert!(chain.is_active());
+    assert_eq!(chain.tip_state.get().next_block_height, BlockHeight(1));
+    drop(chain);
+
+    // The proposal is at height 3 - it should fail until the chain is fully processed up
+    // to height 2.
+    let proposal_result = env
+        .worker()
+        .handle_block_proposal(block_proposal1.clone())
+        .await;
+    assert_matches!(
+        proposal_result,
+        Err(WorkerError::ChainError(err)) if matches!(*err, ChainError::UnexpectedBlockHeight {
+            expected_block_height: BlockHeight(1),
+            found_block_height: BlockHeight(3)
+        })
+    );
+
+    // Handle the certificate in the gap.
+    env.worker()
+        .handle_confirmed_certificate(certificate1, None)
+        .await?;
+
+    let chain = env.worker().chain_state_view(chain_1).await?;
+    assert!(chain.is_active());
+    assert_eq!(chain.tip_state.get().next_block_height, BlockHeight(2));
+    drop(chain);
+
+    // ...and the one that has been preprocessed before, again, as it is not automatically
+    // re-processed.
+    env.worker()
+        .handle_confirmed_certificate(certificate2, None)
+        .await?;
+
+    let chain = env.worker().chain_state_view(chain_1).await?;
+    assert!(chain.is_active());
+    assert_eq!(chain.tip_state.get().next_block_height, BlockHeight(3));
+    drop(chain);
+
+    // The proposal should now succeed.
+    let proposal_result = env
+        .worker()
+        .handle_block_proposal(block_proposal1.clone())
+        .await;
+    assert_matches!(proposal_result, Ok(_));
+
+    Ok(())
+}
+
+#[test_case(MemoryStorageBuilder::default(); "memory")]
+#[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
+#[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
+#[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
+#[test_log::test(tokio::test)]
 async fn test_handle_block_proposal_with_incoming_bundles<B>(
     mut storage_builder: B,
 ) -> anyhow::Result<()>
@@ -915,7 +1045,10 @@ where
     let certificate1 = env.make_certificate(ConfirmedBlock::new(
         BlockExecutionOutcome {
             messages: vec![vec![direct_credit_message(chain_2, Amount::from_tokens(3))]],
-            previous_message_blocks: BTreeMap::from([(chain_2, certificate0.hash())]),
+            previous_message_blocks: BTreeMap::from([(
+                chain_2,
+                (certificate0.hash(), BlockHeight(0)),
+            )]),
             events: vec![Vec::new()],
             blobs: vec![Vec::new()],
             state_hash: SystemExecutionState {
@@ -933,12 +1066,12 @@ where
                 .with_authenticated_signer(Some(sender_owner)),
         ),
     ));
-    // Missing earlier blocks
+    // Missing earlier blocks, but the certificate will be preprocessed.
     assert_matches!(
         env.worker()
             .handle_confirmed_certificate(certificate1.clone(), None)
             .await,
-        Err(WorkerError::MissingEarlierBlocks { .. })
+        Ok(_)
     );
 
     // Run transfers
@@ -1374,7 +1507,7 @@ where
             Amount::from_tokens(5),
             Vec::new(),
             Amount::from_tokens(5),
-            None,
+            vec![],
         )
         .await;
     assert_matches!(
@@ -1464,7 +1597,7 @@ where
             Epoch::ZERO,
             Amount::ZERO,
             BTreeMap::new(),
-            None,
+            vec![],
         )
         .await;
     // This fails because `make_simple_transfer_certificate` uses `sender_key_pair.public()` to
@@ -1504,7 +1637,7 @@ where
             Amount::from_tokens(5),
             Vec::new(),
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
     // Replays are ignored.
@@ -1562,7 +1695,7 @@ where
                 action: MessageAction::Accept,
             }],
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
     env.worker()
@@ -1644,7 +1777,7 @@ where
             Amount::ONE,
             Vec::new(),
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
     env.worker()
@@ -1700,7 +1833,7 @@ where
             Amount::ONE,
             Vec::new(),
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
     env.worker()
@@ -1770,7 +1903,7 @@ where
             Amount::from_tokens(10),
             Vec::new(),
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
     env.worker()
@@ -1843,7 +1976,7 @@ where
             Amount::from_tokens(10),
             Vec::new(),
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
     assert!(env
@@ -1885,7 +2018,7 @@ where
             Amount::from_tokens(10),
             Vec::new(),
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
     // An inactive target chain is created and it acknowledges the message.
@@ -1971,7 +2104,7 @@ where
             Amount::from_tokens(5),
             Vec::new(),
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
 
@@ -2018,7 +2151,7 @@ where
                 action: MessageAction::Accept,
             }],
             Amount::from_tokens(4),
-            None,
+            vec![],
         )
         .await;
     env.worker()
@@ -2099,7 +2232,7 @@ where
             Amount::from_tokens(5),
             Vec::new(),
             Amount::ZERO,
-            None,
+            vec![],
         )
         .await;
 
@@ -2167,7 +2300,7 @@ where
             Vec::new(),
             Amount::ONE,
             BTreeMap::new(),
-            None,
+            vec![],
         )
         .await;
 
@@ -2201,7 +2334,7 @@ where
             }],
             Amount::ZERO,
             BTreeMap::from_iter([(sender, Amount::from_tokens(5))]),
-            Some(&certificate00),
+            vec![&certificate00],
         )
         .await;
 
@@ -2227,7 +2360,7 @@ where
             Vec::new(),
             Amount::ZERO,
             BTreeMap::from_iter([(sender, Amount::from_tokens(2))]),
-            Some(&certificate01),
+            vec![&certificate01, &certificate00],
         )
         .await;
 
@@ -2246,7 +2379,7 @@ where
             Vec::new(),
             Amount::ZERO,
             BTreeMap::new(),
-            Some(&certificate1),
+            vec![&certificate1, &certificate01, &certificate00],
         )
         .await;
 
@@ -2299,7 +2432,7 @@ where
             ],
             Amount::ZERO,
             BTreeMap::from_iter([(recipient, Amount::from_tokens(1))]),
-            None,
+            vec![],
         )
         .await;
 
@@ -2340,7 +2473,7 @@ where
             }],
             Amount::ZERO,
             BTreeMap::new(),
-            Some(&certificate2),
+            vec![&certificate2, &certificate1, &certificate01, &certificate00],
         )
         .await;
 
@@ -2911,7 +3044,7 @@ async fn test_cross_chain_helper() -> anyhow::Result<()> {
             Epoch::ZERO,
             Amount::ONE,
             BTreeMap::new(),
-            None,
+            vec![],
         )
         .await;
     let certificate1 = env
@@ -2926,7 +3059,7 @@ async fn test_cross_chain_helper() -> anyhow::Result<()> {
             Epoch::ZERO,
             Amount::ONE,
             BTreeMap::new(),
-            Some(&certificate0),
+            vec![&certificate0],
         )
         .await;
     let certificate2 = env
@@ -2941,7 +3074,7 @@ async fn test_cross_chain_helper() -> anyhow::Result<()> {
             Epoch::from(1),
             Amount::ONE,
             BTreeMap::new(),
-            Some(&certificate1),
+            vec![&certificate1, &certificate0],
         )
         .await;
     // Weird case: epoch going backward.
@@ -2957,7 +3090,7 @@ async fn test_cross_chain_helper() -> anyhow::Result<()> {
             Epoch::ZERO,
             Amount::ONE,
             BTreeMap::new(),
-            Some(&certificate2),
+            vec![&certificate2, &certificate1, &certificate0],
         )
         .await;
     let bundles0 = certificate0.message_bundles_for(id1).collect::<Vec<_>>();

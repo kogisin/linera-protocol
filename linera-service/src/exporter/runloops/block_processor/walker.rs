@@ -3,10 +3,16 @@
 
 use std::collections::HashSet;
 
+use linera_base::identifiers::{BlobId, BlobType};
 use linera_chain::types::{CertificateValue, ConfirmedBlock};
+use linera_execution::{system::AdminOperation, Operation, SystemOperation};
 use linera_storage::Storage;
 
-use crate::{common::BlockId, storage::BlockProcessorStorage, ExporterError};
+use crate::{
+    common::{BlockId, CanonicalBlock},
+    storage::BlockProcessorStorage,
+    ExporterError,
+};
 
 pub(super) struct Walker<'a, S>
 where
@@ -14,6 +20,7 @@ where
 {
     path: Vec<NodeVisitor>,
     visited: HashSet<BlockId>,
+    new_committee_blob: Option<BlobId>,
     storage: &'a mut BlockProcessorStorage<S>,
 }
 
@@ -23,17 +30,18 @@ where
 {
     pub(super) fn new(storage: &'a mut BlockProcessorStorage<S>) -> Self {
         Self {
+            storage,
             path: Vec::new(),
             visited: HashSet::new(),
-            storage,
+            new_committee_blob: None,
         }
     }
 
     /// Walks through the block's dependencies in a depth wise manner
     /// resolving, sorting and indexing all of them along the way.
-    pub(super) async fn walk(mut self, block: BlockId) -> Result<(), ExporterError> {
+    pub(super) async fn walk(mut self, block: BlockId) -> Result<Option<BlobId>, ExporterError> {
         if self.is_block_indexed(&block).await? {
-            return Ok(());
+            return Ok(None);
         }
 
         let node_visitor = self.get_processed_block_node(&block).await?;
@@ -43,7 +51,7 @@ where
                 continue;
             }
 
-            // resolve dependencies
+            // resolve block dependencies
             if let Some(dependency) = node_visitor.next_dependency() {
                 self.path.push(node_visitor);
                 if !self.is_block_indexed(&dependency).await? {
@@ -54,12 +62,33 @@ where
                 continue;
             }
 
+            // all the block dependecies have been resolved for this block
+            // now just resolve the blobs
+            let mut blobs_to_send = Vec::new();
+            let mut blobs_to_index_block_with = Vec::new();
+            for id in node_visitor.node.required_blobs {
+                if !self.is_blob_indexed(id).await? {
+                    blobs_to_index_block_with.push(id);
+                    if !node_visitor.node.created_blobs.contains(&id) {
+                        blobs_to_send.push(id);
+                    }
+                }
+            }
+
             let block_id = node_visitor.node.block;
+            if self.index_block(&block_id).await? {
+                let block_to_push = CanonicalBlock::new(block_id.hash, &blobs_to_send);
+                self.storage.push_block(block_to_push);
+                for blob in blobs_to_index_block_with {
+                    let _ = self.storage.index_blob(blob);
+                }
+            }
+
+            self.new_committee_blob = node_visitor.node.new_committee_blob;
             self.visited.insert(block_id);
-            self.index_block(&block_id).await?;
         }
 
-        Ok(())
+        Ok(self.new_committee_blob)
     }
 
     async fn get_processed_block_node(
@@ -80,9 +109,12 @@ where
         }
     }
 
-    async fn index_block(&mut self, block_id: &BlockId) -> Result<(), ExporterError> {
-        self.storage.index_block(block_id).await.unwrap();
-        Ok(())
+    async fn index_block(&mut self, block_id: &BlockId) -> Result<bool, ExporterError> {
+        self.storage.index_block(block_id).await
+    }
+
+    async fn is_blob_indexed(&mut self, blob_id: BlobId) -> Result<bool, ExporterError> {
+        self.storage.is_blob_indexed(blob_id).await
     }
 }
 
@@ -112,7 +144,15 @@ impl NodeVisitor {
 #[derive(Debug)]
 struct ProcessedBlock {
     block: BlockId,
+    // blobs created by this block
+    // used for filtering which blobs
+    // we won't need to send separately
+    // as these blobs are part of the block itself.
+    created_blobs: Vec<BlobId>,
+    // all the blobs required by this block
+    required_blobs: Vec<BlobId>,
     dependencies: Vec<BlockId>,
+    new_committee_blob: Option<BlobId>,
 }
 
 impl ProcessedBlock {
@@ -136,9 +176,26 @@ impl ProcessedBlock {
             .map(BlockId::from_incoming_bundle);
         dependencies.extend(message_senders);
 
+        let new_committee = block.block().body.operations.iter().find_map(|m| {
+            if let Operation::System(boxed) = m {
+                if let SystemOperation::Admin(AdminOperation::CreateCommittee {
+                    blob_hash, ..
+                }) = &**boxed
+                {
+                    let committee_blob = BlobId::new(*blob_hash, BlobType::Committee);
+                    return Some(committee_blob);
+                }
+            }
+
+            None
+        });
+
         Self {
             dependencies,
             block: block_id,
+            new_committee_blob: new_committee,
+            required_blobs: block.required_blob_ids().into_iter().collect(),
+            created_blobs: block.block().created_blob_ids().into_iter().collect(),
         }
     }
 }

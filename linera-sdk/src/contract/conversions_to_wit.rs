@@ -40,7 +40,7 @@ impl From<[u8; 20]> for wit_contract_api::Array20 {
         wit_contract_api::Array20 {
             part1: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
             part2: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
-            part3: u64::from_be_bytes(bytes[16..20].try_into().unwrap()),
+            part3: (u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as u64) << 32,
         }
     }
 }
@@ -136,6 +136,7 @@ impl From<Resources> for wit_contract_api::Resources {
             evm_fuel: resources.evm_fuel,
             read_operations: resources.read_operations,
             write_operations: resources.write_operations,
+            bytes_runtime: resources.bytes_runtime,
             bytes_to_read: resources.bytes_to_read,
             bytes_to_write: resources.bytes_to_write,
             blobs_to_read: resources.blobs_to_read,

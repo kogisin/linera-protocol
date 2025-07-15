@@ -50,6 +50,24 @@ impl AccountOwner {
     pub fn is_chain(&self) -> bool {
         self == &AccountOwner::CHAIN
     }
+
+    /// The size of the `AccountOwner`.
+    pub fn size(&self) -> u32 {
+        match self {
+            AccountOwner::Reserved(_) => 1,
+            AccountOwner::Address32(_) => 32,
+            AccountOwner::Address20(_) => 20,
+        }
+    }
+
+    /// Gets the EVM address if possible
+    #[cfg(with_revm)]
+    pub fn to_evm_address(&self) -> Option<Address> {
+        match self {
+            AccountOwner::Address20(address) => Some(Address::from(address)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(with_testing)]
@@ -937,6 +955,18 @@ impl<A> ApplicationId<A> {
     pub fn bytes32(&self) -> B256 {
         *self.application_description_hash.as_bytes()
     }
+
+    /// Returns whether the `ApplicationId` is the one of an EVM application.
+    pub fn is_evm(&self) -> bool {
+        let bytes = self.application_description_hash.as_bytes();
+        let bytes = bytes.0.as_ref();
+        for byte in &bytes[20..] {
+            if byte != &0 {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1108,7 +1138,8 @@ mod tests {
             epoch: Epoch::ZERO,
             ownership: ChainOwnership::single(AccountOwner::Reserved(0)),
             balance: Amount::ZERO,
-            committees: [(Epoch::ZERO, vec![])].into_iter().collect(),
+            min_active_epoch: Epoch::ZERO,
+            max_active_epoch: Epoch::ZERO,
             application_permissions: Default::default(),
         };
         let description = ChainDescription::new(
@@ -1118,7 +1149,7 @@ mod tests {
         );
         assert_eq!(
             description.id().to_string(),
-            "4423610c1010c31be88bc6cc041a9c1063d58062e9d748c1552a1e75e7ea13a9"
+            "fe947fddf2735224d01eb9d56580109f2d9d02397dc5ddd748ef9beeb38d9caa"
         );
     }
 

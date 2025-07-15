@@ -4,7 +4,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    num::NonZeroUsize,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
@@ -12,10 +11,7 @@ use std::{
 use futures::future::Either;
 use linera_base::{
     crypto::{CryptoError, CryptoHash, ValidatorPublicKey, ValidatorSecretKey},
-    data_types::{
-        ApplicationDescription, ArithmeticError, Blob, BlockHeight, DecompressionError, Epoch,
-        Round,
-    },
+    data_types::{ApplicationDescription, ArithmeticError, Blob, BlockHeight, Epoch, Round},
     doc_scalar,
     hashed::Hashed,
     identifiers::{AccountOwner, ApplicationId, BlobId, ChainId},
@@ -34,7 +30,6 @@ use linera_chain::{
 use linera_execution::{ExecutionError, ExecutionStateView, Query, QueryOutcome};
 use linera_storage::Storage;
 use linera_views::ViewError;
-use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, OwnedRwLockReadGuard};
@@ -152,6 +147,9 @@ pub enum WorkerError {
     #[error(transparent)]
     ViewError(#[from] ViewError),
 
+    #[error("Certificates are in confirmed_log but not in storage: {0:?}")]
+    ReadCertificatesError(Vec<CryptoHash>),
+
     #[error(transparent)]
     ChainError(#[from] Box<ChainError>),
 
@@ -170,14 +168,14 @@ pub enum WorkerError {
         expected_block_height: BlockHeight,
         found_block_height: BlockHeight,
     },
-    #[error("Cannot confirm a block before its predecessors: {current_block_height:?}")]
-    MissingEarlierBlocks { current_block_height: BlockHeight },
     #[error("Unexpected epoch {epoch:}: chain {chain_id:} is at {chain_epoch:}")]
     InvalidEpoch {
         chain_id: ChainId,
         chain_epoch: Epoch,
         epoch: Epoch,
     },
+    #[error("Proposal on chain {chain_id:} claims an unknown epoch {epoch:}")]
+    UnknownEpoch { chain_id: ChainId, epoch: Epoch },
 
     // Other server-side errors
     #[error("Invalid cross-chain request")]
@@ -223,8 +221,6 @@ pub enum WorkerError {
     UnexpectedBlob,
     #[error("Number of published blobs per block must not exceed {0}")]
     TooManyPublishedBlobs(u64),
-    #[error(transparent)]
-    Decompression(#[from] DecompressionError),
 }
 
 impl From<ChainError> for WorkerError {
@@ -289,7 +285,7 @@ where
     /// The set of spawned [`ChainWorkerActor`] tasks.
     chain_worker_tasks: Arc<Mutex<JoinSet>>,
     /// The cache of running [`ChainWorkerActor`]s.
-    chain_workers: Arc<Mutex<LruCache<ChainId, ChainActorEndpoint<StorageClient>>>>,
+    chain_workers: Arc<Mutex<BTreeMap<ChainId, ChainActorEndpoint<StorageClient>>>>,
 }
 
 impl<StorageClient> Clone for WorkerState<StorageClient>
@@ -328,7 +324,6 @@ where
         nickname: String,
         key_pair: Option<ValidatorSecretKey>,
         storage: StorageClient,
-        chain_worker_limit: NonZeroUsize,
     ) -> Self {
         WorkerState {
             nickname,
@@ -339,7 +334,7 @@ where
             tracked_chains: None,
             delivery_notifiers: Arc::default(),
             chain_worker_tasks: Arc::default(),
-            chain_workers: Arc::new(Mutex::new(LruCache::new(chain_worker_limit))),
+            chain_workers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -348,7 +343,6 @@ where
         nickname: String,
         storage: StorageClient,
         tracked_chains: Arc<RwLock<HashSet<ChainId>>>,
-        chain_worker_limit: NonZeroUsize,
     ) -> Self {
         WorkerState {
             nickname,
@@ -359,7 +353,7 @@ where
             tracked_chains: Some(tracked_chains),
             delivery_notifiers: Arc::default(),
             chain_worker_tasks: Arc::default(),
-            chain_workers: Arc::new(Mutex::new(LruCache::new(chain_worker_limit))),
+            chain_workers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -382,13 +376,22 @@ where
         self
     }
 
-    /// Returns an instance with the specified grace period, in microseconds.
+    /// Returns an instance with the specified grace period.
     ///
     /// Blocks with a timestamp this far in the future will still be accepted, but the validator
     /// will wait until that timestamp before voting.
-    #[instrument(level = "trace", skip(self, grace_period))]
+    #[instrument(level = "trace", skip(self))]
     pub fn with_grace_period(mut self, grace_period: Duration) -> Self {
         self.chain_worker_config.grace_period = grace_period;
+        self
+    }
+
+    /// Returns an instance with the specified chain worker TTL.
+    ///
+    /// Idle chain workers free their memory after that duration without requests.
+    #[instrument(level = "trace", skip(self))]
+    pub fn with_chain_worker_ttl(mut self, chain_worker_ttl: Duration) -> Self {
+        self.chain_worker_config.ttl = chain_worker_ttl;
         self
     }
 
@@ -709,7 +712,6 @@ where
                     Some(endpoint) => break endpoint,
                     None => sleep(Duration::from_millis(250)).await,
                 }
-                warn!("No chain worker candidates found for eviction, retrying...");
             }
         })
         .await
@@ -764,40 +766,10 @@ where
         if let Some(endpoint) = chain_workers.get(&chain_id) {
             Some((endpoint.clone(), None))
         } else {
-            if chain_workers.len() >= usize::from(chain_workers.cap()) {
-                let (chain_to_evict, _) = chain_workers
-                    .iter()
-                    .rev()
-                    .find(|(_, candidate_endpoint)| candidate_endpoint.strong_count() <= 1)?;
-                let chain_to_evict = *chain_to_evict;
-
-                chain_workers.pop(&chain_to_evict);
-                self.clean_up_finished_chain_workers(&chain_workers);
-            }
-
             let (sender, receiver) = mpsc::unbounded_channel();
-            chain_workers.push(chain_id, sender.clone());
-
+            chain_workers.insert(chain_id, sender.clone());
             Some((sender, Some(receiver)))
         }
-    }
-
-    /// Cleans up any finished chain workers and their delivery notifiers.
-    fn clean_up_finished_chain_workers(
-        &self,
-        active_chain_workers: &LruCache<ChainId, ChainActorEndpoint<StorageClient>>,
-    ) {
-        self.chain_worker_tasks
-            .lock()
-            .unwrap()
-            .reap_finished_tasks();
-
-        self.delivery_notifiers
-            .lock()
-            .unwrap()
-            .retain(|chain_id, notifier| {
-                !notifier.is_empty() || active_chain_workers.contains(chain_id)
-            });
     }
 
     #[instrument(skip_all, fields(
@@ -888,45 +860,6 @@ where
 
         self.process_confirmed_block(certificate, notify_when_messages_are_delivered)
             .await
-    }
-
-    /// Preprocesses a block without executing it. This does not update the execution state, but
-    /// can create cross-chain messages and store blobs. It also does _not_ check the signatures;
-    /// the caller is responsible for checking them using the correct committee.
-    #[instrument(skip_all, fields(
-        nick = self.nickname,
-        chain_id = format!("{:.8}", certificate.block().header.chain_id),
-        height = %certificate.block().header.height,
-    ))]
-    pub async fn fully_preprocess_certificate_with_notifications(
-        &self,
-        certificate: ConfirmedBlockCertificate,
-        notifier: &impl Notifier,
-    ) -> Result<(), WorkerError> {
-        trace!("{} <-- {:?} (preprocess)", self.nickname, certificate);
-
-        let notifications = (*notifier).clone();
-        let this = self.clone();
-        linera_base::task::spawn(async move {
-            let actions = this
-                .query_chain_worker(certificate.block().header.chain_id, move |callback| {
-                    ChainWorkerRequest::PreprocessCertificate {
-                        certificate,
-                        callback,
-                    }
-                })
-                .await?;
-            notifications.notify(&actions.notifications);
-            let mut requests = VecDeque::from(actions.cross_chain_requests);
-            while let Some(request) = requests.pop_front() {
-                let actions = this.handle_cross_chain_request(request).await?;
-                requests.extend(actions.cross_chain_requests);
-                notifications.notify(&actions.notifications);
-            }
-            Ok(())
-        })
-        .await
-        .unwrap_or_else(|_| Err(WorkerError::JoinError))
     }
 
     /// Processes a validated block certificate.

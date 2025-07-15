@@ -2,12 +2,12 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, iter::IntoIterator};
+use std::iter::IntoIterator;
 
 use linera_base::{
     crypto::{AccountPublicKey, BcsSignable, CryptoHash, ValidatorPublicKey, ValidatorSecretKey},
     data_types::{
-        Amount, ChainDescription, ChainOrigin, Epoch, InitialChainConfig, NetworkDescription,
+        Amount, Blob, ChainDescription, ChainOrigin, Epoch, InitialChainConfig, NetworkDescription,
         Timestamp,
     },
     identifiers::ChainId,
@@ -33,7 +33,7 @@ pub enum Error {
     #[error("persistence error: {0}")]
     Persistence(Box<dyn std::error::Error + Send + Sync>),
     #[error("storage is already initialized: {0:?}")]
-    StorageIsAlreadyInitialized(NetworkDescription),
+    StorageIsAlreadyInitialized(Box<NetworkDescription>),
     #[error("no admin chain configured")]
     NoAdminChain,
 }
@@ -102,23 +102,17 @@ pub struct GenesisConfig {
 impl BcsSignable<'_> for GenesisConfig {}
 
 fn make_chain(
-    committee: &Committee,
     index: u32,
     public_key: AccountPublicKey,
     balance: Amount,
     timestamp: Timestamp,
 ) -> ChainDescription {
-    let committees: BTreeMap<_, _> = [(
-        Epoch::ZERO,
-        bcs::to_bytes(committee).expect("serializing a committee should not fail"),
-    )]
-    .into_iter()
-    .collect();
     let origin = ChainOrigin::Root(index);
     let config = InitialChainConfig {
         application_permissions: Default::default(),
         balance,
-        committees: committees.clone(),
+        min_active_epoch: Epoch::ZERO,
+        max_active_epoch: Epoch::ZERO,
         epoch: Epoch::ZERO,
         ownership: ChainOwnership::single(public_key.into()),
     };
@@ -136,7 +130,7 @@ impl GenesisConfig {
         admin_balance: Amount,
     ) -> Self {
         let committee = committee.into_committee(policy);
-        let admin_chain = make_chain(&committee, 0, admin_public_key, admin_balance, timestamp);
+        let admin_chain = make_chain(0, admin_public_key, admin_balance, timestamp);
         Self {
             committee,
             timestamp,
@@ -151,7 +145,6 @@ impl GenesisConfig {
         balance: Amount,
     ) -> ChainDescription {
         let description = make_chain(
-            &self.committee,
             self.chains.len() as u32,
             public_key,
             balance,
@@ -178,9 +171,13 @@ impl GenesisConfig {
             .await
             .map_err(linera_chain::ChainError::from)?
         {
-            return Err(Error::StorageIsAlreadyInitialized(description));
+            return Err(Error::StorageIsAlreadyInitialized(Box::new(description)));
         }
         let network_description = self.network_description();
+        storage
+            .write_blob(&self.committee_blob())
+            .await
+            .map_err(linera_chain::ChainError::from)?;
         storage
             .write_network_description(&network_description)
             .await
@@ -195,11 +192,18 @@ impl GenesisConfig {
         CryptoHash::new(self)
     }
 
+    pub fn committee_blob(&self) -> Blob {
+        Blob::new_committee(
+            bcs::to_bytes(&self.committee).expect("serializing a committee should succeed"),
+        )
+    }
+
     pub fn network_description(&self) -> NetworkDescription {
         NetworkDescription {
             name: self.network_name.clone(),
             genesis_config_hash: CryptoHash::new(self),
             genesis_timestamp: self.timestamp,
+            genesis_committee_blob_hash: self.committee_blob().id().hash,
             admin_chain_id: self.admin_id(),
         }
     }
@@ -229,10 +233,41 @@ pub struct BlockExporterConfig {
 pub struct DestinationConfig {
     /// The destination URIs to export to.
     pub destinations: Vec<Destination>,
+    /// Export blocks to the current committee.
+    #[serde(default)]
+    pub committee_destination: bool,
 }
 
 // Each destination has an ID and a configuration.
-pub type DestinationId = u16;
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DestinationId {
+    address: String,
+    kind: DestinationKind,
+}
+
+impl DestinationId {
+    /// Creates a new destination ID from the address and kind.
+    pub fn new(address: String, kind: DestinationKind) -> Self {
+        Self { address, kind }
+    }
+
+    pub fn validator(address: String) -> Self {
+        Self {
+            address,
+            kind: DestinationKind::Validator,
+        }
+    }
+
+    /// Returns the address of the destination.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Returns the kind of the destination.
+    pub fn kind(&self) -> DestinationKind {
+        self.kind
+    }
+}
 
 /// The uri to provide export services to.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -243,17 +278,19 @@ pub struct Destination {
     pub endpoint: String,
     /// The port number of the target destination.
     pub port: u16,
+    /// The description for the gRPC based destination.
+    /// Discriminates the export mode and the client to use.
+    pub kind: DestinationKind,
 }
 
-impl Destination {
-    pub fn address(&self) -> String {
-        let tls = match self.tls {
-            TlsConfig::ClearText => "http",
-            TlsConfig::Tls => "https",
-        };
-
-        format!("{}://{}:{}", tls, self.endpoint, self.port)
-    }
+/// The description for the gRPC based destination.
+/// Discriminates the export mode and the client to use.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Copy, Hash)]
+pub enum DestinationKind {
+    /// The indexer description.
+    Indexer,
+    /// The validator description.
+    Validator,
 }
 
 /// The configuration file to impose various limits
@@ -289,6 +326,32 @@ impl Default for LimitsConfig {
             block_cache_weight_mb: 1024,
             block_cache_items_capacity: 8192,
             auxiliary_cache_size_mb: 1024,
+        }
+    }
+}
+
+impl Destination {
+    pub fn address(&self) -> String {
+        match self.kind {
+            DestinationKind::Indexer => {
+                let tls = match self.tls {
+                    TlsConfig::ClearText => "http",
+                    TlsConfig::Tls => "https",
+                };
+
+                format!("{}://{}:{}", tls, self.endpoint, self.port)
+            }
+
+            DestinationKind::Validator => {
+                format!("{}:{}:{}", "grpc", self.endpoint, self.port)
+            }
+        }
+    }
+
+    pub fn id(&self) -> DestinationId {
+        DestinationId {
+            address: self.address(),
+            kind: self.kind,
         }
     }
 }

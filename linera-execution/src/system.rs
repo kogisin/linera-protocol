@@ -120,13 +120,15 @@ impl OpenChainConfig {
     pub fn init_chain_config(
         &self,
         epoch: Epoch,
-        committees: BTreeMap<Epoch, Vec<u8>>,
+        min_active_epoch: Epoch,
+        max_active_epoch: Epoch,
     ) -> InitialChainConfig {
         InitialChainConfig {
             application_permissions: self.application_permissions.clone(),
             balance: self.balance,
-            committees,
             epoch,
+            min_active_epoch,
+            max_active_epoch,
             ownership: self.ownership.clone(),
         }
     }
@@ -336,19 +338,6 @@ where
         let epoch = self.epoch.get();
         let committee = self.committees.get().get(epoch)?;
         Some((*epoch, committee))
-    }
-
-    /// Returns a map of epochs to serialized_committees.
-    pub fn get_committees(&self) -> BTreeMap<Epoch, Vec<u8>> {
-        self.committees
-            .get()
-            .iter()
-            .map(|(epoch, committee)| {
-                let serialized_committee =
-                    bcs::to_bytes(committee).expect("Serializing a committee should not fail!");
-                (*epoch, serialized_committee)
-            })
-            .collect()
     }
 
     async fn get_event(&self, event_id: EventId) -> Result<Vec<u8>, ExecutionError> {
@@ -781,21 +770,19 @@ where
         let InitialChainConfig {
             ownership,
             epoch,
-            committees,
             balance,
+            min_active_epoch,
+            max_active_epoch,
             application_permissions,
         } = description.config().clone();
         self.timestamp.set(description.timestamp());
         self.description.set(Some(description));
         self.epoch.set(epoch);
-        let committees = committees
-            .into_iter()
-            .map(|(epoch, serialized_committee)| {
-                let committee = bcs::from_bytes(&serialized_committee)
-                    .expect("Deserializing a committee shouldn't fail");
-                (epoch, committee)
-            })
-            .collect();
+        let committees = self
+            .context()
+            .extra()
+            .committees_for(min_active_epoch..=max_active_epoch)
+            .await?;
         self.committees.set(committees);
         let admin_id = self
             .context()
@@ -842,8 +829,21 @@ where
             block_height,
             chain_index,
         };
-        let committees = self.get_committees();
-        let init_chain_config = config.init_chain_config(*self.epoch.get(), committees);
+        let init_chain_config = config.init_chain_config(
+            *self.epoch.get(),
+            self.committees
+                .get()
+                .keys()
+                .min()
+                .copied()
+                .unwrap_or(Epoch::ZERO),
+            self.committees
+                .get()
+                .keys()
+                .max()
+                .copied()
+                .unwrap_or(Epoch::ZERO),
+        );
         let chain_description = ChainDescription::new(chain_origin, init_chain_config, timestamp);
         let child_id = chain_description.id();
         self.debit(&AccountOwner::CHAIN, config.balance).await?;
