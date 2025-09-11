@@ -12,8 +12,8 @@ use crate::{
     common::{CustomSerialize, HasherOutput, Update},
     context::{BaseKey, Context},
     hashable_wrapper::WrappedHashableContainerView,
-    store::{KeyIterable, ReadableKeyValueStore as _},
-    views::{ClonableView, HashableView, Hasher, View, ViewError},
+    store::ReadableKeyValueStore as _,
+    views::{ClonableView, HashableView, Hasher, ReplaceContext, View, ViewError},
 };
 
 #[cfg(with_metrics)]
@@ -40,6 +40,21 @@ pub struct ByteSetView<C> {
     context: C,
     delete_storage_first: bool,
     updates: BTreeMap<Vec<u8>, Update<()>>,
+}
+
+impl<C: Context, C2: Context> ReplaceContext<C2> for ByteSetView<C> {
+    type Target = ByteSetView<C2>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        ByteSetView {
+            context: ctx(self.context()),
+            delete_storage_first: self.delete_storage_first,
+            updates: self.updates.clone(),
+        }
+    }
 }
 
 impl<C: Context> View for ByteSetView<C> {
@@ -111,12 +126,12 @@ impl<C: Context> View for ByteSetView<C> {
 }
 
 impl<C: Context> ClonableView for ByteSetView<C> {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(ByteSetView {
+    fn clone_unchecked(&mut self) -> Self {
+        ByteSetView {
             context: self.context.clone(),
             delete_storage_first: self.delete_storage_first,
             updates: self.updates.clone(),
-        })
+        }
     }
 }
 
@@ -266,29 +281,22 @@ impl<C: Context> ByteSetView<C> {
         let mut update = updates.next();
         if !self.delete_storage_first {
             let base = &self.context.base_key().bytes;
-            for index in self
-                .context
-                .store()
-                .find_keys_by_prefix(base)
-                .await?
-                .iterator()
-            {
-                let index = index?;
+            for index in self.context.store().find_keys_by_prefix(base).await? {
                 loop {
                     match update {
-                        Some((key, value)) if key.as_slice() <= index => {
+                        Some((key, value)) if key <= &index => {
                             if let Update::Set(_) = value {
                                 if !f(key)? {
                                     return Ok(());
                                 }
                             }
                             update = updates.next();
-                            if key == index {
+                            if key == &index {
                                 break;
                             }
                         }
                         _ => {
-                            if !f(index)? {
+                            if !f(&index)? {
                                 return Ok(());
                             }
                             break;
@@ -371,6 +379,20 @@ pub struct SetView<C, I> {
     _phantom: PhantomData<I>,
 }
 
+impl<C: Context, I: Send + Sync + Serialize, C2: Context> ReplaceContext<C2> for SetView<C, I> {
+    type Target = SetView<C2, I>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        SetView {
+            set: self.set.with_context(ctx).await,
+            _phantom: self._phantom,
+        }
+    }
+}
+
 impl<C: Context, I: Send + Sync + Serialize> View for SetView<C, I> {
     const NUM_INIT_KEYS: usize = ByteSetView::<C>::NUM_INIT_KEYS;
 
@@ -418,11 +440,11 @@ where
     C: Context,
     I: Send + Sync + Serialize,
 {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(SetView {
-            set: self.set.clone_unchecked()?,
+    fn clone_unchecked(&mut self) -> Self {
+        SetView {
+            set: self.set.clone_unchecked(),
             _phantom: PhantomData,
-        })
+        }
     }
 }
 
@@ -683,11 +705,11 @@ where
     C: Context,
     I: Send + Sync + CustomSerialize,
 {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(CustomSetView {
-            set: self.set.clone_unchecked()?,
+    fn clone_unchecked(&mut self) -> Self {
+        CustomSetView {
+            set: self.set.clone_unchecked(),
             _phantom: PhantomData,
-        })
+        }
     }
 }
 

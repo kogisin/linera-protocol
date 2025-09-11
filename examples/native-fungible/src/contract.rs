@@ -3,8 +3,10 @@
 
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-use fungible::{FungibleResponse, FungibleTokenAbi, InitialState, Operation, Parameters};
 use linera_sdk::{
+    abis::fungible::{
+        FungibleResponse, InitialState, NativeFungibleOperation, NativeFungibleTokenAbi, Parameters,
+    },
     linera_base_types::{Account, AccountOwner, ChainId, WithContractAbi},
     Contract, ContractRuntime,
 };
@@ -17,7 +19,7 @@ pub struct NativeFungibleTokenContract {
 linera_sdk::contract!(NativeFungibleTokenContract);
 
 impl WithContractAbi for NativeFungibleTokenContract {
-    type Abi = FungibleTokenAbi;
+    type Abi = NativeFungibleTokenAbi;
 }
 
 impl Contract for NativeFungibleTokenContract {
@@ -47,14 +49,16 @@ impl Contract for NativeFungibleTokenContract {
 
     async fn execute_operation(&mut self, operation: Self::Operation) -> Self::Response {
         match operation {
-            Operation::Balance { owner } => {
+            NativeFungibleOperation::Balance { owner } => {
                 let balance = self.runtime.owner_balance(owner);
                 FungibleResponse::Balance(balance)
             }
 
-            Operation::TickerSymbol => FungibleResponse::TickerSymbol(String::from(TICKER_SYMBOL)),
+            NativeFungibleOperation::TickerSymbol => {
+                FungibleResponse::TickerSymbol(String::from(TICKER_SYMBOL))
+            }
 
-            Operation::Transfer {
+            NativeFungibleOperation::Transfer {
                 owner,
                 amount,
                 target_account,
@@ -72,7 +76,7 @@ impl Contract for NativeFungibleTokenContract {
                 FungibleResponse::Ok
             }
 
-            Operation::Claim {
+            NativeFungibleOperation::Claim {
                 source_account,
                 amount,
                 target_account,
@@ -131,7 +135,7 @@ impl NativeFungibleTokenContract {
         }
     }
 
-    fn normalize_account(&self, account: fungible::Account) -> Account {
+    fn normalize_account(&self, account: Account) -> Account {
         Account {
             chain_id: account.chain_id,
             owner: account.owner,

@@ -1,8 +1,6 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(clippy::large_futures)]
-
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, bail, ensure, Result};
@@ -11,6 +9,8 @@ use futures::{FutureExt as _, SinkExt, StreamExt};
 use linera_base::listen_for_shutdown_signals;
 use linera_client::config::ValidatorServerConfig;
 use linera_core::{node::NodeError, JoinSetExt as _};
+#[cfg(with_metrics)]
+use linera_metrics::prometheus_server;
 use linera_rpc::{
     config::{
         NetworkProtocol, ShardConfig, ValidatorInternalNetworkPreConfig,
@@ -20,8 +20,6 @@ use linera_rpc::{
     RpcMessage,
 };
 use linera_sdk::linera_base_types::Blob;
-#[cfg(with_metrics)]
-use linera_service::prometheus_server;
 use linera_service::{
     storage::{CommonStorageOptions, Runnable, StorageConfig},
     util,
@@ -352,6 +350,41 @@ where
                 };
                 Ok(Some(RpcMessage::DownloadCertificatesResponse(certificates)))
             }
+            DownloadCertificatesByHeights(chain_id, heights) => {
+                let shard = self.internal_config.get_shard_for(chain_id).clone();
+                let protocol = self.internal_config.protocol;
+
+                let chain_info_query = RpcMessage::ChainInfoQuery(Box::new(
+                    linera_core::data_types::ChainInfoQuery::new(chain_id)
+                        .with_sent_certificate_hashes_by_heights(heights),
+                ));
+
+                let hashes = match Self::try_proxy_message(
+                    chain_info_query,
+                    shard.clone(),
+                    protocol,
+                    self.send_timeout,
+                    self.recv_timeout,
+                )
+                .await
+                {
+                    Ok(Some(RpcMessage::ChainInfoResponse(response))) => {
+                        response.info.requested_sent_certificate_hashes
+                    }
+                    _ => bail!("Failed to retrieve sent certificate hashes"),
+                };
+                let certificates = self.storage.read_certificates(hashes.clone()).await?;
+                let certificates = match ResultReadCertificates::new(certificates, hashes) {
+                    ResultReadCertificates::Certificates(certificates) => certificates,
+                    ResultReadCertificates::InvalidHashes(hashes) => {
+                        bail!("Missing certificates: {hashes:?}")
+                    }
+                };
+
+                Ok(Some(RpcMessage::DownloadCertificatesByHeightsResponse(
+                    certificates,
+                )))
+            }
             BlobLastUsedBy(blob_id) => {
                 let blob_state = self.storage.read_blob_state(*blob_id).await?;
                 let blob_state = blob_state.ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
@@ -361,6 +394,21 @@ where
                 Ok(Some(RpcMessage::BlobLastUsedByResponse(Box::new(
                     last_used_by,
                 ))))
+            }
+            BlobLastUsedByCertificate(blob_id) => {
+                let blob_state = self.storage.read_blob_state(*blob_id).await?;
+                let blob_state = blob_state.ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                let last_used_by = blob_state
+                    .last_used_by
+                    .ok_or_else(|| anyhow!("Blob not found {}", blob_id))?;
+                let certificate = self
+                    .storage
+                    .read_certificate(last_used_by)
+                    .await?
+                    .ok_or_else(|| anyhow!("Certificate not found {}", last_used_by))?;
+                Ok(Some(RpcMessage::BlobLastUsedByCertificateResponse(
+                    Box::new(certificate),
+                )))
             }
             MissingBlobIds(blob_ids) => Ok(Some(RpcMessage::MissingBlobIdsResponse(
                 self.storage.missing_blobs(&blob_ids).await?,
@@ -382,10 +430,14 @@ where
             | DownloadPendingBlobResponse(_)
             | HandlePendingBlob(_)
             | BlobLastUsedByResponse(_)
+            | BlobLastUsedByCertificateResponse(_)
             | MissingBlobIdsResponse(_)
             | DownloadConfirmedBlockResponse(_)
             | DownloadCertificatesResponse(_)
-            | UploadBlobResponse(_) => Err(anyhow::Error::from(NodeError::UnexpectedMessage)),
+            | UploadBlobResponse(_)
+            | DownloadCertificatesByHeightsResponse(_) => {
+                Err(anyhow::Error::from(NodeError::UnexpectedMessage))
+            }
         }
     }
 }
@@ -421,8 +473,7 @@ impl ProxyOptions {
     async fn run(&self) -> Result<()> {
         let store_config = self
             .storage_config
-            .add_common_storage_options(&self.common_storage_options)
-            .await?;
+            .add_common_storage_options(&self.common_storage_options)?;
         store_config
             .run_with_storage(None, ProxyContext::from_options(self)?)
             .boxed()

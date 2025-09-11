@@ -5,11 +5,10 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use fungible::{
-    Account, FungibleTokenAbi, InitialState, InitialStateBuilder, Operation, Parameters,
-};
+use fungible::{FungibleTokenAbi, InitialState, InitialStateBuilder, Parameters};
 use linera_sdk::{
-    linera_base_types::{AccountOwner, Amount},
+    abis::fungible::FungibleOperation,
+    linera_base_types::{Account, AccountOwner, Amount},
     test::{MessageAction, TestValidator},
 };
 
@@ -43,7 +42,7 @@ async fn test_cross_chain_transfer() {
         .add_block(|block| {
             block.with_operation(
                 application_id,
-                Operation::Transfer {
+                FungibleOperation::Transfer {
                     owner: sender_account,
                     amount: transfer_amount,
                     target_account: Account {
@@ -97,7 +96,7 @@ async fn test_bouncing_tokens() {
         .add_block(|block| {
             block.with_operation(
                 application_id,
-                Operation::Transfer {
+                FungibleOperation::Transfer {
                     owner: sender_account,
                     amount: transfer_amount,
                     target_account: Account {

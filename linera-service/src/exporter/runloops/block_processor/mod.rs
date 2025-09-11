@@ -6,17 +6,14 @@ use std::{
     time::Duration,
 };
 
-use linera_client::config::DestinationId;
 use linera_execution::committee::Committee;
+use linera_service::config::DestinationId;
 use linera_storage::Storage;
-use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
-    time::{interval, MissedTickBehavior},
-};
+use tokio::time::{interval, MissedTickBehavior};
 
 use crate::{
-    common::{BlockId, ExporterError},
-    runloops::{block_processor::walker::Walker, ThreadPoolState},
+    common::ExporterError,
+    runloops::{block_processor::walker::Walker, ExportersTracker, NewBlockQueue},
     storage::BlockProcessorStorage,
 };
 
@@ -26,10 +23,9 @@ pub(super) struct BlockProcessor<F, T>
 where
     T: Storage + Clone + Send + Sync + 'static,
 {
-    pool_state: ThreadPoolState<F, T>,
+    exporters_tracker: ExportersTracker<F, T>,
     storage: BlockProcessorStorage<T>,
-    queue_rear: UnboundedSender<BlockId>,
-    queue_front: UnboundedReceiver<BlockId>,
+    new_block_queue: NewBlockQueue,
     committee_destination_update: bool,
 }
 
@@ -40,23 +36,21 @@ where
     <S as IntoFuture>::IntoFuture: Future<Output = ()> + Send + Sync + 'static,
 {
     pub(super) fn new(
-        pool_state: ThreadPoolState<S, T>,
+        exporters_tracker: ExportersTracker<S, T>,
         storage: BlockProcessorStorage<T>,
-        queue_rear: UnboundedSender<BlockId>,
-        queue_front: UnboundedReceiver<BlockId>,
+        new_block_queue: NewBlockQueue,
         committee_destination_update: bool,
     ) -> Self {
         Self {
             storage,
-            pool_state,
-            queue_rear,
-            queue_front,
+            exporters_tracker,
             committee_destination_update,
+            new_block_queue,
         }
     }
 
-    pub(super) fn pool_state(self) -> ThreadPoolState<S, T> {
-        self.pool_state
+    pub(super) fn pool_state(self) -> ExportersTracker<S, T> {
+        self.exporters_tracker
     }
 
     pub(super) async fn run_with_shutdown<F>(
@@ -73,7 +67,7 @@ where
         let mut interval = interval(Duration::from_millis(persistence_period.into()));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        self.pool_state.start_startup_exporters();
+        self.exporters_tracker.start_startup_exporters();
 
         loop {
             tokio::select! {
@@ -84,7 +78,7 @@ where
 
                 _ = interval.tick() => self.storage.save().await?,
 
-                Some(next_block_notification) = self.queue_front.recv() => {
+                Some(next_block_notification) = self.new_block_queue.recv() => {
                     let walker = Walker::new(&mut self.storage);
                     match walker.walk(next_block_notification).await {
                         Ok(maybe_new_committee) if self.committee_destination_update => {
@@ -107,9 +101,9 @@ where
                                 };
 
                                 let committee_destinations = committee.validator_addresses().map(|(_, address)| DestinationId::validator(address.to_owned())).collect::<Vec<_>>();
-                                self.pool_state.shutdown_old_committee(committee_destinations.clone()).await;
+                                self.exporters_tracker.shutdown_old_committee(committee_destinations.clone());
                                 self.storage.new_committee(committee_destinations.clone());
-                                self.pool_state.start_committee_exporters(committee_destinations.clone());
+                                self.exporters_tracker.start_committee_exporters(committee_destinations.clone());
                             }
                         },
 
@@ -123,7 +117,7 @@ where
                         // Other error variants are either safe to skip or unreachable.
                         Err(ExporterError::ViewError(_)) => {
                             // return the block to the back of the task queue to process again later
-                            let _ = self.queue_rear.send(next_block_notification);
+                            self.new_block_queue.push_back(next_block_notification);
                         },
 
                         Err(e @ (ExporterError::UnprocessedChain
@@ -133,7 +127,10 @@ where
                             tracing::error!("error {:?} when resolving block with hash: {}", e, next_block_notification.hash)
                         },
 
-                        Err(e) => unreachable!("unexpected error: {:?}", e),
+                        Err(e) => {
+                            tracing::error!("unexpected error: {:?}", e);
+                            return Err(e);
+                        }
                     }
                 },
 
@@ -148,28 +145,28 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
-
     use linera_base::{
         crypto::CryptoHash,
         data_types::{Round, Timestamp},
         identifiers::ChainId,
+        time::Duration,
     };
     use linera_chain::{
         data_types::{BlockExecutionOutcome, IncomingBundle, MessageBundle},
         test::{make_child_block, make_first_block, BlockTestExt},
         types::{CertificateValue, ConfirmedBlock, ConfirmedBlockCertificate},
     };
-    use linera_client::config::LimitsConfig;
+    use linera_rpc::NodeOptions;
     use linera_sdk::test::MessageAction;
+    use linera_service::config::LimitsConfig;
     use linera_storage::{DbStorage, Storage, TestClock};
-    use linera_views::memory::MemoryStore;
+    use linera_views::memory::MemoryDatabase;
     use tokio::sync::mpsc::unbounded_channel;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
         common::BlockId,
-        runloops::{BlockProcessor, ThreadPoolState},
+        runloops::{BlockProcessor, ExportersTracker, NewBlockQueue},
         storage::BlockProcessorStorage,
         test_utils::make_simple_state_with_blobs,
         ExporterCancellationSignal,
@@ -178,18 +175,32 @@ mod test {
     #[test_log::test(tokio::test)]
     async fn test_topological_sort() -> anyhow::Result<()> {
         let (tx, rx) = unbounded_channel();
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
-        let (block_processor_storage, exporter_storage) =
+        let new_block_queue = NewBlockQueue {
+            queue_rear: tx.clone(),
+            queue_front: rx,
+        };
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(None).await;
+        let (block_processor_storage, mut exporter_storage) =
             BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
                 .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
-        let pool_state = ThreadPoolState::<
+        let exporters_tracker = ExportersTracker::<
             ExporterCancellationSignal,
-            DbStorage<MemoryStore, TestClock>,
-        >::new(vec![], vec![]);
-        let mut block_processor =
-            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
+            DbStorage<MemoryDatabase, TestClock>,
+        >::new(
+            NodeOptions::default(),
+            0,
+            signal.clone(),
+            exporter_storage.clone(),
+            vec![],
+        );
+        let mut block_processor = BlockProcessor::new(
+            exporters_tracker,
+            block_processor_storage,
+            new_block_queue,
+            false,
+        );
         let (block_ids, state) = make_state(&storage).await;
         for id in block_ids {
             let _ = tx.send(id);
@@ -300,18 +311,32 @@ mod test {
     #[test_log::test(tokio::test)]
     async fn test_topological_sort_2() -> anyhow::Result<()> {
         let (tx, rx) = unbounded_channel();
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
-        let (block_processor_storage, exporter_storage) =
+        let new_block_queue = NewBlockQueue {
+            queue_rear: tx.clone(),
+            queue_front: rx,
+        };
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(None).await;
+        let (block_processor_storage, mut exporter_storage) =
             BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
                 .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
-        let pool_state = ThreadPoolState::<
+        let exporters_tracker = ExportersTracker::<
             ExporterCancellationSignal,
-            DbStorage<MemoryStore, TestClock>,
-        >::new(vec![], vec![]);
-        let mut block_processor =
-            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
+            DbStorage<MemoryDatabase, TestClock>,
+        >::new(
+            NodeOptions::default(),
+            0,
+            signal.clone(),
+            exporter_storage.clone(),
+            vec![],
+        );
+        let mut block_processor = BlockProcessor::new(
+            exporters_tracker,
+            block_processor_storage,
+            new_block_queue,
+            false,
+        );
         let (block_id, state) = make_state_2(&storage).await;
         let _ = tx.send(block_id);
 
@@ -402,18 +427,32 @@ mod test {
     #[tokio::test]
     async fn test_topological_sort_3() -> anyhow::Result<()> {
         let (tx, rx) = unbounded_channel();
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
-        let (block_processor_storage, exporter_storage) =
+        let new_block_queue = NewBlockQueue {
+            queue_rear: tx.clone(),
+            queue_front: rx,
+        };
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(None).await;
+        let (block_processor_storage, mut exporter_storage) =
             BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
                 .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
-        let pool_state = ThreadPoolState::<
+        let exporters_tracker = ExportersTracker::<
             ExporterCancellationSignal,
-            DbStorage<MemoryStore, TestClock>,
-        >::new(vec![], vec![]);
-        let mut block_processor =
-            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
+            DbStorage<MemoryDatabase, TestClock>,
+        >::new(
+            NodeOptions::default(),
+            0,
+            signal.clone(),
+            exporter_storage.clone(),
+            vec![],
+        );
+        let mut block_processor = BlockProcessor::new(
+            exporters_tracker,
+            block_processor_storage,
+            new_block_queue,
+            false,
+        );
         let (block_id, state) = make_state_3(&storage).await;
         let _ = tx.send(block_id);
 
@@ -475,18 +514,32 @@ mod test {
     #[tokio::test]
     async fn test_topological_sort_4() -> anyhow::Result<()> {
         let (tx, rx) = unbounded_channel();
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
-        let (block_processor_storage, exporter_storage) =
+        let new_block_queue = NewBlockQueue {
+            queue_rear: tx.clone(),
+            queue_front: rx,
+        };
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(None).await;
+        let (block_processor_storage, mut exporter_storage) =
             BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
                 .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
-        let pool_state = ThreadPoolState::<
+        let exporters_tracker = ExportersTracker::<
             ExporterCancellationSignal,
-            DbStorage<MemoryStore, TestClock>,
-        >::new(vec![], vec![]);
-        let mut block_processor =
-            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
+            DbStorage<MemoryDatabase, TestClock>,
+        >::new(
+            NodeOptions::default(),
+            0,
+            signal.clone(),
+            exporter_storage.clone(),
+            vec![],
+        );
+        let mut block_processor = BlockProcessor::new(
+            exporters_tracker,
+            block_processor_storage,
+            new_block_queue,
+            false,
+        );
         let (block_id, state) = make_state_4(&storage).await;
         let _ = tx.send(block_id);
 
@@ -570,18 +623,32 @@ mod test {
     #[tokio::test]
     async fn test_topological_sort_5() -> anyhow::Result<()> {
         let (tx, rx) = unbounded_channel();
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
-        let (block_processor_storage, exporter_storage) =
+        let new_block_queue = NewBlockQueue {
+            queue_rear: tx.clone(),
+            queue_front: rx,
+        };
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(None).await;
+        let (block_processor_storage, mut exporter_storage) =
             BlockProcessorStorage::load(storage.clone(), 0, vec![], LimitsConfig::default())
                 .await?;
         let token = CancellationToken::new();
         let signal = ExporterCancellationSignal::new(token.clone());
-        let pool_state = ThreadPoolState::<
+        let exporters_tracker = ExportersTracker::<
             ExporterCancellationSignal,
-            DbStorage<MemoryStore, TestClock>,
-        >::new(vec![], vec![]);
-        let mut block_processor =
-            BlockProcessor::new(pool_state, block_processor_storage, tx.clone(), rx, false);
+            DbStorage<MemoryDatabase, TestClock>,
+        >::new(
+            NodeOptions::default(),
+            0,
+            signal.clone(),
+            exporter_storage.clone(),
+            vec![],
+        );
+        let mut block_processor = BlockProcessor::new(
+            exporters_tracker,
+            block_processor_storage,
+            new_block_queue,
+            false,
+        );
         let (block_id, expected_state) = make_simple_state_with_blobs(&storage).await;
         let _ = tx.send(block_id);
 

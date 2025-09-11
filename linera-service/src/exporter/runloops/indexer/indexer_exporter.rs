@@ -13,8 +13,8 @@ use std::{
 use futures::{stream::FuturesOrdered, StreamExt};
 use linera_base::data_types::Blob;
 use linera_chain::types::ConfirmedBlockCertificate;
-use linera_client::config::DestinationId;
 use linera_rpc::NodeOptions;
+use linera_service::config::DestinationId;
 use linera_storage::Storage;
 use tokio::{select, sync::mpsc::Sender, time::sleep};
 use tonic::Streaming;
@@ -25,44 +25,41 @@ use crate::{
     ExporterError,
 };
 
-pub(crate) struct Exporter<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
+pub(crate) struct Exporter {
     options: NodeOptions,
     work_queue_size: usize,
-    storage: ExporterStorage<S>,
     destination_id: DestinationId,
 }
 
-impl<S> Exporter<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
+impl Exporter {
     pub(crate) fn new(
-        options: NodeOptions,
-        work_queue_size: usize,
-        storage: ExporterStorage<S>,
         destination_id: DestinationId,
-    ) -> Exporter<S> {
+        work_queue_size: usize,
+        options: NodeOptions,
+    ) -> Exporter {
         Self {
             options,
-            storage,
             destination_id,
             work_queue_size,
         }
     }
 
-    pub(crate) async fn run_with_shutdown<F: IntoFuture<Output = ()>>(
+    pub(crate) async fn run_with_shutdown<S, F: IntoFuture<Output = ()>>(
         self,
         shutdown_signal: F,
-    ) -> anyhow::Result<()> {
+        mut storage: ExporterStorage<S>,
+    ) -> anyhow::Result<()>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
         let shutdown_signal_future = shutdown_signal.into_future();
         let mut pinned_shutdown_signal = Box::pin(shutdown_signal_future);
 
         let address = self.destination_id.address();
         let mut client = IndexerClient::new(address, self.options)?;
-        let destination_state = self.storage.load_destination_state(&self.destination_id);
+        let destination_state = storage.load_destination_state(&self.destination_id);
+
+        tracing::info!(start_index=&destination_state.load(Ordering::SeqCst), indexer_address=%address, "starting indexer exporter");
 
         loop {
             let (outgoing_stream, incoming_stream) =
@@ -71,7 +68,7 @@ where
                 self.work_queue_size,
                 destination_state.load(Ordering::Acquire) as usize,
                 outgoing_stream,
-                &self.storage,
+                storage.clone(),
             );
 
             let mut acknowledgement_task =
@@ -137,17 +134,17 @@ impl AcknowledgementTask {
     }
 }
 
-struct ExportTaskQueue<'a, S>
+struct ExportTaskQueue<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     queue_size: usize,
     start_height: usize,
     buffer: CanonicalBlockStream,
-    storage: &'a ExporterStorage<S>,
+    storage: ExporterStorage<S>,
 }
 
-impl<'a, S> ExportTaskQueue<'a, S>
+impl<S> ExportTaskQueue<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -155,8 +152,8 @@ where
         queue_size: usize,
         start_height: usize,
         sender: CanonicalBlockStream,
-        storage: &'a ExporterStorage<S>,
-    ) -> ExportTaskQueue<'a, S> {
+        storage: ExporterStorage<S>,
+    ) -> ExportTaskQueue<S> {
         Self {
             queue_size,
             start_height,

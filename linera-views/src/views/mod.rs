@@ -96,6 +96,16 @@ pub trait View: Sized {
     }
 }
 
+/// A view which can have its context replaced.
+pub trait ReplaceContext<C: crate::context::Context>: View {
+    /// The type returned after replacing the context.
+    type Target: View<Context = C>;
+
+    /// Returns a view with a replaced context.
+    async fn with_context(&mut self, ctx: impl FnOnce(&Self::Context) -> C + Clone)
+        -> Self::Target;
+}
+
 /// A view that supports hashing its values.
 #[cfg_attr(not(web), trait_variant::make(Send))]
 pub trait HashableView: View {
@@ -177,5 +187,5 @@ pub trait CryptoHashRootView: RootView + CryptoHashView {}
 pub trait ClonableView: View {
     /// Creates a clone of this view, sharing the underlying storage context but prone to
     /// data races which can corrupt the view state.
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError>;
+    fn clone_unchecked(&mut self) -> Self;
 }

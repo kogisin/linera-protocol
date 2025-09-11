@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 wasmer = ["linera-execution/wasmer", "linera-storage/wasmer"]
 wasmtime = ["linera-execution/wasmtime", "linera-storage/wasmtime"]
@@ -56,7 +59,6 @@ bcs.workspace = true
 cfg-if.workspace = true
 clap.workspace = true
 custom_debug_derive.workspace = true
-dashmap.workspace = true
 futures.workspace = true
 linera-base.workspace = true
 linera-chain.workspace = true
@@ -65,6 +67,7 @@ linera-storage.workspace = true
 linera-version.workspace = true
 linera-views.workspace = true
 lru.workspace = true
+papaya.workspace = true
 prometheus = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 rand = { workspace = true, features = ["std_rng"] }
@@ -93,9 +96,11 @@ assert_matches.workspace = true
 counter.workspace = true
 criterion.workspace = true
 fungible.workspace = true
+hex-game.workspace = true
 linera-core = { path = ".", default-features = false, features = ["test"] }
 linera-views.workspace = true
 meta-counter.workspace = true
+publish-read-data-blob.workspace = true
 serde_json.workspace = true
 sha3.workspace = true
 social.workspace = true

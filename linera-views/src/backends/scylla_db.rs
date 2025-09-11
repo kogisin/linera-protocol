@@ -14,7 +14,6 @@ use std::{
 };
 
 use async_lock::{Semaphore, SemaphoreGuard};
-use dashmap::DashMap;
 use futures::{future::join_all, StreamExt as _};
 use linera_base::ensure;
 use scylla::{
@@ -39,16 +38,19 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(with_metrics)]
-use crate::metering::MeteredStore;
+use crate::metering::MeteredDatabase;
 #[cfg(with_testing)]
-use crate::store::TestKeyValueStore;
+use crate::store::TestKeyValueDatabase;
 use crate::{
     batch::UnorderedBatch,
     common::{get_uleb128_size, get_upper_bound_option},
-    journaling::{DirectWritableKeyValueStore, JournalConsistencyError, JournalingKeyValueStore},
-    lru_caching::{LruCachingConfig, LruCachingStore},
-    store::{AdminKeyValueStore, KeyValueStoreError, ReadableKeyValueStore, WithError},
-    value_splitting::{ValueSplittingError, ValueSplittingStore},
+    journaling::{JournalConsistencyError, JournalingKeyValueDatabase},
+    lru_caching::{LruCachingConfig, LruCachingDatabase},
+    store::{
+        DirectWritableKeyValueStore, KeyValueDatabase, KeyValueStoreError, ReadableKeyValueStore,
+        WithError,
+    },
+    value_splitting::{ValueSplittingDatabase, ValueSplittingError},
     FutureSyncExt as _,
 };
 
@@ -112,8 +114,8 @@ struct ScyllaDbClient {
     find_keys_by_prefix_bounded: PreparedStatement,
     find_key_values_by_prefix_unbounded: PreparedStatement,
     find_key_values_by_prefix_bounded: PreparedStatement,
-    multi_key_values: DashMap<usize, PreparedStatement>,
-    multi_keys: DashMap<usize, PreparedStatement>,
+    multi_key_values: papaya::HashMap<usize, PreparedStatement>,
+    multi_keys: papaya::HashMap<usize, PreparedStatement>,
 }
 
 impl ScyllaDbClient {
@@ -202,8 +204,8 @@ impl ScyllaDbClient {
             find_keys_by_prefix_bounded,
             find_key_values_by_prefix_unbounded,
             find_key_values_by_prefix_bounded,
-            multi_key_values: DashMap::new(),
-            multi_keys: DashMap::new(),
+            multi_key_values: papaya::HashMap::new(),
+            multi_keys: papaya::HashMap::new(),
         })
     }
 
@@ -240,7 +242,7 @@ impl ScyllaDbClient {
         &self,
         num_markers: usize,
     ) -> Result<PreparedStatement, ScyllaDbStoreInternalError> {
-        if let Some(prepared_statement) = self.multi_key_values.get(&num_markers) {
+        if let Some(prepared_statement) = self.multi_key_values.pin().get(&num_markers) {
             return Ok(prepared_statement.clone());
         }
         let markers = std::iter::repeat_n("?", num_markers)
@@ -254,6 +256,7 @@ impl ScyllaDbClient {
             ))
             .await?;
         self.multi_key_values
+            .pin()
             .insert(num_markers, prepared_statement.clone());
         Ok(prepared_statement)
     }
@@ -262,7 +265,7 @@ impl ScyllaDbClient {
         &self,
         num_markers: usize,
     ) -> Result<PreparedStatement, ScyllaDbStoreInternalError> {
-        if let Some(prepared_statement) = self.multi_keys.get(&num_markers) {
+        if let Some(prepared_statement) = self.multi_keys.pin().get(&num_markers) {
             return Ok(prepared_statement.clone());
         };
         let markers = std::iter::repeat_n("?", num_markers)
@@ -276,6 +279,7 @@ impl ScyllaDbClient {
             ))
             .await?;
         self.multi_keys
+            .pin()
             .insert(num_markers, prepared_statement.clone());
         Ok(prepared_statement)
     }
@@ -526,6 +530,18 @@ pub struct ScyllaDbStoreInternal {
     root_key: Vec<u8>,
 }
 
+/// Database-level connection to ScyllaDB for managing namespaces and partitions.
+#[derive(Clone)]
+pub struct ScyllaDbDatabaseInternal {
+    store: Arc<ScyllaDbClient>,
+    semaphore: Option<Arc<Semaphore>>,
+    max_stream_queries: usize,
+}
+
+impl WithError for ScyllaDbDatabaseInternal {
+    type Error = ScyllaDbStoreInternalError;
+}
+
 /// The error type for [`ScyllaDbStoreInternal`]
 #[derive(Error, Debug)]
 pub enum ScyllaDbStoreInternalError {
@@ -600,8 +616,6 @@ impl WithError for ScyllaDbStoreInternal {
 
 impl ReadableKeyValueStore for ScyllaDbStoreInternal {
     const MAX_KEY_SIZE: usize = MAX_KEY_SIZE;
-    type Keys = Vec<Vec<u8>>;
-    type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn max_stream_queries(&self) -> usize {
         self.max_stream_queries
@@ -667,7 +681,7 @@ impl ReadableKeyValueStore for ScyllaDbStoreInternal {
     async fn find_keys_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::Keys, ScyllaDbStoreInternalError> {
+    ) -> Result<Vec<Vec<u8>>, ScyllaDbStoreInternalError> {
         let store = self.store.deref();
         let _guard = self.acquire().await;
         store
@@ -678,7 +692,7 @@ impl ReadableKeyValueStore for ScyllaDbStoreInternal {
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::KeyValues, ScyllaDbStoreInternalError> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ScyllaDbStoreInternalError> {
         let store = self.store.deref();
         let _guard = self.acquire().await;
         store
@@ -726,8 +740,9 @@ pub struct ScyllaDbStoreInternalConfig {
     pub replication_factor: u32,
 }
 
-impl AdminKeyValueStore for ScyllaDbStoreInternal {
+impl KeyValueDatabase for ScyllaDbDatabaseInternal {
     type Config = ScyllaDbStoreInternalConfig;
+    type Store = ScyllaDbStoreInternal;
 
     fn get_name() -> String {
         "scylladb internal".to_string()
@@ -745,8 +760,19 @@ impl AdminKeyValueStore for ScyllaDbStoreInternal {
             .max_concurrent_queries
             .map(|n| Arc::new(Semaphore::new(n)));
         let max_stream_queries = config.max_stream_queries;
-        let root_key = get_big_root_key(&[]);
         Ok(Self {
+            store,
+            semaphore,
+            max_stream_queries,
+        })
+    }
+
+    fn open_shared(&self, root_key: &[u8]) -> Result<Self::Store, ScyllaDbStoreInternalError> {
+        let store = self.store.clone();
+        let semaphore = self.semaphore.clone();
+        let max_stream_queries = self.max_stream_queries;
+        let root_key = get_big_root_key(root_key);
+        Ok(ScyllaDbStoreInternal {
             store,
             semaphore,
             max_stream_queries,
@@ -754,17 +780,8 @@ impl AdminKeyValueStore for ScyllaDbStoreInternal {
         })
     }
 
-    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self, ScyllaDbStoreInternalError> {
-        let store = self.store.clone();
-        let semaphore = self.semaphore.clone();
-        let max_stream_queries = self.max_stream_queries;
-        let root_key = get_big_root_key(root_key);
-        Ok(Self {
-            store,
-            semaphore,
-            max_stream_queries,
-            root_key,
-        })
+    fn open_exclusive(&self, root_key: &[u8]) -> Result<Self::Store, ScyllaDbStoreInternalError> {
+        self.open_shared(root_key)
     }
 
     async fn list_all(config: &Self::Config) -> Result<Vec<String>, ScyllaDbStoreInternalError> {
@@ -962,7 +979,9 @@ impl ScyllaDbStoreInternal {
             Some(count) => Some(count.acquire().await),
         }
     }
+}
 
+impl ScyllaDbDatabaseInternal {
     fn check_namespace(namespace: &str) -> Result<(), ScyllaDbStoreInternalError> {
         if !namespace.is_empty()
             && namespace.len() <= 48
@@ -977,7 +996,7 @@ impl ScyllaDbStoreInternal {
 }
 
 #[cfg(with_testing)]
-impl TestKeyValueStore for JournalingKeyValueStore<ScyllaDbStoreInternal> {
+impl TestKeyValueDatabase for JournalingKeyValueDatabase<ScyllaDbDatabaseInternal> {
     async fn new_test_config() -> Result<ScyllaDbStoreInternalConfig, ScyllaDbStoreInternalError> {
         // TODO(#4114): Read the port from an environment variable.
         let uri = "localhost:9042".to_string();
@@ -990,23 +1009,26 @@ impl TestKeyValueStore for JournalingKeyValueStore<ScyllaDbStoreInternal> {
     }
 }
 
-/// The `ScyllaDbStore` composed type with metrics
+/// The `ScyllaDbDatabase` composed type with metrics
 #[cfg(with_metrics)]
-pub type ScyllaDbStore = MeteredStore<
-    LruCachingStore<
-        MeteredStore<
-            ValueSplittingStore<MeteredStore<JournalingKeyValueStore<ScyllaDbStoreInternal>>>,
+pub type ScyllaDbDatabase = MeteredDatabase<
+    LruCachingDatabase<
+        MeteredDatabase<
+            ValueSplittingDatabase<
+                MeteredDatabase<JournalingKeyValueDatabase<ScyllaDbDatabaseInternal>>,
+            >,
         >,
     >,
 >;
 
-/// The `ScyllaDbStore` composed type
+/// The `ScyllaDbDatabase` composed type
 #[cfg(not(with_metrics))]
-pub type ScyllaDbStore =
-    LruCachingStore<ValueSplittingStore<JournalingKeyValueStore<ScyllaDbStoreInternal>>>;
+pub type ScyllaDbDatabase = LruCachingDatabase<
+    ValueSplittingDatabase<JournalingKeyValueDatabase<ScyllaDbDatabaseInternal>>,
+>;
 
 /// The `ScyllaDbStoreConfig` input type
 pub type ScyllaDbStoreConfig = LruCachingConfig<ScyllaDbStoreInternalConfig>;
 
-/// The combined error type for the `ScyllaDbStore`.
+/// The combined error type for the `ScyllaDbDatabase`.
 pub type ScyllaDbStoreError = ValueSplittingError<ScyllaDbStoreInternalError>;

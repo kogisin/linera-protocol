@@ -5,27 +5,27 @@ use std::future::{Future, IntoFuture};
 
 use block_processor::BlockProcessor;
 use indexer::indexer_exporter::Exporter as IndexerExporter;
-use linera_client::config::{DestinationConfig, LimitsConfig};
 use linera_rpc::NodeOptions;
+use linera_service::config::{DestinationConfig, LimitsConfig};
 use linera_storage::Storage;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use validator_exporter::Exporter as ValidatorExporter;
 
 use crate::{
     common::{BlockId, ExporterError},
-    runloops::task_manager::{PoolMember, ThreadPoolState},
+    runloops::task_manager::ExportersTracker,
     storage::BlockProcessorStorage,
 };
 
 mod block_processor;
 mod indexer;
+mod logging_exporter;
 mod task_manager;
 mod validator_exporter;
 
 #[cfg(test)]
 pub use indexer::indexer_api;
 
-#[expect(clippy::type_complexity)]
 pub(crate) fn start_block_processor_task<S, F>(
     storage: S,
     shutdown_signal: F,
@@ -33,20 +33,20 @@ pub(crate) fn start_block_processor_task<S, F>(
     options: NodeOptions,
     block_exporter_id: u32,
     destination_config: DestinationConfig,
-) -> Result<
-    (
-        UnboundedSender<BlockId>,
-        std::thread::JoinHandle<Result<(), ExporterError>>,
-    ),
-    ExporterError,
->
+) -> (
+    UnboundedSender<BlockId>,
+    std::thread::JoinHandle<Result<(), ExporterError>>,
+)
 where
     S: Storage + Clone + Send + Sync + 'static,
     F: IntoFuture<Output = ()> + Clone + Send + Sync + 'static,
     <F as IntoFuture>::IntoFuture: Future<Output = ()> + Send + Sync + 'static,
 {
     let (task_sender, queue_front) = unbounded_channel();
-    let moved_task_sender = task_sender.clone();
+    let new_block_queue = NewBlockQueue {
+        queue_rear: task_sender.clone(),
+        queue_front,
+    };
     let handle = std::thread::spawn(move || {
         start_block_processor(
             storage,
@@ -54,16 +54,31 @@ where
             limits,
             options,
             block_exporter_id,
-            moved_task_sender,
+            new_block_queue,
             destination_config,
-            queue_front,
         )
     });
 
-    Ok((task_sender, handle))
+    (task_sender, handle)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct NewBlockQueue {
+    pub(crate) queue_rear: UnboundedSender<BlockId>,
+    pub(crate) queue_front: UnboundedReceiver<BlockId>,
+}
+
+impl NewBlockQueue {
+    async fn recv(&mut self) -> Option<BlockId> {
+        self.queue_front.recv().await
+    }
+
+    fn push_back(&self, block_id: BlockId) {
+        self.queue_rear
+            .send(block_id)
+            .expect("sender should never fail");
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn start_block_processor<S, F>(
     storage: S,
@@ -71,9 +86,8 @@ async fn start_block_processor<S, F>(
     limits: LimitsConfig,
     options: NodeOptions,
     block_exporter_id: u32,
-    queue_rear: UnboundedSender<BlockId>,
+    new_block_queue: NewBlockQueue,
     destination_config: DestinationConfig,
-    queue_front: UnboundedReceiver<BlockId>,
 ) -> Result<(), ExporterError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -89,20 +103,18 @@ where
         BlockProcessorStorage::load(storage.clone(), block_exporter_id, destination_ids, limits)
             .await?;
 
-    let pool_members = PoolMember::new(
+    let tracker = ExportersTracker::new(
         options,
-        exporter_storage.clone().unwrap(),
         limits.work_queue_size.into(),
         shutdown_signal.clone(),
+        exporter_storage.clone(),
+        destination_config.destinations.clone(),
     );
-    let pool_state =
-        ThreadPoolState::new(vec![pool_members], destination_config.destinations.clone());
 
     let mut block_processor = BlockProcessor::new(
-        pool_state,
+        tracker,
         block_processor_storage,
-        queue_rear,
-        queue_front,
+        new_block_queue,
         destination_config.committee_destination,
     );
 
@@ -132,16 +144,18 @@ mod test {
         test::{make_child_block, make_first_block, BlockTestExt},
         types::{CertificateValue, ConfirmedBlock, ConfirmedBlockCertificate},
     };
-    use linera_client::config::{Destination, DestinationConfig, LimitsConfig};
     use linera_execution::{
         committee::{Committee, ValidatorState},
         system::AdminOperation,
         Operation, ResourceControlPolicy, SystemOperation,
     };
     use linera_rpc::{config::TlsConfig, NodeOptions};
-    use linera_service::cli_wrappers::local_net::LocalNet;
+    use linera_service::{
+        cli_wrappers::local_net::LocalNet,
+        config::{Destination, DestinationConfig, DestinationKind, LimitsConfig},
+    };
     use linera_storage::{DbStorage, Storage};
-    use linera_views::{memory::MemoryStore, ViewError};
+    use linera_views::{memory::MemoryDatabase, ViewError};
     use test_case::test_case;
     use tokio::time::sleep;
     use tokio_util::sync::CancellationToken;
@@ -167,12 +181,20 @@ mod test {
         LocalNet::ensure_grpc_server_has_started("test server", port as usize, "http").await?;
 
         let signal = ExporterCancellationSignal::new(cancellation_token.clone());
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
-        let destination_address = Destination {
-            port,
-            tls: TlsConfig::ClearText,
-            endpoint: "127.0.0.1".to_owned(),
-            kind: destination.kind(),
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(None).await;
+        let destination_address = match destination.kind() {
+            DestinationKind::Indexer => Destination::Indexer {
+                port,
+                tls: TlsConfig::ClearText,
+                endpoint: "127.0.0.1".to_owned(),
+            },
+            DestinationKind::Validator => Destination::Validator {
+                port,
+                endpoint: "127.0.0.1".to_owned(),
+            },
+            DestinationKind::Logging => {
+                unreachable!("Logging destination is not supported in tests")
+            }
         };
 
         // make some blocks
@@ -193,7 +215,7 @@ mod test {
                 committee_destination: false,
                 destinations: vec![destination_address],
             },
-        )?;
+        );
 
         assert!(
             notifier.send(notification).is_ok(),
@@ -203,9 +225,9 @@ mod test {
         sleep(Duration::from_secs(4)).await;
 
         for CanonicalBlock { blobs, block_hash } in state {
-            assert!(destination.state().contains(&block_hash));
+            assert!(destination.state().pin().contains(&block_hash));
             for blob in blobs {
-                assert!(destination.blobs().contains(&blob));
+                assert!(destination.blobs().pin().contains(&blob));
             }
         }
 
@@ -227,7 +249,7 @@ mod test {
 
         let child = cancellation_token.child_token();
         let signal = ExporterCancellationSignal::new(child.clone());
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(None).await;
 
         let (notification, _state) = make_simple_state_with_blobs(&storage).await;
 
@@ -249,7 +271,7 @@ mod test {
                 committee_destination: false,
                 destinations: destinations.clone(),
             },
-        )?;
+        );
 
         assert!(
             notifier.send(notification).is_ok(),
@@ -304,7 +326,7 @@ mod test {
                 destinations: destinations.clone(),
                 committee_destination: false,
             },
-        )?;
+        );
 
         sleep(Duration::from_secs(4)).await;
 
@@ -313,7 +335,7 @@ mod test {
 
         let (_, _, destination_states) =
             BlockExporterStateView::initiate(context.clone(), destination_ids).await?;
-        for destination in destinations.iter() {
+        for destination in destinations {
             assert_eq!(
                 destination_states
                     .load_state(&destination.id())
@@ -332,7 +354,7 @@ mod test {
     async fn test_committee_destination() -> anyhow::Result<()> {
         tracing::info!("Starting test_committee_destination test");
 
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(None).await;
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(None).await;
         let test_chain = TestChain::new(storage.clone());
         let cancellation_token = CancellationToken::new();
         let child = cancellation_token.child_token();
@@ -364,7 +386,7 @@ mod test {
                 committee_destination: true,
                 destinations: vec![],
             },
-        )?;
+        );
 
         let mut single_validator = BTreeMap::new();
         single_validator.insert(Secp256k1PublicKey::test_key(0), validator_state);
@@ -378,12 +400,15 @@ mod test {
         notifier.send(first_notification)?;
         sleep(Duration::from_secs(4)).await;
 
-        assert!(dummy_validator.state.contains(&first_notification.hash));
+        {
+            let pinned = dummy_validator.state.pin();
+            assert!(pinned.contains(&first_notification.hash));
+        }
         // We expect the validator to receive the confired certificate only once.
-        assert!(dummy_validator
-            .duplicate_blocks
-            .get(&first_notification.hash)
-            .is_none());
+        {
+            let pinned = dummy_validator.duplicate_blocks.pin();
+            assert!(pinned.get(&first_notification.hash).is_none());
+        }
 
         ///////////
         // Add new validator to the committee.
@@ -405,25 +430,31 @@ mod test {
         notifier.send(second_notification)?;
         sleep(Duration::from_secs(4)).await;
 
-        assert!(second_dummy.state.contains(&second_notification.hash));
+        {
+            let pinned = second_dummy.state.pin();
+            assert!(pinned.contains(&second_notification.hash));
+        }
         // We expect the new validator to receive the new confirmed certificate only once.
-        assert!(second_dummy
-            .duplicate_blocks
-            .get(&second_notification.hash)
-            .is_none());
+        {
+            let pinned = second_dummy.duplicate_blocks.pin();
+            assert!(pinned.get(&second_notification.hash).is_none());
+        }
         // The first certificate should not be duplicated.
-        assert!(second_dummy
-            .duplicate_blocks
-            .get(&first_notification.hash)
-            .is_none());
+        {
+            let pinned = second_dummy.duplicate_blocks.pin();
+            assert!(pinned.get(&first_notification.hash).is_none());
+        }
 
         // The first validator should receive the new committee as well.
-        assert!(dummy_validator.state.contains(&second_notification.hash));
+        {
+            let pinned = dummy_validator.state.pin();
+            assert!(pinned.contains(&second_notification.hash));
+        }
         // We expect the first validator to receive the new confirmed certificate only once.
-        assert!(dummy_validator
-            .duplicate_blocks
-            .get(&second_notification.hash)
-            .is_none());
+        {
+            let pinned = dummy_validator.duplicate_blocks.pin();
+            assert!(pinned.get(&second_notification.hash).is_none());
+        }
 
         ///////////
         // Remove the validator from the committee.
@@ -445,19 +476,25 @@ mod test {
         notifier.send(third_notification)?;
         sleep(Duration::from_secs(4)).await;
         // The first validator should not receive the new confirmed certificate.
-        assert!(!dummy_validator.state.contains(&third_notification.hash));
+        {
+            let pinned = dummy_validator.state.pin();
+            assert!(!pinned.contains(&third_notification.hash));
+        }
         // We expect the first validator to receive the new confirmed certificate only once.
-        assert!(dummy_validator
-            .duplicate_blocks
-            .get(&third_notification.hash)
-            .is_none());
+        {
+            let pinned = dummy_validator.duplicate_blocks.pin();
+            assert!(pinned.get(&third_notification.hash).is_none());
+        }
         // The second validator should receive the new confirmed certificate.
-        assert!(second_dummy.state.contains(&third_notification.hash));
+        {
+            let pinned = second_dummy.state.pin();
+            assert!(pinned.contains(&third_notification.hash));
+        }
         // We expect the second validator to receive the new confirmed certificate only once.
-        assert!(second_dummy
-            .duplicate_blocks
-            .get(&third_notification.hash)
-            .is_none());
+        {
+            let pinned = second_dummy.duplicate_blocks.pin();
+            assert!(pinned.get(&third_notification.hash).is_none());
+        }
 
         cancellation_token.cancel();
         block_processor_handle.join().unwrap()?;
@@ -543,11 +580,10 @@ mod test {
         let destination = DummyIndexer::default();
         tokio::spawn(destination.clone().start(port, token.clone()));
         LocalNet::ensure_grpc_server_has_started("dummy indexer", port as usize, "http").await?;
-        let destination_address = Destination {
+        let destination_address = Destination::Indexer {
             port,
             tls: TlsConfig::ClearText,
             endpoint: "127.0.0.1".to_owned(),
-            kind: destination.kind(),
         };
 
         destinations.push(destination_address);
@@ -562,11 +598,9 @@ mod test {
         let destination = DummyValidator::new(port);
         tokio::spawn(destination.clone().start(port, token.clone()));
         LocalNet::ensure_grpc_server_has_started("dummy validator", port as usize, "http").await?;
-        let destination_address = Destination {
+        let destination_address = Destination::Validator {
             port,
-            tls: TlsConfig::ClearText,
             endpoint: get_address(port as u16).ip().to_string(),
-            kind: destination.kind(),
         };
 
         destinations.push(destination_address);
@@ -582,11 +616,10 @@ mod test {
         destination.set_faulty();
         tokio::spawn(destination.clone().start(port, token.clone()));
         LocalNet::ensure_grpc_server_has_started("faulty indexer", port as usize, "http").await?;
-        let destination_address = Destination {
+        let destination_address = Destination::Indexer {
             port,
             tls: TlsConfig::ClearText,
             endpoint: "127.0.0.1".to_owned(),
-            kind: destination.kind(),
         };
 
         destinations.push(destination_address);
@@ -601,12 +634,10 @@ mod test {
         let destination = DummyValidator::default();
         destination.set_faulty();
         tokio::spawn(destination.clone().start(port, token.clone()));
-        LocalNet::ensure_grpc_server_has_started("falty validator", port as usize, "http").await?;
-        let destination_address = Destination {
+        LocalNet::ensure_grpc_server_has_started("faulty validator", port as usize, "http").await?;
+        let destination_address = Destination::Validator {
             port,
-            tls: TlsConfig::ClearText,
             endpoint: "127.0.0.1".to_owned(),
-            kind: destination.kind(),
         };
 
         destinations.push(destination_address);

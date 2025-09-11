@@ -10,7 +10,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
 use futures::{stream, StreamExt};
 use linera_base::{
     crypto::CryptoHash,
@@ -26,7 +25,6 @@ use linera_chain::{
     test::{make_child_block, make_first_block, BlockTestExt},
     types::{CertificateValue, ConfirmedBlock, ConfirmedBlockCertificate},
 };
-use linera_client::config::DestinationKind;
 use linera_core::{
     data_types::{ChainInfo, ChainInfoResponse},
     node::NodeError,
@@ -39,6 +37,7 @@ use linera_rpc::{
     },
     HandleConfirmedCertificateRequest,
 };
+use linera_service::config::DestinationKind;
 use linera_storage::Storage;
 use tokio_stream::{wrappers::UnboundedReceiverStream, Stream};
 use tokio_util::sync::CancellationToken;
@@ -56,8 +55,8 @@ use crate::{
 #[derive(Clone, Default)]
 pub(crate) struct DummyIndexer {
     pub(crate) fault_guard: Arc<AtomicBool>,
-    pub(crate) blobs: Arc<DashSet<BlobId>>,
-    pub(crate) state: Arc<DashSet<CryptoHash>>,
+    pub(crate) blobs: Arc<papaya::HashSet<BlobId>>,
+    pub(crate) state: Arc<papaya::HashSet<CryptoHash>>,
 }
 
 impl DummyIndexer {
@@ -67,7 +66,7 @@ impl DummyIndexer {
         cancellation_token: CancellationToken,
     ) -> Result<(), anyhow::Error> {
         let endpoint = get_address(port);
-        let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
         health_reporter.set_serving::<IndexerServer<Self>>().await;
 
         Server::builder()
@@ -109,7 +108,7 @@ impl Indexer for DummyIndexer {
                             payload: Some(Payload::Block(indexer_block)),
                         }) => match TryInto::<ConfirmedBlockCertificate>::try_into(indexer_block) {
                             Ok(block) => {
-                                moved_state.insert(block.hash());
+                                moved_state.pin().insert(block.hash());
                                 return Some((Ok(()), stream));
                             }
                             Err(e) => return Some((Err(Status::from_error(e)), stream)),
@@ -118,7 +117,7 @@ impl Indexer for DummyIndexer {
                             payload: Some(Payload::Blob(indexer_blob)),
                         }) => {
                             let blob = Blob::try_from(indexer_blob).unwrap();
-                            moved_blobs_state.insert(blob.id());
+                            moved_blobs_state.pin().insert(blob.id());
                         }
                         Ok(_) => continue,
                         Err(e) => return Some((Err(e), stream)),
@@ -136,10 +135,10 @@ impl Indexer for DummyIndexer {
 pub(crate) struct DummyValidator {
     pub(crate) validator_port: u16,
     pub(crate) fault_guard: Arc<AtomicBool>,
-    pub(crate) blobs: Arc<DashSet<BlobId>>,
-    pub(crate) state: Arc<DashSet<CryptoHash>>,
+    pub(crate) blobs: Arc<papaya::HashSet<BlobId>>,
+    pub(crate) state: Arc<papaya::HashSet<CryptoHash>>,
     // Tracks whether a block has been received multiple times.
-    pub(crate) duplicate_blocks: Arc<DashMap<CryptoHash, u64>>,
+    pub(crate) duplicate_blocks: Arc<papaya::HashMap<CryptoHash, u64>>,
 }
 
 impl DummyValidator {
@@ -147,9 +146,9 @@ impl DummyValidator {
         Self {
             validator_port: port,
             fault_guard: Arc::new(AtomicBool::new(false)),
-            blobs: Arc::new(DashSet::new()),
-            state: Arc::new(DashSet::new()),
-            duplicate_blocks: Arc::new(DashMap::new()),
+            blobs: Arc::new(papaya::HashSet::new()),
+            state: Arc::new(papaya::HashSet::new()),
+            duplicate_blocks: Arc::new(papaya::HashMap::new()),
         }
     }
 
@@ -159,7 +158,7 @@ impl DummyValidator {
         cancellation_token: CancellationToken,
     ) -> Result<(), anyhow::Error> {
         let endpoint = get_address(port);
-        let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
         health_reporter
             .set_serving::<ValidatorNodeServer<Self>>()
             .await;
@@ -194,31 +193,16 @@ impl ValidatorNode for DummyValidator {
         let mut missing_blobs = Vec::new();
         let created_blobs = req.certificate.inner().block().created_blob_ids();
         for blob in req.certificate.inner().required_blob_ids() {
-            if !self.blobs.contains(&blob) && !created_blobs.contains(&blob) {
+            if !self.blobs.pin().contains(&blob) && !created_blobs.contains(&blob) {
                 missing_blobs.push(blob);
             }
         }
-
-        let manager = ChainManagerInfo {
-            ownership: Default::default(),
-            requested_proposed: None,
-            requested_locking: None,
-            timeout: None,
-            pending: None,
-            timeout_vote: None,
-            fallback_vote: None,
-            requested_confirmed: None,
-            requested_validated: None,
-            current_round: Default::default(),
-            leader: None,
-            round_timeout: None,
-        };
 
         let chain_info = ChainInfo {
             chain_id: ChainId(CryptoHash::test_hash("test")),
             epoch: Epoch::ZERO,
             description: None,
-            manager: manager.into(),
+            manager: ChainManagerInfo::default().into(),
             chain_balance: Amount::ONE,
             block_hash: None,
             timestamp: Timestamp::now(),
@@ -235,15 +219,13 @@ impl ValidatorNode for DummyValidator {
         let response = if missing_blobs.is_empty() {
             let response = ChainInfoResponse::new(chain_info, None).try_into()?;
             for blob in created_blobs {
-                self.blobs.insert(blob);
+                self.blobs.pin().insert(blob);
             }
 
-            if !self.state.insert(req.certificate.hash()) {
+            if !self.state.pin().insert(req.certificate.hash()) {
                 tracing::warn!(validator=?self.validator_port, certificate=?req.certificate.hash(), "duplicate block received");
-                self.duplicate_blocks
-                    .entry(req.certificate.hash())
-                    .and_modify(|count| *count += 1)
-                    .or_insert(2);
+                let pinned = self.duplicate_blocks.pin();
+                pinned.update_or_insert(req.certificate.hash(), |count| count + 1, 2);
             }
 
             response
@@ -266,7 +248,7 @@ impl ValidatorNode for DummyValidator {
             request.into_inner().try_into()?;
         let blob = Blob::new(content);
         let id = blob.id();
-        self.blobs.insert(id);
+        self.blobs.pin().insert(id);
         Ok(Response::new(id.try_into()?))
     }
 
@@ -361,10 +343,31 @@ impl ValidatorNode for DummyValidator {
         unimplemented!()
     }
 
+    async fn download_certificates_by_heights(
+        &self,
+        _request: Request<linera_rpc::grpc::api::DownloadCertificatesByHeightsRequest>,
+    ) -> Result<Response<linera_rpc::grpc::api::CertificatesBatchResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn download_raw_certificates_by_heights(
+        &self,
+        _request: Request<linera_rpc::grpc::api::DownloadCertificatesByHeightsRequest>,
+    ) -> Result<Response<linera_rpc::grpc::api::RawCertificatesBatch>, Status> {
+        unimplemented!()
+    }
+
     async fn blob_last_used_by(
         &self,
         _request: Request<linera_rpc::grpc::api::BlobId>,
     ) -> Result<Response<linera_rpc::grpc::api::CryptoHash>, Status> {
+        unimplemented!()
+    }
+
+    async fn blob_last_used_by_certificate(
+        &self,
+        _request: Request<linera_rpc::grpc::api::BlobId>,
+    ) -> Result<Response<linera_rpc::grpc::api::Certificate>, Status> {
         unimplemented!()
     }
 
@@ -379,10 +382,10 @@ impl ValidatorNode for DummyValidator {
 #[async_trait]
 pub trait TestDestination {
     fn kind(&self) -> DestinationKind;
-    fn blobs(&self) -> &DashSet<BlobId>;
+    fn blobs(&self) -> &papaya::HashSet<BlobId>;
     fn set_faulty(&self);
     fn unset_faulty(&self);
-    fn state(&self) -> &DashSet<CryptoHash>;
+    fn state(&self) -> &papaya::HashSet<CryptoHash>;
     async fn start(
         self,
         port: u16,
@@ -396,7 +399,7 @@ impl TestDestination for DummyIndexer {
         DestinationKind::Indexer
     }
 
-    fn blobs(&self) -> &DashSet<BlobId> {
+    fn blobs(&self) -> &papaya::HashSet<BlobId> {
         self.blobs.as_ref()
     }
 
@@ -408,7 +411,7 @@ impl TestDestination for DummyIndexer {
         self.fault_guard.store(false, Ordering::Release);
     }
 
-    fn state(&self) -> &DashSet<CryptoHash> {
+    fn state(&self) -> &papaya::HashSet<CryptoHash> {
         self.state.as_ref()
     }
 
@@ -427,7 +430,7 @@ impl TestDestination for DummyValidator {
         DestinationKind::Validator
     }
 
-    fn blobs(&self) -> &DashSet<BlobId> {
+    fn blobs(&self) -> &papaya::HashSet<BlobId> {
         self.blobs.as_ref()
     }
 
@@ -439,7 +442,7 @@ impl TestDestination for DummyValidator {
         self.fault_guard.store(false, Ordering::Release);
     }
 
-    fn state(&self) -> &DashSet<CryptoHash> {
+    fn state(&self) -> &papaya::HashSet<CryptoHash> {
         self.state.as_ref()
     }
 

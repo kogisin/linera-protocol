@@ -17,16 +17,14 @@ use linera_base::{
     ownership::{ChainOwnership, TimeoutConfig},
 };
 use linera_chain::{
-    data_types::{IncomingBundle, MessageBundle, PostedMessage},
+    data_types::{IncomingBundle, MessageBundle, PostedMessage, Transaction},
     manager::LockingBlock,
     types::Timeout,
     ChainError, ChainExecutionContext,
 };
 use linera_execution::{
-    committee::Committee,
-    system::{Recipient, SystemOperation},
-    ExecutionError, Message, MessageKind, Operation, QueryOutcome, ResourceControlPolicy,
-    SystemMessage, SystemQuery, SystemResponse,
+    committee::Committee, system::SystemOperation, ExecutionError, Message, MessageKind, Operation,
+    QueryOutcome, ResourceControlPolicy, SystemMessage, SystemQuery, SystemResponse,
 };
 use linera_storage::Storage;
 use rand::Rng;
@@ -46,15 +44,17 @@ use crate::test_utils::ScyllaDbStorageBuilder;
 use crate::test_utils::ServiceStorageBuilder;
 use crate::{
     client::{
-        BlanketMessagePolicy, ChainClient, ChainClientError, ClientOutcome, MessageAction,
-        MessagePolicy,
+        BlanketMessagePolicy, ChainClient, ChainClientError, ClientOutcome, ListeningMode,
+        MessageAction, MessagePolicy,
     },
     local_node::LocalNodeError,
     node::{
         NodeError::{self, ClientIoError},
         ValidatorNode,
     },
-    test_utils::{FaultType, MemoryStorageBuilder, StorageBuilder, TestBuilder},
+    test_utils::{
+        ClientOutcomeResultExt as _, FaultType, MemoryStorageBuilder, StorageBuilder, TestBuilder,
+    },
     updater::CommunicationError,
     worker::{Notification, Reason, WorkerError},
     Environment,
@@ -73,7 +73,8 @@ fn test_listener_is_send() {
     async fn check_listener(
         chain_client: ChainClient<impl Environment>,
     ) -> Result<(), ChainClientError> {
-        let (listener, _abort_notifications, _notifications) = chain_client.listen().await?;
+        let (listener, _abort_notifications, _notifications) =
+            chain_client.listen(ListeningMode::FullChain).await?;
         ensure_send(&listener);
         Ok(())
     }
@@ -82,7 +83,7 @@ fn test_listener_is_send() {
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -100,8 +101,8 @@ where
     let sender = builder.add_root_chain(1, Amount::from_tokens(4)).await?;
     let chain_2 = builder.add_root_chain(2, Amount::ZERO).await?;
     // Listen to the notifications on the sender chain.
-    let mut notifications = sender.subscribe().await?;
-    let (listener, _listen_handle, _) = sender.listen().await?;
+    let mut notifications = sender.subscribe()?;
+    let (listener, _listen_handle, _) = sender.listen(ListeningMode::FullChain).await?;
     tokio::spawn(listener);
     {
         let certificate = sender
@@ -111,8 +112,7 @@ where
                 Account::chain(chain_2.chain_id()),
             )
             .await
-            .unwrap()
-            .unwrap();
+            .unwrap_ok_committed();
         assert_eq!(
             sender.chain_info().await?.next_block_height,
             BlockHeight::from(1)
@@ -141,7 +141,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -166,8 +166,7 @@ where
             Account::new(receiver_id, owner),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     let cert = sender
         .transfer_to_account(
             AccountOwner::CHAIN,
@@ -175,8 +174,7 @@ where
             Account::new(receiver_id, friend),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert_eq!(
         sender.local_balance().await.unwrap(),
         Amount::from_millis(900)
@@ -215,7 +213,7 @@ where
         .claim(
             owner,
             receiver_id,
-            Recipient::chain(sender.chain_id()),
+            Account::chain(sender.chain_id()),
             Amount::from_tokens(5),
         )
         .await
@@ -225,19 +223,18 @@ where
         .claim(
             owner,
             receiver_id,
-            Recipient::chain(sender.chain_id()),
+            Account::chain(sender.chain_id()),
             Amount::from_tokens(2),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
 
     receiver
         .receive_certificate_and_update_validators(cert)
         .await?;
     let cert = receiver.process_inbox().await?.0.pop().unwrap();
     {
-        let messages = &cert.block().body.incoming_bundles;
+        let messages = cert.block().body.incoming_bundles().collect::<Vec<_>>();
         // Both `Claim` messages were included in the block.
         assert_eq!(messages.len(), 2);
         // The first one was rejected.
@@ -261,7 +258,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -280,8 +277,7 @@ where
     let certificate = sender
         .rotate_key_pair(new_public_key)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     sender.set_preferred_owner(new_owner);
     assert_eq!(
         sender.chain_info().await?.next_block_height,
@@ -310,7 +306,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -359,7 +355,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -375,8 +371,7 @@ where
     let certificate = sender
         .share_ownership(new_owner, 100)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert_eq!(
         sender.chain_info().await?.next_block_height,
         BlockHeight::from(1)
@@ -424,7 +419,7 @@ where
     );
 
     // We need at least three validators for making an operation.
-    builder.set_fault_type([0, 1], FaultType::Offline).await;
+    builder.set_fault_type([0, 1], FaultType::Offline);
     let result = client.burn(AccountOwner::CHAIN, Amount::ONE).await;
     assert_matches!(
         result,
@@ -432,8 +427,8 @@ where
             CommunicationError::Trusted(ClientIoError { .. }),
         ))
     );
-    builder.set_fault_type([0, 1], FaultType::Honest).await;
-    builder.set_fault_type([2, 3], FaultType::Offline).await;
+    builder.set_fault_type([0, 1], FaultType::Honest);
+    builder.set_fault_type([2, 3], FaultType::Offline);
     assert_matches!(
         sender.burn(AccountOwner::CHAIN, Amount::ONE).await,
         Err(ChainClientError::CommunicationError(
@@ -443,9 +438,7 @@ where
 
     // Half the validators voted for one block, half for the other. We need to make a proposal in
     // the next round to succeed.
-    builder
-        .set_fault_type([0, 1, 2, 3], FaultType::Honest)
-        .await;
+    builder.set_fault_type([0, 1, 2, 3], FaultType::Honest);
     client.synchronize_from_validators().await.unwrap();
     client.process_inbox().await.unwrap();
     assert_eq!(
@@ -456,8 +449,7 @@ where
     client
         .burn(AccountOwner::CHAIN, Amount::ONE)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert_eq!(client.local_balance().await.unwrap(), Amount::ONE);
 
     // The other client doesn't know the new round number yet:
@@ -469,8 +461,7 @@ where
     sender
         .burn(AccountOwner::CHAIN, Amount::ONE)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
 
     // That's it, we spent all our money on this test!
     assert_eq!(sender.local_balance().await.unwrap(), Amount::ZERO);
@@ -481,7 +472,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -504,8 +495,7 @@ where
             Amount::ZERO,
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     let new_id = new_description.id();
 
     assert_eq!(
@@ -527,7 +517,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -580,8 +570,7 @@ where
             Amount::ZERO,
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     let new_id2 = new_description2.id();
     assert_eq!(new_id, new_id2);
     assert_eq!(
@@ -595,8 +584,8 @@ where
     assert!(sender.pending_proposal().is_none());
     assert_eq!(sender.identity().await?, sender.preferred_owner.unwrap());
     assert_matches!(
-        certificate.block().body.operations[0].as_system_operation(),
-        Some(SystemOperation::OpenChain(_)),
+        &certificate.block().body.transactions[0],
+        Transaction::ExecuteOperation(Operation::System(system_op)) if matches!(**system_op, SystemOperation::OpenChain(_)),
         "Unexpected certificate value",
     );
     assert_eq!(
@@ -622,8 +611,7 @@ where
             Account::chain(new_id),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     client
         .receive_certificate_and_update_validators(certificate2)
         .await
@@ -640,7 +628,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -661,8 +649,7 @@ where
     let (new_description, creation_certificate) = sender
         .open_chain(ownership, ApplicationPermissions::default(), Amount::ZERO)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     let new_id = new_description.id();
     // Transfer after creating the chain.
     let transfer_certificate = sender
@@ -672,8 +659,7 @@ where
             Account::chain(new_id),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert_eq!(
         sender.chain_info().await?.next_block_height,
         BlockHeight::from(2)
@@ -706,7 +692,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -724,13 +710,13 @@ where
 
     let certificate = client1.close_chain().await.unwrap().unwrap().unwrap();
     assert_eq!(
-        certificate.block().body.operations.len(),
+        certificate.block().body.transactions.len(),
         1,
-        "Unexpected operations in certificate"
+        "Unexpected transactions in certificate"
     );
     assert_matches!(
-        certificate.block().body.operations[0].as_system_operation(),
-        Some(SystemOperation::CloseChain),
+        &certificate.block().body.transactions[0],
+        Transaction::ExecuteOperation(Operation::System(system_op)) if matches!(**system_op, SystemOperation::CloseChain),
         "Unexpected certificate value",
     );
     assert_eq!(
@@ -769,23 +755,21 @@ where
             Account::chain(client1.chain_id()),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     client1.synchronize_from_validators().await.unwrap();
     let (certificates, _) = client1.process_inbox().await.unwrap();
     let block = certificates[0].block();
-    assert!(block.body.operations.is_empty());
-    assert_eq!(block.body.incoming_bundles.len(), 1);
+    assert_eq!(block.body.transactions.len(), 1);
     assert_matches!(
-        &block.body.incoming_bundles[0],
-        IncomingBundle {
+        &block.body.transactions[..],
+        [Transaction::ReceiveMessages(IncomingBundle {
             origin: sender,
             action: MessageAction::Reject,
             bundle: MessageBundle {
                 messages,
                 ..
             },
-        } if *sender == client2.chain_id() && matches!(messages[..],
+        })] if *sender == client2.chain_id() && matches!(messages[..],
             [PostedMessage {
                 message: Message::System(SystemMessage::Credit { .. }),
                 kind: MessageKind::Tracked,
@@ -809,7 +793,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -819,39 +803,39 @@ where
     B: StorageBuilder,
 {
     let signer = InMemorySigner::new(None);
-    let mut builder = TestBuilder::new(storage_builder, 4, 2, signer).await?;
-    let sender = builder.add_root_chain(1, Amount::from_tokens(4)).await?;
+    let mut builder = TestBuilder::new(storage_builder, 4, 0, signer).await?;
+    builder.set_fault_type([0, 1], FaultType::NoChains);
+    let chain_1 = builder.add_root_chain(1, Amount::from_tokens(4)).await?;
     let chain_2 = builder.add_root_chain(2, Amount::from_tokens(4)).await?;
-    let result = sender
+    let result = chain_1
         .transfer_to_account_unsafe_unconfirmed(
             AccountOwner::CHAIN,
             Amount::from_tokens(3),
             Account::chain(chain_2.chain_id()),
         )
         .await;
-    // The faulty validators will not have a chain with this ID (as the initial balance
-    // being zero changes it) - they will fail with `BlobsNotFound`.
+    // Malicious validators always return ArithmeticError when handling a proposal.
     assert_matches!(
         result,
         Err(ChainClientError::CommunicationError(
-            CommunicationError::Trusted(crate::node::NodeError::BlobsNotFound(_))
+            CommunicationError::Trusted(NodeError::InactiveChain(_))
         )),
         "unexpected result"
     );
     assert_eq!(
-        sender.chain_info().await?.next_block_height,
+        chain_1.chain_info().await?.next_block_height,
         BlockHeight::ZERO
     );
-    assert!(sender.pending_proposal().is_some());
+    assert!(chain_1.pending_proposal().is_some());
     assert_eq!(
-        sender.local_balance().await.unwrap(),
+        chain_1.local_balance().await.unwrap(),
         Amount::from_tokens(4)
     );
     Ok(())
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -885,8 +869,7 @@ where
             Account::chain(client2.chain_id),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
 
     assert_eq!(
         client1.chain_info().await?.next_block_height,
@@ -968,7 +951,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -990,8 +973,7 @@ where
             Account::chain(client2.chain_id),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     // Transfer was executed locally.
     assert_eq!(
         client1.local_balance().await.unwrap(),
@@ -1018,7 +1000,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -1072,8 +1054,7 @@ where
     assert!(client2
         .process_pending_block()
         .await
-        .unwrap()
-        .unwrap()
+        .unwrap_ok_committed()
         .is_none());
     // Retrying the whole command works after synchronization.
     client2.synchronize_from_validators().await.unwrap();
@@ -1084,8 +1065,7 @@ where
             Account::chain(client3.chain_id),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     // Blocks were executed locally.
     assert_eq!(client1.local_balance().await.unwrap(), Amount::ONE);
     assert_eq!(
@@ -1114,7 +1094,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -1170,8 +1150,7 @@ where
             Account::chain(user.chain_id()),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     admin
         .transfer_to_account(
             AccountOwner::CHAIN,
@@ -1179,8 +1158,7 @@ where
             Account::chain(user.chain_id()),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
 
     // User is still at the initial epoch, but we can receive transfers from future
     // epochs AFTER synchronizing the client with the admin chain.
@@ -1215,8 +1193,7 @@ where
             Account::chain(admin.chain_id()),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     admin
         .receive_certificate_and_update_validators(cert)
         .await
@@ -1231,8 +1208,7 @@ where
             Account::chain(admin.chain_id()),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     admin
         .receive_certificate_and_update_validators(cert)
         .await
@@ -1260,7 +1236,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[test_log::test(tokio::test)]
 async fn test_insufficient_balance<B>(storage_builder: B) -> anyhow::Result<()>
 where
@@ -1289,14 +1265,14 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[test_log::test(tokio::test)]
 async fn test_sparse_sender_chain<B>(storage_builder: B) -> anyhow::Result<()>
 where
     B: StorageBuilder,
 {
     let signer = InMemorySigner::new(None);
-    let mut builder = TestBuilder::new(storage_builder, 4, 1, signer).await?;
+    let mut builder = TestBuilder::new(storage_builder, 2, 0, signer).await?;
     let sender = builder.add_root_chain(1, Amount::from_tokens(4)).await?;
     let receiver = builder.add_root_chain(2, Amount::ZERO).await?;
     let receiver_id = receiver.chain_id();
@@ -1308,13 +1284,11 @@ where
             Account::chain(receiver_id),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     let cert1 = sender
         .burn(AccountOwner::CHAIN, Amount::ONE)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     let cert2 = sender
         .transfer_to_account(
             AccountOwner::CHAIN,
@@ -1322,10 +1296,24 @@ where
             Account::chain(receiver_id),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
 
-    receiver.synchronize_from_validators().await?;
+    // Process the notification about the incoming message.
+    let notification = Notification {
+        chain_id: receiver_id,
+        reason: Reason::NewIncomingBundle {
+            origin: cert2.block().header.chain_id,
+            height: cert2.block().header.height,
+        },
+    };
+    let validator = builder
+        .initial_committee
+        .validator_addresses()
+        .next()
+        .unwrap();
+    receiver
+        .process_notification_from(notification, validator)
+        .await;
     receiver.process_inbox().await?;
 
     // The first and last blocks sent something to the receiver. The middle one didn't.
@@ -1353,7 +1341,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -1406,7 +1394,7 @@ where
 
     // Try to read a blob without publishing it first, should fail
     let result = client_1a
-        .execute_operation(SystemOperation::ReadBlob { blob_id: blob0_id })
+        .execute_operation(SystemOperation::VerifyBlob { blob_id: blob0_id })
         .await;
     assert_matches!(
         result,
@@ -1415,29 +1403,28 @@ where
     );
 
     // Take one validator down
-    builder.set_fault_type([2], FaultType::Offline).await;
+    builder.set_fault_type([2], FaultType::Offline);
 
     // Publish blob on chain 1
     let publish_certificate = client_1a
         .publish_data_blob(blob0_bytes)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert!(publish_certificate
         .block()
         .requires_or_creates_blob(&blob0_id));
 
     // Validators goes back up
-    builder.set_fault_type([2], FaultType::Honest).await;
+    builder.set_fault_type([2], FaultType::Honest);
     // But another one goes down
-    builder.set_fault_type([3], FaultType::Offline).await;
+    builder.set_fault_type([3], FaultType::Offline);
 
     // Try to read the blob. This is a different client but on the same chain, so when we
     // synchronize this with the validators before executing the block, we'll actually download
     // and cache locally the blobs that were published by `client_a`. So this will succeed.
     client_1b.prepare_chain().await?;
     let certificate = client_1b
-        .execute_operation(SystemOperation::ReadBlob { blob_id: blob0_id })
+        .execute_operation(SystemOperation::VerifyBlob { blob_id: blob0_id })
         .await?
         .unwrap();
     assert_eq!(certificate.round, Round::MultiLeader(0));
@@ -1447,16 +1434,14 @@ where
     // Validators 0, 1, 2 now don't process validated block certificates. Client 2A tries to
     // commit a block that reads blob 0 and publishes blob 1. Client 2A will have that block
     // locked now, but the validators won't.
-    builder
-        .set_fault_type([0, 1, 2], FaultType::DontProcessValidated)
-        .await;
+    builder.set_fault_type([0, 1, 2], FaultType::DontProcessValidated);
 
     client_2a.synchronize_from_validators().await.unwrap();
     let blob1 = Blob::new_data(b"blob1".to_vec());
     let blob1_hash = blob1.id().hash;
 
     let blob_0_1_operations = vec![
-        Operation::system(SystemOperation::ReadBlob { blob_id: blob0_id }),
+        Operation::system(SystemOperation::VerifyBlob { blob_id: blob0_id }),
         Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob1_hash,
         }),
@@ -1477,8 +1462,8 @@ where
     }
 
     // Now 2 goes offline and the other validators are working again.
-    builder.set_fault_type([2], FaultType::Offline).await;
-    builder.set_fault_type([0, 1, 3], FaultType::Honest).await;
+    builder.set_fault_type([2], FaultType::Offline);
+    builder.set_fault_type([0, 1, 3], FaultType::Honest);
 
     // We make validator 3 (who does not have the block proposal) process the validated block.
     let info2_a = client_2a.chain_info_with_manager_values().await?;
@@ -1512,11 +1497,11 @@ where
         LockingBlock::Regular(validated),
         *info2_b.manager.requested_locking.unwrap()
     );
+    let recipient = Account::burn_address(client_2b.chain_id());
     let bt_certificate = client_2b
-        .burn(AccountOwner::CHAIN, Amount::from_tokens(1))
+        .transfer_to_account(AccountOwner::CHAIN, Amount::from_tokens(1), recipient)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
 
     let certificate_values = client_2b
         .read_confirmed_blocks_downward(bt_certificate.hash(), 2)
@@ -1524,27 +1509,28 @@ where
         .unwrap();
 
     // Latest block should be the burn
-    assert!(certificate_values[0]
-        .block()
-        .body
-        .operations
-        .contains(&Operation::system(SystemOperation::Transfer {
+    assert!(certificate_values[0].block().body.operations().any(|op| *op
+        == Operation::system(SystemOperation::Transfer {
             owner: AccountOwner::CHAIN,
-            recipient: Recipient::Burn,
+            recipient,
             amount: Amount::from_tokens(1),
         })));
 
     // Block before that should be b0
     assert_eq!(
-        certificate_values[1].block().body.operations,
-        blob_0_1_operations,
+        certificate_values[1]
+            .block()
+            .body
+            .operations()
+            .collect::<Vec<_>>(),
+        blob_0_1_operations.iter().collect::<Vec<_>>(),
     );
 
     Ok(())
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -1586,7 +1572,7 @@ where
     client2_b.set_preferred_owner(owner2_b);
 
     // Take one validator down
-    builder.set_fault_type([3], FaultType::Offline).await;
+    builder.set_fault_type([3], FaultType::Offline);
 
     let blob0_bytes = b"blob0".to_vec();
     let blob0_id = Blob::new(BlobContent::new_data(blob0_bytes.clone())).id();
@@ -1595,22 +1581,19 @@ where
     let publish_certificate = client1
         .publish_data_blob(blob0_bytes)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert!(publish_certificate
         .block()
         .requires_or_creates_blob(&blob0_id));
 
-    builder
-        .set_fault_type([0, 1, 2], FaultType::DontProcessValidated)
-        .await;
+    builder.set_fault_type([0, 1, 2], FaultType::DontProcessValidated);
 
     client2_a.synchronize_from_validators().await.unwrap();
     let blob1 = Blob::new_data(b"blob1".to_vec());
     let blob1_hash = blob1.id().hash;
 
     let blob_0_1_operations = vec![
-        Operation::system(SystemOperation::ReadBlob { blob_id: blob0_id }),
+        Operation::system(SystemOperation::VerifyBlob { blob_id: blob0_id }),
         Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob1_hash,
         }),
@@ -1635,21 +1618,22 @@ where
                 .unwrap()
                 .content
                 .block
-                .operations,
-            blob_0_1_operations,
+                .operations()
+                .collect::<Vec<_>>(),
+            blob_0_1_operations.iter().collect::<Vec<_>>(),
         );
         assert!(validator_manager.requested_locking.is_none());
     }
 
-    builder.set_fault_type([2], FaultType::Offline).await;
-    builder.set_fault_type([0, 1, 3], FaultType::Honest).await;
+    builder.set_fault_type([2], FaultType::Offline);
+    builder.set_fault_type([0, 1, 3], FaultType::Honest);
 
     client2_b.prepare_chain().await.unwrap();
+    let recipient = Account::burn_address(client2_b.chain_id());
     let bt_certificate = client2_b
-        .burn(AccountOwner::CHAIN, Amount::from_tokens(1))
+        .transfer_to_account(AccountOwner::CHAIN, Amount::from_tokens(1), recipient)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
 
     let certificate_values = client2_b
         .read_confirmed_blocks_downward(bt_certificate.hash(), 2)
@@ -1657,13 +1641,10 @@ where
         .unwrap();
 
     // Latest block should be the burn
-    assert!(certificate_values[0]
-        .block()
-        .body
-        .operations
-        .contains(&Operation::system(SystemOperation::Transfer {
+    assert!(certificate_values[0].block().body.operations().any(|op| *op
+        == Operation::system(SystemOperation::Transfer {
             owner: AccountOwner::CHAIN,
-            recipient: Recipient::Burn,
+            recipient,
             amount: Amount::from_tokens(1),
         })));
 
@@ -1671,13 +1652,13 @@ where
     assert!(certificate_values[1]
         .block()
         .body
-        .operations
-        .contains(&owner_change_op));
+        .operations()
+        .any(|op| *op == owner_change_op));
     Ok(())
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -1714,19 +1695,15 @@ where
     client2.synchronize_from_validators().await.unwrap();
 
     // Client 1 makes a proposal to only validators 0 and 1.
-    builder
-        .set_fault_type([2, 3], FaultType::OfflineWithInfo)
-        .await;
+    builder.set_fault_type([2, 3], FaultType::OfflineWithInfo);
     assert!(client1
         .burn(AccountOwner::CHAIN, Amount::from_millis(1))
         .await
         .is_err());
 
     // Client 2's proposal reaches only 2 and 3.
-    builder
-        .set_fault_type([0, 1], FaultType::OfflineWithInfo)
-        .await;
-    builder.set_fault_type([2, 3], FaultType::Honest).await;
+    builder.set_fault_type([0, 1], FaultType::OfflineWithInfo);
+    builder.set_fault_type([2, 3], FaultType::Honest);
     assert!(client2
         .burn(AccountOwner::CHAIN, Amount::from_millis(2))
         .await
@@ -1748,9 +1725,7 @@ where
     // }
 
     // Once all validators are functional again, a new proposal should succeed.
-    builder
-        .set_fault_type([0, 1, 2, 3], FaultType::Honest)
-        .await;
+    builder.set_fault_type([0, 1, 2, 3], FaultType::Honest);
 
     client1.synchronize_from_validators().await.unwrap();
     client1.publish_data_blob(b"foo".to_vec()).await?;
@@ -1763,7 +1738,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -1810,7 +1785,7 @@ where
     client3_c.set_preferred_owner(owner3_c);
 
     // Take one validator down
-    builder.set_fault_type([3], FaultType::Offline).await;
+    builder.set_fault_type([3], FaultType::Offline);
 
     let blob0_bytes = b"blob0".to_vec();
     let blob0_id = Blob::new(BlobContent::new_data(blob0_bytes.clone())).id();
@@ -1820,8 +1795,7 @@ where
     let publish_certificate0 = client1
         .publish_data_blob(blob0_bytes)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert!(publish_certificate0
         .block()
         .requires_or_creates_blob(&blob0_id));
@@ -1834,25 +1808,20 @@ where
     let publish_certificate2 = client2
         .publish_data_blob(blob2_bytes)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert!(publish_certificate2
         .block()
         .requires_or_creates_blob(&blob2_id));
 
-    builder
-        .set_fault_type([0, 1], FaultType::DontProcessValidated)
-        .await;
-    builder
-        .set_fault_type([2], FaultType::DontSendConfirmVote)
-        .await;
+    builder.set_fault_type([0, 1], FaultType::DontProcessValidated);
+    builder.set_fault_type([2], FaultType::DontSendConfirmVote);
 
     client3_a.synchronize_from_validators().await.unwrap();
     let blob1 = Blob::new_data(b"blob1".to_vec());
     let blob1_hash = blob1.id().hash;
 
     let blob_0_1_operations = vec![
-        Operation::system(SystemOperation::ReadBlob { blob_id: blob0_id }),
+        Operation::system(SystemOperation::VerifyBlob { blob_id: blob0_id }),
         Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob1_hash,
         }),
@@ -1895,8 +1864,9 @@ where
                 .unwrap()
                 .content
                 .block
-                .operations,
-            blob_0_1_operations,
+                .operations()
+                .collect::<Vec<_>>(),
+            blob_0_1_operations.iter().collect::<Vec<_>>(),
         );
 
         if i == 2 {
@@ -1904,23 +1874,24 @@ where
             let LockingBlock::Regular(validated) = locking else {
                 panic!("Unexpected locking fast block.");
             };
-            assert_eq!(validated.block().body.operations, blob_0_1_operations);
+            assert_eq!(
+                validated.block().body.operations().collect::<Vec<_>>(),
+                blob_0_1_operations.iter().collect::<Vec<_>>()
+            );
         } else {
             assert!(validator_manager.requested_locking.is_none());
         }
     }
 
-    builder.set_fault_type([2], FaultType::Offline).await;
-    builder
-        .set_fault_type([3], FaultType::DontSendConfirmVote)
-        .await;
+    builder.set_fault_type([2], FaultType::Offline);
+    builder.set_fault_type([3], FaultType::DontSendConfirmVote);
 
     client3_b.synchronize_from_validators().await.unwrap();
     let blob3 = Blob::new_data(b"blob3".to_vec());
     let blob3_hash = blob3.id().hash;
 
     let blob_2_3_operations = vec![
-        Operation::system(SystemOperation::ReadBlob { blob_id: blob2_id }),
+        Operation::system(SystemOperation::VerifyBlob { blob_id: blob2_id }),
         Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob3_hash,
         }),
@@ -1960,17 +1931,21 @@ where
             .unwrap()
             .content
             .block
-            .operations,
-        blob_2_3_operations,
+            .operations()
+            .collect::<Vec<_>>(),
+        blob_2_3_operations.iter().collect::<Vec<_>>(),
     );
     let locking = *validator_manager.requested_locking.unwrap();
     let LockingBlock::Regular(validated) = locking else {
         panic!("Unexpected locking fast block.");
     };
-    assert_eq!(validated.block().body.operations, blob_2_3_operations);
+    assert_eq!(
+        validated.block().body.operations().collect::<Vec<_>>(),
+        blob_2_3_operations.iter().collect::<Vec<_>>()
+    );
 
-    builder.set_fault_type([1], FaultType::Offline).await;
-    builder.set_fault_type([0, 2, 3], FaultType::Honest).await;
+    builder.set_fault_type([1], FaultType::Offline);
+    builder.set_fault_type([0, 2, 3], FaultType::Honest);
 
     client3_c.synchronize_from_validators().await.unwrap();
     let blob4_data = b"blob4".to_vec();
@@ -1978,8 +1953,7 @@ where
     let bt_certificate = client3_c
         .publish_data_blob(blob4_data)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
 
     let certificate_values = client3_c
         .read_confirmed_blocks_downward(bt_certificate.hash(), 3)
@@ -1987,31 +1961,32 @@ where
         .unwrap();
 
     // Latest block should be the burn
-    assert!(certificate_values[0]
-        .block()
-        .body
-        .operations
-        .contains(&Operation::system(SystemOperation::PublishDataBlob {
+    assert!(certificate_values[0].block().body.operations().any(|op| *op
+        == Operation::system(SystemOperation::PublishDataBlob {
             blob_hash: blob4.id().hash
         })));
 
     // Block before that should be b1
     assert_eq!(
-        certificate_values[1].block().body.operations,
-        blob_2_3_operations,
+        certificate_values[1]
+            .block()
+            .body
+            .operations()
+            .collect::<Vec<_>>(),
+        blob_2_3_operations.iter().collect::<Vec<_>>(),
     );
 
     // Previous should be the `ChangeOwnership` operation
     assert!(certificate_values[2]
         .block()
         .body
-        .operations
-        .contains(&owner_change_op));
+        .operations()
+        .any(|op| *op == owner_change_op));
     Ok(())
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -2047,11 +2022,11 @@ where
     if !matches!(
         result,
         Err(ChainClientError::CommunicationError(
-            CommunicationError::Trusted(NodeError::MissingVoteInValidatorResponse)
+            CommunicationError::Trusted(NodeError::ChainError { .. })
         ))
     ) && !matches!(&result,
         Err(ChainClientError::CommunicationError(CommunicationError::Sample(samples)))
-        if samples.iter().any(|(err, _)| matches!(err, NodeError::MissingVoteInValidatorResponse))
+        if samples.iter().any(|(err, _)| matches!(err, NodeError::ChainError { .. }))
     ) {
         panic!("unexpected leader timeout result: {:?}", result);
     }
@@ -2093,7 +2068,7 @@ where
         .transfer(
             AccountOwner::CHAIN,
             Amount::ONE,
-            Recipient::chain(observer_id),
+            Account::chain(observer_id),
         )
         .await
         .unwrap();
@@ -2124,11 +2099,10 @@ where
         .transfer(
             AccountOwner::CHAIN,
             Amount::ONE,
-            Recipient::chain(observer_id),
+            Account::chain(observer_id),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert_eq!(
         client.local_balance().await.unwrap(),
         Amount::from_tokens(2)
@@ -2142,11 +2116,8 @@ where
     Ok(())
 }
 
-// TODO(#3860): this test is currently intermittently failing if the faulty validators respond to
-// client0 before the correct ones. Un-ignore when this issue is fixed.
-#[ignore]
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -2180,19 +2151,19 @@ where
 
     // Client 0 tries to burn 3 tokens. Two validators are offline, so nothing will get
     // validated or confirmed. However, client 0 now has a pending block.
-    builder
-        .set_fault_type([2], FaultType::OfflineWithInfo)
-        .await;
+    builder.set_fault_type([2], FaultType::OfflineWithInfo);
     let result = client0
         .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await;
     assert!(result.is_err());
+    // Make sure at least one validator has added the proposal to its state.
+    let info = client0.chain_info_with_manager_values().await?;
+    let proposal = info.manager.requested_proposed.unwrap();
+    builder.node(1).handle_block_proposal(*proposal).await?;
 
     // Client 1 thinks it is madness to burn 3 tokens! They want to publish a blob instead.
     // The validators are still faulty: They validate blocks but don't confirm them.
-    builder
-        .set_fault_type([2], FaultType::DontSendConfirmVote)
-        .await;
+    builder.set_fault_type([2], FaultType::DontSendConfirmVote);
     client1.synchronize_from_validators().await.unwrap();
     let manager = client1
         .chain_info_with_manager_values()
@@ -2210,8 +2181,8 @@ where
         .blobs
         .is_empty());
 
-    // Finally, the validators are online and honest again.
-    builder.set_fault_type([1, 2], FaultType::Honest).await;
+    // Finally, enough validators are online and honest again.
+    builder.set_fault_type([2], FaultType::Honest);
     client0.synchronize_from_validators().await.unwrap();
     let manager = client0
         .chain_info_with_manager_values()
@@ -2224,7 +2195,7 @@ where
     );
     assert!(client0.pending_proposal().is_some());
 
-    // Client 0 now only tries to burn 1 token. Before that, they automatically finalize the
+    // Client 0 now only tries to transfer 1 token. Before that, they automatically finalize the
     // pending block, which publishes the blob, leaving 10 - 1 = 9.
     client0
         .burn(AccountOwner::CHAIN, Amount::from_tokens(1))
@@ -2238,7 +2209,7 @@ where
     );
     assert!(client0.pending_proposal().is_none());
 
-    // Burn another token so Client 1 sees that the blob is already published
+    // Transfer another token so Client 1 sees that the blob is already published
     client1.prepare_chain().await.unwrap();
     client1
         .burn(AccountOwner::CHAIN, Amount::from_tokens(1))
@@ -2255,7 +2226,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -2270,19 +2241,17 @@ where
 
     // The client tries to burn 3 tokens. Two validators are offline, so nothing will get
     // validated or confirmed. However, the client now has a pending block.
-    builder
-        .set_fault_type([2], FaultType::OfflineWithInfo)
-        .await;
+    builder.set_fault_type([2], FaultType::OfflineWithInfo);
     let result = client
         .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
         .await;
     assert!(result.is_err());
 
     // Now three validators are online again.
-    builder.set_fault_type([2], FaultType::Honest).await;
+    builder.set_fault_type([2], FaultType::Honest);
 
     // The client tries to burn another token. Before that, they automatically finalize the
-    // pending block, which burns 3 tokens, leaving 10 - 3 - 1 = 6.
+    // pending block, which transfers 3 tokens, leaving 10 - 3 - 1 = 6.
     client.burn(AccountOwner::CHAIN, Amount::ONE).await.unwrap();
     client.synchronize_from_validators().await.unwrap();
     client.process_inbox().await.unwrap();
@@ -2294,7 +2263,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -2329,10 +2298,8 @@ where
 
     // Client 0 tries to burn 3 tokens. Three validators are faulty: 1 and 2 will validate the
     // block but not receive it for confirmation. Validator 3 is offline.
-    builder
-        .set_fault_type([1, 2], FaultType::DontProcessValidated)
-        .await;
-    builder.set_fault_type([3], FaultType::Offline).await;
+    builder.set_fault_type([1, 2], FaultType::DontProcessValidated);
+    builder.set_fault_type([3], FaultType::Offline);
 
     let result = client0
         .burn(AccountOwner::CHAIN, Amount::from_tokens(3))
@@ -2359,10 +2326,8 @@ where
     // Client 1 wants to burn 2 tokens. They learn about the proposal in round 0, but now the
     // validator 0 is offline, so they don't learn about the validated block and make their own
     // proposal in round 1.
-    builder.set_fault_type([0], FaultType::Offline).await;
-    builder
-        .set_fault_type([3], FaultType::OfflineWithInfo)
-        .await;
+    builder.set_fault_type([0], FaultType::Offline);
+    builder.set_fault_type([3], FaultType::OfflineWithInfo);
     client1.synchronize_from_validators().await.unwrap();
     let manager = client1
         .chain_info_with_manager_values()
@@ -2379,8 +2344,8 @@ where
 
     // Finally, three validators are online and honest again. Client 1 realizes there has been a
     // validated block in round 0, and re-proposes it when it tries to burn 4 tokens.
-    builder.set_fault_type([0, 1, 2], FaultType::Honest).await;
-    builder.set_fault_type([3], FaultType::Offline).await;
+    builder.set_fault_type([0, 1, 2], FaultType::Honest);
+    builder.set_fault_type([3], FaultType::Offline);
     client1.synchronize_from_validators().await.unwrap();
     let manager = client1
         .chain_info_with_manager_values()
@@ -2408,7 +2373,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -2457,9 +2422,7 @@ where
         .await?;
 
     // Client 0 tries to burn 3 of their own tokens, but three validators are faulty.
-    builder
-        .set_fault_type([1, 2, 3], FaultType::OfflineWithInfo)
-        .await;
+    builder.set_fault_type([1, 2, 3], FaultType::OfflineWithInfo);
 
     let result = client0.burn(owner0, Amount::from_tokens(3)).await;
     assert!(result.is_err());
@@ -2483,14 +2446,14 @@ where
 
     // Round 0 times out.
     clock.add(TimeDelta::from_secs(5));
-    builder.set_fault_type([0], FaultType::Offline).await;
-    builder.set_fault_type([1, 2, 3], FaultType::Honest).await;
+    builder.set_fault_type([0], FaultType::Offline);
+    builder.set_fault_type([1, 2, 3], FaultType::Honest);
     client1.synchronize_from_validators().await.unwrap();
     client1.request_leader_timeout().await.unwrap();
 
     // Client 1 wants to burn 2 tokens. But now validators 0 and 3 is offline, so they don't learn
     // about the proposed fast block and make their own instead.
-    builder.set_fault_type([3], FaultType::Offline).await;
+    builder.set_fault_type([3], FaultType::Offline);
     let result = client1
         .burn(AccountOwner::CHAIN, Amount::from_tokens(2))
         .await;
@@ -2498,7 +2461,7 @@ where
 
     // Finally, three validators are online and honest again. Client 1 realizes there has been a
     // validated block in round 0, and re-proposes it when it tries to burn 4 tokens.
-    builder.set_fault_type([0, 1, 2], FaultType::Honest).await;
+    builder.set_fault_type([0, 1, 2], FaultType::Honest);
     client1.synchronize_from_validators().await.unwrap();
     assert!(client1.pending_proposal().is_some());
     client1
@@ -2523,7 +2486,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[test_log::test(tokio::test)]
 async fn test_message_policy<B>(storage_builder: B) -> anyhow::Result<()>
 where
@@ -2535,12 +2498,11 @@ where
         .with_policy(ResourceControlPolicy::only_fuel());
     let sender = builder.add_root_chain(1, Amount::from_tokens(4)).await?;
     let mut receiver = builder.add_root_chain(2, Amount::ZERO).await?;
-    let recipient = Recipient::chain(receiver.chain_id());
+    let recipient = Account::chain(receiver.chain_id());
     let cert = sender
         .transfer(AccountOwner::CHAIN, Amount::ONE, recipient)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert_eq!(
         sender.local_balance().await.unwrap(),
         Amount::from_tokens(3)
@@ -2577,7 +2539,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
 #[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
 #[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
@@ -2610,15 +2572,14 @@ where
     }
 
     // Take one validator down
-    builder.set_fault_type([3], FaultType::Offline).await;
+    builder.set_fault_type([3], FaultType::Offline);
 
     // Publish a blob on chain 1.
     let blob_id = Blob::new(BlobContent::new_data(blob_bytes.clone())).id();
     let certificate = client1
         .publish_data_blob(blob_bytes)
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     assert_eq!(certificate.round, Round::Fast);
 
     // Send a message from chain 2 to chain 3.
@@ -2626,27 +2587,26 @@ where
         .transfer(
             AccountOwner::CHAIN,
             Amount::from_millis(1),
-            Recipient::chain(chain_id3),
+            Account::chain(chain_id3),
         )
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     client3.synchronize_from_validators().await.unwrap();
     assert_eq!(certificate.round, Round::Fast);
 
-    builder.set_fault_type([2], FaultType::Offline).await;
-    builder.set_fault_type([3], FaultType::Honest).await;
+    builder.set_fault_type([2], FaultType::Offline);
+    builder.set_fault_type([3], FaultType::Honest);
 
     // Client 3 should be able to update validator 3 about the blob and the message.
     let certificate = client3
-        .execute_operation(SystemOperation::ReadBlob { blob_id })
+        .execute_operation(SystemOperation::VerifyBlob { blob_id })
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
+
     // This read a new blob, so it cannot be a fast block.
     assert_eq!(certificate.round, Round::MultiLeader(0));
     let block = certificate.block();
-    assert_eq!(block.body.incoming_bundles.len(), 1);
+    assert_eq!(block.body.incoming_bundles().count(), 1);
     assert_eq!(block.required_blob_ids().len(), 1);
 
     // This will go way over the limit, because of the different overheads.
@@ -2679,7 +2639,7 @@ where
 }
 
 #[test_case(MemoryStorageBuilder::default(); "memory")]
-#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new().await; "storage_service"))]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
 #[test_log::test(tokio::test)]
 async fn test_blob_fees<B>(storage_builder: B) -> anyhow::Result<()>
 where
@@ -2704,16 +2664,120 @@ where
     client
         .publish_data_blob(bytes.to_vec())
         .await
-        .unwrap()
-        .unwrap();
+        .unwrap_ok_committed();
     expected_balance = expected_balance
         - policy.blob_published
         - policy.blob_byte_published * (blob.bytes().len() as u128);
     assert_eq!(client.local_balance().await.unwrap(), expected_balance);
 
     client.read_data_blob(blob_id.hash).await.unwrap().unwrap();
-    expected_balance =
-        expected_balance - policy.blob_read - policy.blob_byte_read * (blob.bytes().len() as u128);
+    expected_balance = expected_balance - policy.blob_read;
     assert_eq!(client.local_balance().await.unwrap(), expected_balance);
+    Ok(())
+}
+
+#[test_case(MemoryStorageBuilder::default(); "memory")]
+#[cfg_attr(feature = "storage-service", test_case(ServiceStorageBuilder::new(); "storage_service"))]
+#[cfg_attr(feature = "rocksdb", test_case(RocksDbStorageBuilder::new().await; "rocks_db"))]
+#[cfg_attr(feature = "dynamodb", test_case(DynamoDbStorageBuilder::default(); "dynamo_db"))]
+#[cfg_attr(feature = "scylladb", test_case(ScyllaDbStorageBuilder::default(); "scylla_db"))]
+#[test_log::test(tokio::test)]
+async fn test_validator_outdated_admin_chain<B>(storage_builder: B) -> anyhow::Result<()>
+where
+    B: StorageBuilder,
+{
+    let mut signer = InMemorySigner::new(None);
+    let new_public_key = signer.generate_new();
+    let mut builder = TestBuilder::new(storage_builder, 4, 0, signer).await?;
+
+    let admin_client = builder.add_root_chain(0, Amount::from_tokens(1000)).await?;
+    let client1 = builder.add_root_chain(1, Amount::from_tokens(1000)).await?;
+
+    // Take one validator down - they will miss committee changes.
+    builder.set_fault_type([3], FaultType::Offline);
+
+    // Start by creating a block in epoch 0.
+    let certificate0 = client1
+        .transfer(
+            AccountOwner::CHAIN,
+            Amount::ONE,
+            Account::chain(admin_client.chain_id()),
+        )
+        .await
+        .unwrap_ok_committed();
+
+    assert_eq!(certificate0.block().header.epoch, Epoch::from(0));
+
+    // Advance the epoch.
+    admin_client
+        .stage_new_committee(builder.initial_committee.clone())
+        .await
+        .unwrap();
+
+    // Process the inbox to migrate the client's chain.
+    client1.synchronize_from_validators().await.unwrap();
+    client1.process_inbox().await.unwrap();
+
+    // Open a chain
+    let (new_chain_desc, certificate1) = client1
+        .open_chain(
+            ChainOwnership::single(new_public_key.into()),
+            ApplicationPermissions::default(),
+            Amount::from_tokens(10),
+        )
+        .await
+        .unwrap_ok_committed();
+
+    // Check that the epoch has been migrated.
+    assert_eq!(certificate1.block().header.epoch, Epoch::from(1));
+
+    // Make a client to try the new chain.
+    let mut client2 = builder
+        .make_client(new_chain_desc.id(), None, BlockHeight::ZERO)
+        .await?;
+    client2.set_preferred_owner(new_public_key.into());
+    client2.synchronize_from_validators().await.unwrap();
+    client2
+        .receive_certificate_and_update_validators(certificate1)
+        .await
+        .unwrap();
+
+    // Let's deactivate another validator and reactivate the one that was offline.
+    // Now the client will have to update validator 3 on the admin chain in order for the
+    // next blocks to be correctly processed.
+    builder.set_fault_type([2], FaultType::Offline);
+    builder.set_fault_type([3], FaultType::Honest);
+
+    let admin_tip = builder
+        .node(3)
+        .chain_info_with_manager_values(admin_client.chain_id())
+        .await
+        .unwrap()
+        .next_block_height;
+    // At this point, validator 3 should have zero blocks on the admin chain.
+    assert_eq!(admin_tip, 0.into());
+
+    // Update the validators on the chain.
+    // If it works, it means the validator has been correctly updated.
+    client2.update_validators(None).await.unwrap();
+
+    client2
+        .transfer(
+            AccountOwner::CHAIN,
+            Amount::from_tokens(3),
+            Account::chain(admin_client.chain_id()),
+        )
+        .await
+        .unwrap_ok_committed();
+
+    let admin_tip = builder
+        .node(3)
+        .chain_info_with_manager_values(admin_client.chain_id())
+        .await
+        .unwrap()
+        .next_block_height;
+    // Validator 3 should be up to date on the admin chain.
+    assert_eq!(admin_tip, 2.into());
+
     Ok(())
 }

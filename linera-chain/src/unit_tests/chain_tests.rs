@@ -6,7 +6,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     thread,
-    time::{Duration, Instant},
 };
 
 use assert_matches::assert_matches;
@@ -18,13 +17,13 @@ use linera_base::{
         ChainDescription, ChainOrigin, Epoch, InitialChainConfig, Timestamp,
     },
     http,
-    identifiers::{AccountOwner, ApplicationId, ChainId, ModuleId},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, ModuleId},
     ownership::ChainOwnership,
+    time::{Duration, Instant},
     vm::VmRuntime,
 };
 use linera_execution::{
     committee::{Committee, ValidatorState},
-    system::Recipient,
     test_utils::{ExpectedCall, MockApplication},
     BaseRuntime, ContractRuntime, ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext,
     Operation, ResourceControlPolicy, ServiceRuntime, SystemOperation, TestExecutionRuntimeContext,
@@ -199,7 +198,7 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
         .with_authenticated_signer(Some(owner))
         .with_operation(SystemOperation::Transfer {
             owner: AccountOwner::CHAIN,
-            recipient: Recipient::chain(env.admin_id()),
+            recipient: Account::chain(env.admin_id()),
             amount: Amount::ONE,
         });
 
@@ -208,7 +207,7 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
         .clone()
         .with_operation(SystemOperation::Transfer {
             owner: AccountOwner::CHAIN,
-            recipient: Recipient::chain(env.admin_id()),
+            recipient: Account::chain(env.admin_id()),
             amount: Amount::ONE,
         });
 
@@ -269,12 +268,11 @@ async fn test_application_permissions() -> anyhow::Result<()> {
     let mut chain = ChainStateView::new(chain_id).await;
 
     let extra = &chain.context().extra();
-    extra
-        .user_contracts()
-        .insert(application_id, application.clone().into());
-    extra
-        .user_contracts()
-        .insert(another_app_id, application.clone().into());
+    {
+        let pinned = extra.user_contracts().pin();
+        pinned.insert(application_id, application.clone().into());
+        pinned.insert(another_app_id, application.clone().into());
+    }
 
     extra
         .add_blobs([committee_blob(Default::default())])
@@ -724,12 +722,14 @@ async fn prepare_test_with_dummy_mock_application(
     let application_id = ApplicationId::from(&app_description);
     let application = MockApplication::default();
     let extra = &chain.context().extra();
-    extra
-        .user_contracts()
-        .insert(application_id, application.clone().into());
-    extra
-        .user_services()
-        .insert(application_id, application.clone().into());
+    {
+        let pinned = extra.user_contracts().pin();
+        pinned.insert(application_id, application.clone().into());
+    }
+    {
+        let pinned = extra.user_services().pin();
+        pinned.insert(application_id, application.clone().into());
+    }
     extra
         .add_blobs([
             committee_blob,

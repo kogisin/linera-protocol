@@ -9,8 +9,8 @@ use futures::stream::LocalBoxStream as BoxStream;
 use futures::stream::Stream;
 use linera_base::{
     crypto::{CryptoError, CryptoHash, ValidatorPublicKey},
-    data_types::{ArithmeticError, Blob, BlobContent, BlockHeight, NetworkDescription},
-    identifiers::{BlobId, ChainId},
+    data_types::{ArithmeticError, Blob, BlobContent, BlockHeight, NetworkDescription, Round},
+    identifiers::{BlobId, ChainId, EventId},
 };
 use linera_chain::{
     data_types::BlockProposal,
@@ -145,8 +145,21 @@ pub trait ValidatorNode {
         hashes: Vec<CryptoHash>,
     ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError>;
 
+    /// Requests a batch of certificates from a specific chain by heights.
+    async fn download_certificates_by_heights(
+        &self,
+        chain_id: ChainId,
+        heights: Vec<BlockHeight>,
+    ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError>;
+
     /// Returns the hash of the `Certificate` that last used a blob.
     async fn blob_last_used_by(&self, blob_id: BlobId) -> Result<CryptoHash, NodeError>;
+
+    /// Returns the certificate that last used the blob.
+    async fn blob_last_used_by_certificate(
+        &self,
+        blob_id: BlobId,
+    ) -> Result<ConfirmedBlockCertificate, NodeError>;
 
     /// Returns the missing `Blob`s by their IDs.
     async fn missing_blob_ids(&self, blob_ids: Vec<BlobId>) -> Result<Vec<BlobId>, NodeError>;
@@ -213,10 +226,21 @@ pub enum NodeError {
     #[error("The chain {0} is not active in validator")]
     InactiveChain(ChainId),
 
+    #[error("Round number should be {0:?}")]
+    WrongRound(Round),
+
+    #[error(
+        "Was expecting block height {expected_block_height} but found {found_block_height} instead"
+    )]
+    UnexpectedBlockHeight {
+        expected_block_height: BlockHeight,
+        found_block_height: BlockHeight,
+    },
+
     // This error must be normalized during conversions.
     #[error(
-        "Cannot vote for block proposal of chain {chain_id:?} because a message \
-         from chain {origin:?} at height {height:?} has not been received yet"
+        "Cannot vote for block proposal of chain {chain_id} because a message \
+         from chain {origin} at height {height} has not been received yet"
     )]
     MissingCrossChainUpdate {
         chain_id: ChainId,
@@ -227,6 +251,9 @@ pub enum NodeError {
     #[error("Blobs not found: {0:?}")]
     BlobsNotFound(Vec<BlobId>),
 
+    #[error("Events not found: {0:?}")]
+    EventsNotFound(Vec<EventId>),
+
     // This error must be normalized during conversions.
     #[error("We don't have the value for the certificate.")]
     MissingCertificateValue,
@@ -234,8 +261,8 @@ pub enum NodeError {
     #[error("Response doesn't contain requested certificates: {0:?}")]
     MissingCertificates(Vec<CryptoHash>),
 
-    #[error("Validator's response to block proposal failed to include a vote")]
-    MissingVoteInValidatorResponse,
+    #[error("Validator's response failed to include a vote when trying to {0}")]
+    MissingVoteInValidatorResponse(String),
 
     #[error("The received chain info response is invalid")]
     InvalidChainInfoResponse,
@@ -274,6 +301,18 @@ pub enum NodeError {
     EmptyBlobsNotFound,
     #[error("Local error handling validator response: {error}")]
     ResponseHandlingError { error: String },
+
+    #[error("Missing certificates for chain {chain_id} in heights {heights:?}")]
+    MissingCertificatesByHeights {
+        chain_id: ChainId,
+        heights: Vec<BlockHeight>,
+    },
+
+    #[error("Too many certificates returned for chain {chain_id} from {remote_node}")]
+    TooManyCertificatesReturned {
+        chain_id: ChainId,
+        remote_node: Box<ValidatorPublicKey>,
+    },
 }
 
 impl From<tonic::Status> for NodeError {
@@ -338,15 +377,21 @@ impl From<ChainError> for NodeError {
                 height,
             },
             ChainError::InactiveChain(chain_id) => Self::InactiveChain(chain_id),
-            ChainError::ExecutionError(execution_error, context) => {
-                if let ExecutionError::BlobsNotFound(blob_ids) = *execution_error {
-                    Self::BlobsNotFound(blob_ids)
-                } else {
-                    Self::ChainError {
-                        error: ChainError::ExecutionError(execution_error, context).to_string(),
-                    }
-                }
-            }
+            ChainError::ExecutionError(execution_error, context) => match *execution_error {
+                ExecutionError::BlobsNotFound(blob_ids) => Self::BlobsNotFound(blob_ids),
+                ExecutionError::EventsNotFound(event_ids) => Self::EventsNotFound(event_ids),
+                _ => Self::ChainError {
+                    error: ChainError::ExecutionError(execution_error, context).to_string(),
+                },
+            },
+            ChainError::UnexpectedBlockHeight {
+                expected_block_height,
+                found_block_height,
+            } => Self::UnexpectedBlockHeight {
+                expected_block_height,
+                found_block_height,
+            },
+            ChainError::WrongRound(round) => Self::WrongRound(round),
             error => Self::ChainError {
                 error: error.to_string(),
             },
@@ -360,6 +405,14 @@ impl From<WorkerError> for NodeError {
             WorkerError::ChainError(error) => (*error).into(),
             WorkerError::MissingCertificateValue => Self::MissingCertificateValue,
             WorkerError::BlobsNotFound(blob_ids) => Self::BlobsNotFound(blob_ids),
+            WorkerError::EventsNotFound(event_ids) => Self::EventsNotFound(event_ids),
+            WorkerError::UnexpectedBlockHeight {
+                expected_block_height,
+                found_block_height,
+            } => NodeError::UnexpectedBlockHeight {
+                expected_block_height,
+                found_block_height,
+            },
             error => Self::WorkerError {
                 error: error.to_string(),
             },

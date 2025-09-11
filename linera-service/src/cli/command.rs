@@ -19,31 +19,19 @@ use linera_client::{
     util,
 };
 use linera_rpc::config::CrossChainConfig;
-#[cfg(feature = "benchmark")]
-use serde::Serialize;
 
-#[cfg(feature = "benchmark")]
 const DEFAULT_TOKENS_PER_CHAIN: Amount = Amount::from_millis(100);
-#[cfg(feature = "benchmark")]
 const DEFAULT_TRANSACTIONS_PER_BLOCK: usize = 1;
-#[cfg(feature = "benchmark")]
 const DEFAULT_WRAP_UP_MAX_IN_FLIGHT: usize = 5;
-#[cfg(feature = "benchmark")]
+const DEFAULT_NUM_CHAINS: usize = 10;
 const DEFAULT_BPS: usize = 10;
 
-// Make sure that the default values are consts, and that they are used in the Default impl.
-#[cfg(feature = "benchmark")]
-#[derive(Clone, Serialize, clap::Args)]
+#[derive(Clone, clap::Args, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct BenchmarkCommand {
-    /// Wether to use cross chain messages in the transactions or not. This effectively sets the
-    /// chain group size to 1.
-    #[arg(long)]
-    pub dont_use_cross_chain_messages: bool,
-
-    /// How many chain groups to use. If not provided, the number of CPUs will be used.
-    #[arg(long)]
-    pub num_chain_groups: Option<usize>,
+pub struct BenchmarkOptions {
+    /// How many chains to use.
+    #[arg(long, default_value_t = DEFAULT_NUM_CHAINS)]
+    pub num_chains: usize,
 
     /// How many tokens to assign to each newly created chain.
     /// These need to cover the transaction fees per chain for the benchmark.
@@ -91,21 +79,30 @@ pub struct BenchmarkCommand {
     #[arg(long)]
     pub runtime_in_seconds: Option<u64>,
 
-    /// The delay between chain groups, in milliseconds. For example, if set to 200ms, the first
-    /// chain group will start, then the second will start 200 ms after the first one, the third
+    /// The delay between chains, in milliseconds. For example, if set to 200ms, the first
+    /// chain will start, then the second will start 200 ms after the first one, the third
     /// 200 ms after the second one, and so on.
     /// This is used for slowly ramping up the TPS, so we don't pound the validators with the full
     /// TPS all at once.
     #[arg(long)]
-    pub delay_between_chain_groups_ms: Option<u64>,
+    pub delay_between_chains_ms: Option<u64>,
+
+    /// Path to YAML file containing chain IDs to send transfers to.
+    /// If not provided, only transfers between chains in the same wallet.
+    #[arg(long)]
+    pub config_path: Option<PathBuf>,
+
+    /// Transaction distribution mode. If false (default), distributes transactions evenly
+    /// across chains within each block. If true, sends all transactions in each block
+    /// to a single chain, rotating through chains for subsequent blocks.
+    #[arg(long)]
+    pub single_destination_per_block: bool,
 }
 
-#[cfg(feature = "benchmark")]
-impl Default for BenchmarkCommand {
+impl Default for BenchmarkOptions {
     fn default() -> Self {
         Self {
-            dont_use_cross_chain_messages: false,
-            num_chain_groups: None,
+            num_chains: DEFAULT_NUM_CHAINS,
             tokens_per_chain: DEFAULT_TOKENS_PER_CHAIN,
             transactions_per_block: DEFAULT_TRANSACTIONS_PER_BLOCK,
             wrap_up_max_in_flight: DEFAULT_WRAP_UP_MAX_IN_FLIGHT,
@@ -115,7 +112,57 @@ impl Default for BenchmarkCommand {
             health_check_endpoints: None,
             confirm_before_start: false,
             runtime_in_seconds: None,
-            delay_between_chain_groups_ms: None,
+            delay_between_chains_ms: None,
+            config_path: None,
+            single_destination_per_block: false,
+        }
+    }
+}
+
+#[derive(Clone, clap::Subcommand, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BenchmarkCommand {
+    /// Start a single benchmark process, maintaining a given TPS.
+    Single {
+        #[command(flatten)]
+        options: BenchmarkOptions,
+    },
+
+    /// Run multiple benchmark processes in parallel.
+    Multi {
+        #[command(flatten)]
+        options: BenchmarkOptions,
+
+        /// The number of benchmark processes to run in parallel.
+        #[arg(long, default_value = "1")]
+        processes: usize,
+
+        /// The faucet (which implicitly defines the network)
+        #[arg(long)]
+        faucet: String,
+
+        /// If specified, a directory with a random name will be created in this directory, and the
+        /// client state will be stored there.
+        /// If not specified, a temporary directory will be used for each client.
+        #[arg(long)]
+        client_state_dir: Option<String>,
+
+        /// The delay between starting the benchmark processes, in seconds.
+        /// If --cross-wallet-transfers is true, this will be ignored.
+        #[arg(long, default_value = "10")]
+        delay_between_processes: u64,
+
+        /// Whether to send transfers between chains in different wallets.
+        #[arg(long)]
+        cross_wallet_transfers: bool,
+    },
+}
+
+impl BenchmarkCommand {
+    pub fn transactions_per_block(&self) -> usize {
+        match self {
+            Self::Single { options } => options.transactions_per_block,
+            Self::Multi { options, .. } => options.transactions_per_block,
         }
     }
 }
@@ -156,6 +203,10 @@ pub enum ClientCommand {
         /// balance.
         #[arg(long = "initial-balance", default_value = "0")]
         balance: Amount,
+
+        /// Whether to create a super owner for the new chain.
+        #[arg(long)]
+        super_owner: bool,
     },
 
     /// Open (i.e. activate) a new multi-owner chain deriving the UID from an existing one.
@@ -466,35 +517,9 @@ pub enum ClientCommand {
         http_request_allow_list: Option<Vec<String>>,
     },
 
-    /// Start a benchmark, maintaining a given TPS or just sending one transfer per chain in bulk mode.
-    #[cfg(feature = "benchmark")]
+    /// Run benchmarks to test network performance.
+    #[command(subcommand)]
     Benchmark(BenchmarkCommand),
-
-    /// Runs multiple `linera benchmark` processes in parallel.
-    #[cfg(feature = "benchmark")]
-    MultiBenchmark {
-        /// The number of `linera benchmark` processes to run in parallel.
-        #[arg(long, default_value = "1")]
-        processes: usize,
-
-        /// The faucet (which implicitly defines the network)
-        #[arg(long)]
-        faucet: String,
-
-        /// If specified, a directory with a random name will be created in this directory, and the
-        /// client state will be stored there.
-        /// If not specified, a temporary directory will be used for each client.
-        #[arg(long)]
-        client_state_dir: Option<String>,
-
-        /// The benchmark command to run.
-        #[clap(flatten)]
-        command: BenchmarkCommand,
-
-        /// The delay between starting the benchmark processes, in seconds.
-        #[arg(long, default_value = "10")]
-        delay_between_processes: u64,
-    },
 
     /// Create genesis configuration for a Linera deployment.
     /// Create initial user chains and print information to be used for initialization of validator setup.
@@ -717,7 +742,12 @@ pub enum ClientCommand {
 
         /// The port on which to run the server
         #[arg(long, default_value = "8080")]
-        port: NonZeroU16,
+        port: u16,
+
+        /// The port for prometheus to scrape.
+        #[cfg(with_metrics)]
+        #[arg(long, default_value = "9090")]
+        metrics_port: u16,
 
         /// The number of tokens to send to each new chain.
         #[arg(long)]
@@ -731,6 +761,14 @@ pub enum ClientCommand {
         /// Configuration for the faucet chain listener.
         #[command(flatten)]
         config: ChainListenerConfig,
+
+        /// Path to the persistent storage file for faucet mappings.
+        #[arg(long)]
+        storage_path: Option<PathBuf>,
+
+        /// Maximum number of operations to include in a single block (default: 100).
+        #[arg(long, default_value = "100")]
+        max_batch_size: usize,
     },
 
     /// Publish module.
@@ -946,10 +984,8 @@ impl ClientCommand {
             | ClientCommand::Assign { .. }
             | ClientCommand::Wallet { .. }
             | ClientCommand::RetryPendingBlock { .. } => "client".into(),
-            #[cfg(feature = "benchmark")]
-            ClientCommand::Benchmark { .. } => "benchmark".into(),
-            #[cfg(feature = "benchmark")]
-            ClientCommand::MultiBenchmark { .. } => "multi-benchmark".into(),
+            ClientCommand::Benchmark(BenchmarkCommand::Single { .. }) => "single-benchmark".into(),
+            ClientCommand::Benchmark(BenchmarkCommand::Multi { .. }) => "multi-benchmark".into(),
             ClientCommand::Net { .. } => "net".into(),
             ClientCommand::Project { .. } => "project".into(),
             ClientCommand::Watch { .. } => "watch".into(),
@@ -1084,9 +1120,17 @@ pub enum NetCommand {
         #[arg(long, default_value = "1000")]
         faucet_amount: Amount,
 
-        /// The number of block exporters per validator in the local test network. Default is 0.
-        #[arg(long, default_value = "0")]
-        block_exporters: u32,
+        /// Whether to start a block exporter for each validator.
+        #[arg(long, default_value = "false")]
+        with_block_exporter: bool,
+
+        /// The address of the block exporter.
+        #[arg(long, default_value = "localhost")]
+        exporter_address: String,
+
+        /// The port on which to run the block exporter.
+        #[arg(long, default_value = "8081")]
+        exporter_port: NonZeroU16,
 
         /// Use dual store (rocksdb and scylladb) instead of just scylladb. This is exclusive for
         /// kubernetes deployments.

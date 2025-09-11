@@ -10,9 +10,10 @@ use linera_execution::{
     test_utils::{
         create_dummy_user_application_description, dummy_chain_description, SystemExecutionState,
     },
-    ExecutionRuntimeConfig, ExecutionRuntimeContext, Operation, OperationContext, Query,
-    QueryContext, QueryOutcome, QueryResponse, ResourceControlPolicy, ResourceController,
-    ResourceTracker, TransactionTracker, WasmContractModule, WasmRuntime, WasmServiceModule,
+    ExecutionRuntimeConfig, ExecutionRuntimeContext, ExecutionStateActor, Operation,
+    OperationContext, Query, QueryContext, QueryOutcome, QueryResponse, ResourceControlPolicy,
+    ResourceController, ResourceTracker, TransactionTracker, WasmContractModule, WasmRuntime,
+    WasmServiceModule,
 };
 use linera_views::{context::Context as _, views::View};
 use serde_json::json;
@@ -46,17 +47,17 @@ async fn test_fuel_for_counter_wasm_application(
 
     let contract =
         WasmContractModule::from_file("tests/fixtures/counter_contract.wasm", wasm_runtime).await?;
-    view.context()
-        .extra()
-        .user_contracts()
-        .insert(app_id, contract.into());
+    {
+        let pinned = view.context().extra().user_contracts().pin();
+        pinned.insert(app_id, contract.into());
+    }
 
     let service =
         WasmServiceModule::from_file("tests/fixtures/counter_service.wasm", wasm_runtime).await?;
-    view.context()
-        .extra()
-        .user_services()
-        .insert(app_id, service.into());
+    {
+        let pinned = view.context().extra().user_services().pin();
+        pinned.insert(app_id, service.into());
+    }
 
     view.context()
         .extra()
@@ -72,7 +73,6 @@ async fn test_fuel_for_counter_wasm_application(
         height: BlockHeight(0),
         round: Some(0),
         authenticated_signer: None,
-        authenticated_caller_id: None,
         timestamp: Default::default(),
     };
     let increments = [2_u64, 9, 7, 1000];
@@ -91,13 +91,12 @@ async fn test_fuel_for_counter_wasm_application(
         } else {
             vec![]
         });
-        view.execute_operation(
-            context,
-            Operation::user_without_abi(app_id, increment).unwrap(),
-            &mut txn_tracker,
-            &mut controller,
-        )
-        .await?;
+        ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+            .execute_operation(
+                context,
+                Operation::user_without_abi(app_id, increment).unwrap(),
+            )
+            .await?;
         let txn_outcome = txn_tracker.into_outcome().unwrap();
         assert!(txn_outcome.outgoing_messages.is_empty());
     }

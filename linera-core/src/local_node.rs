@@ -7,15 +7,15 @@ use std::{
     sync::Arc,
 };
 
-use futures::{future::Either, stream::FuturesUnordered, TryStreamExt as _};
+use futures::{stream::FuturesUnordered, TryStreamExt as _};
 use linera_base::{
     crypto::ValidatorPublicKey,
-    data_types::{ApplicationDescription, ArithmeticError, Blob, BlockHeight, Epoch},
-    identifiers::{ApplicationId, BlobId, ChainId},
+    data_types::{ArithmeticError, Blob, BlockHeight, Epoch},
+    identifiers::{BlobId, ChainId},
 };
 use linera_chain::{
     data_types::{BlockProposal, ProposedBlock},
-    types::{Block, GenericCertificate, LiteCertificate},
+    types::{Block, GenericCertificate},
     ChainStateView,
 };
 use linera_execution::{committee::Committee, BlobState, Query, QueryOutcome};
@@ -94,18 +94,6 @@ where
     }
 
     #[instrument(level = "trace", skip_all)]
-    pub async fn handle_lite_certificate(
-        &self,
-        certificate: LiteCertificate<'_>,
-        notifier: &impl Notifier,
-    ) -> Result<ChainInfoResponse, LocalNodeError> {
-        match self.node.state.full_certificate(certificate).await? {
-            Either::Left(confirmed) => Ok(self.handle_certificate(confirmed, notifier).await?),
-            Either::Right(validated) => Ok(self.handle_certificate(validated, notifier).await?),
-        }
-    }
-
-    #[instrument(level = "trace", skip_all)]
     pub async fn handle_certificate<T>(
         &self,
         certificate: GenericCertificate<T>,
@@ -167,7 +155,7 @@ where
         Ok(storage.read_blobs(blob_ids).await?.into_iter().collect())
     }
 
-    /// Reads blob states from storage
+    /// Reads blob states from storage.
     pub async fn read_blob_states_from_storage(
         &self,
         blob_ids: &[BlobId],
@@ -260,20 +248,6 @@ where
         Ok(outcome)
     }
 
-    #[instrument(level = "trace", skip(self))]
-    pub async fn describe_application(
-        &self,
-        chain_id: ChainId,
-        application_id: ApplicationId,
-    ) -> Result<ApplicationDescription, LocalNodeError> {
-        let response = self
-            .node
-            .state
-            .describe_application(chain_id, application_id)
-            .await?;
-        Ok(response)
-    }
-
     /// Handles any pending local cross-chain requests.
     #[instrument(level = "trace", skip(self))]
     pub async fn retry_pending_cross_chain_requests(
@@ -283,7 +257,7 @@ where
         let (_response, actions) = self
             .node
             .state
-            .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
+            .handle_chain_info_query(ChainInfoQuery::new(sender_chain).with_network_actions())
             .await?;
         let mut requests = VecDeque::from_iter(actions.cross_chain_requests);
         while let Some(request) = requests.pop_front() {

@@ -3,15 +3,13 @@
 
 //! Tests for how the runtime computes fees based on consumed resources.
 
-#![allow(clippy::items_after_test_module)]
-
 use std::{collections::BTreeSet, sync::Arc, vec};
 
 use linera_base::{
     crypto::AccountPublicKey,
     data_types::{Amount, BlockHeight, OracleResponse},
     http,
-    identifiers::{Account, AccountOwner, MessageId},
+    identifiers::{Account, AccountOwner},
     vm::VmRuntime,
 };
 use linera_execution::{
@@ -19,8 +17,8 @@ use linera_execution::{
         blob_oracle_responses, dummy_chain_description, ExpectedCall, RegisterMockApplication,
         SystemExecutionState,
     },
-    ContractRuntime, ExecutionError, Message, MessageContext, ResourceControlPolicy,
-    ResourceController, ResourceTracker, TransactionTracker,
+    ContractRuntime, ExecutionError, ExecutionStateActor, Message, MessageContext,
+    ResourceControlPolicy, ResourceController, ResourceTracker, TransactionTracker,
 };
 use test_case::test_case;
 
@@ -278,31 +276,30 @@ async fn test_fee_consumption(
         .or(None);
     let context = MessageContext {
         chain_id,
+        origin: chain_id,
         is_bouncing: false,
         authenticated_signer,
         refund_grant_to,
         height: BlockHeight(0),
         round: Some(0),
-        message_id: MessageId::default(),
         timestamp: Default::default(),
     };
     let mut grant = initial_grant.unwrap_or_default();
     let mut txn_tracker = TransactionTracker::new_replaying(oracle_responses);
-    view.execute_message(
-        context,
-        Message::User {
-            application_id,
-            bytes: vec![],
-        },
-        if initial_grant.is_some() {
-            Some(&mut grant)
-        } else {
-            None
-        },
-        &mut txn_tracker,
-        &mut controller,
-    )
-    .await?;
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_message(
+            context,
+            Message::User {
+                application_id,
+                bytes: vec![],
+            },
+            if initial_grant.is_some() {
+                Some(&mut grant)
+            } else {
+                None
+            },
+        )
+        .await?;
 
     let txn_outcome = txn_tracker.into_outcome()?;
     assert!(txn_outcome.outgoing_messages.is_empty());
@@ -393,8 +390,7 @@ impl FeeSpend {
             FeeSpend::Read(_key, value) => {
                 let value_read_fee = value
                     .as_ref()
-                    .map(|value| Amount::from(value.len() as u128))
-                    .unwrap_or(Amount::ZERO);
+                    .map_or(Amount::ZERO, |value| Amount::from(value.len() as u128));
 
                 policy.read_operation.saturating_add(value_read_fee)
             }

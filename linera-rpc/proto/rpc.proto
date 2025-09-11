@@ -13,8 +13,7 @@ service NotifierService {
 // Interface provided by each physical shard (aka "worker") of a validator or a local node.
 // * All commands return either the current chain info or an error.
 // * Repeating commands produces no changes and returns no error.
-// * Some handlers may return cross-chain requests, that is, messages
-//   to be communicated to other workers of the same validator.
+// * Some handlers may return cross-chain requests, that is, messages to be communicated to other workers of the same validator.
 service ValidatorWorker {
   // Propose a new block.
   rpc HandleBlockProposal(BlockProposal) returns (ChainInfoResult);
@@ -86,11 +85,40 @@ service ValidatorNode {
   // Download a batch of certificates.
   rpc DownloadCertificates(CertificatesBatchRequest) returns (CertificatesBatchResponse);
 
+  /// Download a batch of certificates by heights.
+  rpc DownloadCertificatesByHeights(DownloadCertificatesByHeightsRequest) returns (CertificatesBatchResponse);
+
+  // Download a batch of certificates, in serialized form, by their heights.
+  rpc DownloadRawCertificatesByHeights(DownloadCertificatesByHeightsRequest) returns (RawCertificatesBatch);
+
   // Return the hash of the `Certificate` that last used a blob.
   rpc BlobLastUsedBy(BlobId) returns (CryptoHash);
 
+  // Returns the certificate that last used the blob.
+  rpc BlobLastUsedByCertificate(BlobId) returns (Certificate);
+
+
   // Return the `BlobId`s that are not contained as `Blob`.
   rpc MissingBlobIds(BlobIds) returns (BlobIds);
+}
+
+// Batch of raw certificates.
+message RawCertificatesBatch {
+  repeated RawCertificate certificates = 1;
+}
+
+// A confirmed block certificate in a serialized form.
+message RawCertificate {
+  // BCS-serialized bytes of lite certificate part.
+  bytes lite_certificate = 1;
+  // BCS-serialized bytes of confirmed block part.
+  bytes confirmed_block = 2;
+}
+
+// A request for downloading certificates by block heights.
+message DownloadCertificatesByHeightsRequest {
+  ChainId chain_id = 1;
+  repeated BlockHeight heights = 2;
 }
 
 // A request for a batch of certificates.
@@ -173,6 +201,8 @@ message ConfirmUpdatedRecipient {
 
 // Request information on a chain.
 message ChainInfoQuery {
+  // Removed `request_sent_certificate_hashes_in_range`
+  reserved 5;
   // The chain ID
   ChainId chain_id = 1;
 
@@ -185,23 +215,26 @@ message ChainInfoQuery {
   // Query the received messages that are waiting to be picked in the next block.
   bool request_pending_message_bundles = 4;
 
-  // Query a range of certificates hashes sent from the chain.
-  optional bytes request_sent_certificate_hashes_in_range = 5;
-
   // Query new certificate removed from the chain.
   optional uint64 request_received_log_excluding_first_n = 6;
 
   // Query values from the chain manager, not just votes.
   bool request_manager_values = 7;
 
-  // Request a signed vote for a leader timeout.
-  bool request_leader_timeout = 8;
+  // Request a signed vote for a leader timeout for the given height and round.
+  optional bytes request_leader_timeout = 8;
 
   // Query the balance of a given owner.
   AccountOwner request_owner_balance = 9;
 
   // Request a signed vote for fallback mode.
   bool request_fallback = 10;
+
+  // Query for certificate hashes at block heights sent from the chain.
+  optional bytes request_sent_certificate_hashes_by_heights = 11;
+
+  // Whether to create network actions as part of the query.
+  optional bool create_network_actions = 12;
 }
 
 // An authenticated proposal for a new block.

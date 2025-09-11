@@ -3,8 +3,6 @@
 
 //! This module manages the state of a Linera chain, including cross-chain communication.
 
-#![deny(clippy::large_futures)]
-
 pub mod block;
 mod certificate;
 
@@ -26,7 +24,7 @@ pub use chain::ChainStateView;
 use data_types::{MessageBundle, PostedMessage};
 use linera_base::{
     bcs,
-    crypto::{CryptoError, CryptoHash},
+    crypto::CryptoError,
     data_types::{ArithmeticError, BlockHeight, Round, Timestamp},
     identifiers::{ApplicationId, ChainId},
 };
@@ -49,8 +47,8 @@ pub enum ChainError {
     #[error("The chain being queried is not active {0}")]
     InactiveChain(ChainId),
     #[error(
-        "Cannot vote for block proposal of chain {chain_id:?} because a message \
-         from origin {origin:?} at height {height:?} has not been received yet"
+        "Cannot vote for block proposal of chain {chain_id} because a message \
+         from chain {origin} at height {height} has not been received yet"
     )]
     MissingCrossChainUpdate {
         chain_id: ChainId,
@@ -118,13 +116,11 @@ pub enum ChainError {
     #[error("The previous block hash of a new block should match the last block of the chain")]
     UnexpectedPreviousBlockHash,
     #[error("Sequence numbers above the maximal value are not usable for blocks")]
-    InvalidBlockHeight,
+    BlockHeightOverflow,
     #[error(
         "Block timestamp {new} must not be earlier than the parent block's timestamp {parent}"
     )]
     InvalidBlockTimestamp { parent: Timestamp, new: Timestamp },
-    #[error("Cannot initiate a new block while the previous one is still pending confirmation")]
-    PreviousBlockMustBeConfirmedFirst,
     #[error("Round number should be at least {0:?}")]
     InsufficientRound(Round),
     #[error("Round number should be greater than {0:?}")]
@@ -141,16 +137,12 @@ pub enum ChainError {
     CertificateValidatorReuse,
     #[error("Signatures in a certificate must form a quorum")]
     CertificateRequiresQuorum,
-    #[error("Certificate signature verification failed: {error}")]
-    CertificateSignatureVerificationFailed { error: String },
     #[error("Internal error {0}")]
     InternalError(String),
     #[error("Block proposal has size {0} which is too large")]
     BlockProposalTooLarge(usize),
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
-    #[error("Insufficient balance to pay the fees")]
-    InsufficientBalance,
     #[error("Invalid owner weights: {0}")]
     OwnerWeightError(#[from] WeightedError),
     #[error("Closed chains cannot have operations, accepted messages or empty blocks")]
@@ -161,15 +153,12 @@ pub enum ChainError {
     AuthorizedApplications(Vec<ApplicationId>),
     #[error("Missing operations or messages from mandatory applications: {0:?}")]
     MissingMandatoryApplications(Vec<ApplicationId>),
-    #[error("Can't use grant across different broadcast messages")]
-    GrantUseOnBroadcast,
     #[error("Executed block contains fewer oracle responses than requests")]
     MissingOracleResponseList,
-    #[error("Unexpected hash for CertificateValue! Expected: {expected:?}, Actual: {actual:?}")]
-    CertificateValueHashMismatch {
-        expected: CryptoHash,
-        actual: CryptoHash,
-    },
+    #[error("Not signing timeout certificate; current round does not time out")]
+    RoundDoesNotTimeOut,
+    #[error("Not signing timeout certificate; current round times out at time {0}")]
+    NotTimedOutYet(Timestamp),
 }
 
 #[derive(Copy, Clone, Debug)]

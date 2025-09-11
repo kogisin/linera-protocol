@@ -3,35 +3,36 @@
 
 use std::{
     collections::HashMap,
-    iter,
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
 };
 
-use hdrhistogram::Histogram;
 use linera_base::{
     data_types::Amount,
-    identifiers::{AccountOwner, ApplicationId, ChainId},
-    listen_for_shutdown_signals,
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId},
     time::Instant,
 };
-use linera_core::{client::ChainClient, Environment};
-use linera_execution::{
-    committee::Committee,
-    system::{Recipient, SystemOperation},
-    Operation,
+use linera_core::{
+    client::{ChainClient, ChainClientError},
+    Environment,
 };
-use linera_sdk::abis::fungible;
+use linera_execution::{system::SystemOperation, Operation};
+use linera_sdk::abis::fungible::FungibleOperation;
 use num_format::{Locale, ToFormattedString};
 use prometheus_parse::{HistogramCount, Scrape, Value};
+use rand::{rngs::SmallRng, seq::SliceRandom, thread_rng, SeedableRng};
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, Barrier, Notify},
     task, time,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Instrument as _};
+
+use crate::chain_listener::{ChainListener, ClientContext};
 
 const PROXY_LATENCY_P99_THRESHOLD: f64 = 400.0;
 const LATENCY_METRIC_PREFIX: &str = "linera_proxy_request_latency";
@@ -41,7 +42,7 @@ pub enum BenchmarkError {
     #[error("Failed to join task: {0}")]
     JoinError(#[from] task::JoinError),
     #[error("Chain client error: {0}")]
-    ChainClient(#[from] linera_core::client::ChainClientError),
+    ChainClient(#[from] ChainClientError),
     #[error("Current histogram count is less than previous histogram count")]
     HistogramCountMismatch,
     #[error("Expected histogram value, got {0:?}")]
@@ -66,117 +67,16 @@ pub enum BenchmarkError {
     UnexpectedEmptyBucket,
     #[error("Failed to send unit message: {0}")]
     TokioSendUnitError(#[from] mpsc::error::SendError<()>),
-    #[error("Failed to create histogram: {0}")]
-    HistogramCreationError(#[from] hdrhistogram::CreationError),
-    #[error("Failed to record histogram: {0}")]
-    HistogramRecordError(#[from] hdrhistogram::RecordError),
-    #[error("Failed to send block timings message: {0}")]
-    TokioSendBlockTimingsError(#[from] mpsc::error::SendError<BlockTimings>),
-}
-
-struct SubmitFastBlockProposalTimings {
-    creating_proposal_ms: u64,
-    stage_block_execution_ms: u64,
-    creating_confirmed_block_ms: u64,
-    submitting_block_proposal_ms: u64,
-}
-
-struct BlockTimeTimings {
-    get_pending_message_bundles_ms: u64,
-    submit_fast_block_proposal_ms: u64,
-    submit_fast_block_proposal_timings: SubmitFastBlockProposalTimings,
-    communicate_chain_updates_ms: u64,
-}
-
-pub struct BlockTimings {
-    block_time_ms: u64,
-    block_time_timings: BlockTimeTimings,
-}
-
-struct SubmitFastBlockProposalTimingsHistograms {
-    creating_proposal_histogram: Histogram<u64>,
-    stage_block_execution_histogram: Histogram<u64>,
-    creating_confirmed_block_histogram: Histogram<u64>,
-    submitting_block_proposal_histogram: Histogram<u64>,
-}
-
-impl SubmitFastBlockProposalTimingsHistograms {
-    pub fn new() -> Result<Self, BenchmarkError> {
-        Ok(Self {
-            creating_proposal_histogram: Histogram::<u64>::new(2)?,
-            stage_block_execution_histogram: Histogram::<u64>::new(2)?,
-            creating_confirmed_block_histogram: Histogram::<u64>::new(2)?,
-            submitting_block_proposal_histogram: Histogram::<u64>::new(2)?,
-        })
-    }
-
-    pub fn record(
-        &mut self,
-        submit_fast_block_proposal_timings: SubmitFastBlockProposalTimings,
-    ) -> Result<(), BenchmarkError> {
-        self.creating_proposal_histogram
-            .record(submit_fast_block_proposal_timings.creating_proposal_ms)?;
-        self.stage_block_execution_histogram
-            .record(submit_fast_block_proposal_timings.stage_block_execution_ms)?;
-        self.creating_confirmed_block_histogram
-            .record(submit_fast_block_proposal_timings.creating_confirmed_block_ms)?;
-        self.submitting_block_proposal_histogram
-            .record(submit_fast_block_proposal_timings.submitting_block_proposal_ms)?;
-        Ok(())
-    }
-}
-
-struct BlockTimeTimingsHistograms {
-    get_pending_message_bundles_histogram: Histogram<u64>,
-    submit_fast_block_proposal_histogram: Histogram<u64>,
-    submit_fast_block_proposal_timings_histograms: SubmitFastBlockProposalTimingsHistograms,
-    communicate_chain_updates_histogram: Histogram<u64>,
-}
-
-impl BlockTimeTimingsHistograms {
-    pub fn new() -> Result<Self, BenchmarkError> {
-        Ok(Self {
-            get_pending_message_bundles_histogram: Histogram::<u64>::new(2)?,
-            submit_fast_block_proposal_histogram: Histogram::<u64>::new(2)?,
-            submit_fast_block_proposal_timings_histograms:
-                SubmitFastBlockProposalTimingsHistograms::new()?,
-            communicate_chain_updates_histogram: Histogram::<u64>::new(2)?,
-        })
-    }
-
-    pub fn record(&mut self, block_time_timings: BlockTimeTimings) -> Result<(), BenchmarkError> {
-        self.get_pending_message_bundles_histogram
-            .record(block_time_timings.get_pending_message_bundles_ms)?;
-        self.submit_fast_block_proposal_histogram
-            .record(block_time_timings.submit_fast_block_proposal_ms)?;
-        self.submit_fast_block_proposal_timings_histograms
-            .record(block_time_timings.submit_fast_block_proposal_timings)?;
-        self.communicate_chain_updates_histogram
-            .record(block_time_timings.communicate_chain_updates_ms)?;
-        Ok(())
-    }
-}
-
-struct BlockTimingsHistograms {
-    block_time_histogram: Histogram<u64>,
-    block_time_timings_histograms: BlockTimeTimingsHistograms,
-}
-
-impl BlockTimingsHistograms {
-    pub fn new() -> Result<Self, BenchmarkError> {
-        Ok(Self {
-            block_time_histogram: Histogram::<u64>::new(2)?,
-            block_time_timings_histograms: BlockTimeTimingsHistograms::new()?,
-        })
-    }
-
-    pub fn record(&mut self, block_timings: BlockTimings) -> Result<(), BenchmarkError> {
-        self.block_time_histogram
-            .record(block_timings.block_time_ms)?;
-        self.block_time_timings_histograms
-            .record(block_timings.block_time_timings)?;
-        Ok(())
-    }
+    #[error("Config file not found: {0}")]
+    ConfigFileNotFound(std::path::PathBuf),
+    #[error("Failed to load config file: {0}")]
+    ConfigLoadError(#[from] anyhow::Error),
+    #[error("Could not find enough chains in wallet alone: needed {0}, but only found {1}")]
+    NotEnoughChainsInWallet(usize, usize),
+    #[error("Random number generator error: {0}")]
+    RandError(#[from] rand::Error),
+    #[error("Chain listener startup error")]
+    ChainListenerStartupError,
 }
 
 #[derive(Debug)]
@@ -186,62 +86,81 @@ struct HistogramSnapshot {
     sum: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct BenchmarkConfig {
+    pub chain_ids: Vec<ChainId>,
+}
+
+impl BenchmarkConfig {
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config = serde_yaml::from_str(&content)?;
+        Ok(config)
+    }
+
+    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+        let content = serde_yaml::to_string(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
 pub struct Benchmark<Env: Environment> {
     _phantom: std::marker::PhantomData<Env>,
 }
 
 impl<Env: Environment> Benchmark<Env> {
     #[expect(clippy::too_many_arguments)]
-    pub async fn run_benchmark(
-        num_chain_groups: usize,
-        transactions_per_block: usize,
+    pub async fn run_benchmark<C: ClientContext<Environment = Env> + 'static>(
         bps: usize,
-        chain_clients: Vec<Vec<ChainClient<Env>>>,
-        blocks_infos: Vec<Vec<(Vec<Operation>, AccountOwner)>>,
-        committee: Committee,
+        chain_clients: Vec<ChainClient<Env>>,
+        all_chains: Vec<ChainId>,
+        transactions_per_block: usize,
+        fungible_application_id: Option<ApplicationId>,
         health_check_endpoints: Option<String>,
         runtime_in_seconds: Option<u64>,
-        delay_between_chain_groups_ms: Option<u64>,
+        delay_between_chains_ms: Option<u64>,
+        chain_listener: ChainListener<C>,
+        shutdown_notifier: &CancellationToken,
+        single_destination_per_block: bool,
     ) -> Result<(), BenchmarkError> {
-        let bps_counts = (0..num_chain_groups)
+        let num_chains = chain_clients.len();
+        let bps_counts = (0..num_chains)
             .map(|_| Arc::new(AtomicUsize::new(0)))
             .collect::<Vec<_>>();
         let notifier = Arc::new(Notify::new());
-        let barrier = Arc::new(Barrier::new(num_chain_groups + 1));
+        let barrier = Arc::new(Barrier::new(num_chains + 1));
 
-        let shutdown_notifier = CancellationToken::new();
-        tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
+        let chain_listener_future = chain_listener
+            .run()
+            .await
+            .map_err(|_| BenchmarkError::ChainListenerStartupError)?;
+        let chain_listener_handle = tokio::spawn(chain_listener_future.in_current_span());
 
         let bps_control_task = Self::bps_control_task(
             &barrier,
-            &shutdown_notifier,
+            shutdown_notifier,
             &bps_counts,
             &notifier,
             transactions_per_block,
             bps,
         );
 
-        let (block_time_quantiles_sender, block_time_quantiles_task) =
-            Self::block_time_quantiles_task(&shutdown_notifier);
-
         let (runtime_control_task, runtime_control_sender) =
-            Self::runtime_control_task(&shutdown_notifier, runtime_in_seconds, num_chain_groups);
+            Self::runtime_control_task(shutdown_notifier, runtime_in_seconds, num_chains);
 
-        let bps_initial_share = bps / num_chain_groups;
-        let mut bps_remainder = bps % num_chain_groups;
+        let bps_initial_share = bps / num_chains;
+        let mut bps_remainder = bps % num_chains;
         let mut join_set = task::JoinSet::<Result<(), BenchmarkError>>::new();
-        for (chain_group_index, (chain_group, chain_clients)) in blocks_infos
-            .into_iter()
-            .zip(chain_clients.into_iter())
-            .enumerate()
-        {
+        for (chain_idx, chain_client) in chain_clients.into_iter().enumerate() {
+            let chain_id = chain_client.chain_id();
             let shutdown_notifier_clone = shutdown_notifier.clone();
-            let committee = committee.clone();
             let barrier_clone = barrier.clone();
-            let block_time_quantiles_sender = block_time_quantiles_sender.clone();
-            let bps_count_clone = bps_counts[chain_group_index].clone();
+            let bps_count_clone = bps_counts[chain_idx].clone();
             let notifier_clone = notifier.clone();
             let runtime_control_sender_clone = runtime_control_sender.clone();
+            let all_chains_clone = all_chains.clone();
             let bps_share = if bps_remainder > 0 {
                 bps_remainder -= 1;
                 bps_initial_share + 1
@@ -251,38 +170,44 @@ impl<Env: Environment> Benchmark<Env> {
             join_set.spawn(
                 async move {
                     Box::pin(Self::run_benchmark_internal(
-                        chain_group_index,
+                        chain_idx,
+                        chain_id,
                         bps_share,
-                        chain_group,
-                        chain_clients,
+                        chain_client,
+                        all_chains_clone,
+                        transactions_per_block,
+                        fungible_application_id,
                         shutdown_notifier_clone,
                         bps_count_clone,
-                        committee,
-                        block_time_quantiles_sender,
                         barrier_clone,
                         notifier_clone,
                         runtime_control_sender_clone,
-                        delay_between_chain_groups_ms,
+                        delay_between_chains_ms,
+                        single_destination_per_block,
                     ))
                     .await?;
 
                     Ok(())
                 }
-                .instrument(
-                    tracing::info_span!("chain_group", chain_group_index = ?chain_group_index),
-                ),
+                .instrument(tracing::info_span!("chain_id", chain_id = ?chain_id)),
             );
         }
 
         let metrics_watcher =
-            Self::metrics_watcher(health_check_endpoints, shutdown_notifier.clone()).await?;
+            Self::metrics_watcher(health_check_endpoints, shutdown_notifier).await?;
 
-        join_set
-            .join_all()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        info!("All benchmark tasks completed");
+        // Wait for tasks and fail immediately if any task returns an error or panics
+        while let Some(result) = join_set.join_next().await {
+            let inner_result = result?;
+            if let Err(e) = inner_result {
+                error!("Benchmark task failed: {}", e);
+                shutdown_notifier.cancel();
+                join_set.abort_all();
+                return Err(e);
+            }
+        }
+        info!("All benchmark tasks completed successfully");
+
         bps_control_task.await?;
         if let Some(metrics_watcher) = metrics_watcher {
             metrics_watcher.await??;
@@ -290,8 +215,10 @@ impl<Env: Environment> Benchmark<Env> {
         if let Some(runtime_control_task) = runtime_control_task {
             runtime_control_task.await?;
         }
-        drop(block_time_quantiles_sender);
-        block_time_quantiles_task.await??;
+
+        if let Err(e) = chain_listener_handle.await? {
+            tracing::error!("chain listener error: {e}");
+        }
 
         Ok(())
     }
@@ -352,117 +279,9 @@ impl<Env: Environment> Benchmark<Env> {
         )
     }
 
-    fn block_time_quantiles_task(
-        shutdown_notifier: &CancellationToken,
-    ) -> (
-        mpsc::UnboundedSender<BlockTimings>,
-        task::JoinHandle<Result<(), BenchmarkError>>,
-    ) {
-        let shutdown_notifier = shutdown_notifier.clone();
-        let (block_time_quantiles_sender, mut block_time_quantiles_receiver) =
-            mpsc::unbounded_channel();
-        let block_time_quantiles_task: task::JoinHandle<Result<(), BenchmarkError>> = task::spawn(
-            async move {
-                let mut histograms = BlockTimingsHistograms::new()?;
-                let mut block_time_quantiles_timer = Instant::now();
-
-                while let Some(block_timings) = block_time_quantiles_receiver.recv().await {
-                    if shutdown_notifier.is_cancelled() {
-                        info!("Shutdown signal received on block time quantiles task");
-                        break;
-                    }
-
-                    histograms.record(block_timings)?;
-
-                    // Print block time quantiles every 5 seconds.
-                    if block_time_quantiles_timer.elapsed().as_secs() >= 5 {
-                        for quantile in [0.99, 0.95, 0.90, 0.50] {
-                            let formatted_quantile = (quantile * 100.0) as usize;
-
-                            // Overall block timing
-                            info!(
-                                "Block time p{}: {} ms",
-                                formatted_quantile,
-                                histograms.block_time_histogram.value_at_quantile(quantile)
-                            );
-
-                            // Block time breakdown
-                            info!(
-                                "  ├─ Get pending message bundles p{}: {} ms",
-                                formatted_quantile,
-                                histograms
-                                    .block_time_timings_histograms
-                                    .get_pending_message_bundles_histogram
-                                    .value_at_quantile(quantile)
-                            );
-                            info!(
-                                "  ├─ Submit fast block proposal p{}: {} ms",
-                                formatted_quantile,
-                                histograms
-                                    .block_time_timings_histograms
-                                    .submit_fast_block_proposal_histogram
-                                    .value_at_quantile(quantile)
-                            );
-                            info!(
-                                "  │  ├─ Creating proposal p{}: {} ms",
-                                formatted_quantile,
-                                histograms
-                                    .block_time_timings_histograms
-                                    .submit_fast_block_proposal_timings_histograms
-                                    .creating_proposal_histogram
-                                    .value_at_quantile(quantile)
-                            );
-                            info!(
-                                "  │  ├─ Stage block execution p{}: {} ms",
-                                formatted_quantile,
-                                histograms
-                                    .block_time_timings_histograms
-                                    .submit_fast_block_proposal_timings_histograms
-                                    .stage_block_execution_histogram
-                                    .value_at_quantile(quantile)
-                            );
-                            info!(
-                                "  │  ├─ Creating confirmed block p{}: {} ms",
-                                formatted_quantile,
-                                histograms
-                                    .block_time_timings_histograms
-                                    .submit_fast_block_proposal_timings_histograms
-                                    .creating_confirmed_block_histogram
-                                    .value_at_quantile(quantile)
-                            );
-                            info!(
-                                "  │  └─ Submitting block proposal p{}: {} ms",
-                                formatted_quantile,
-                                histograms
-                                    .block_time_timings_histograms
-                                    .submit_fast_block_proposal_timings_histograms
-                                    .submitting_block_proposal_histogram
-                                    .value_at_quantile(quantile)
-                            );
-                            info!(
-                                "  └─ Communicate chain updates p{}: {} ms",
-                                formatted_quantile,
-                                histograms
-                                    .block_time_timings_histograms
-                                    .communicate_chain_updates_histogram
-                                    .value_at_quantile(quantile)
-                            );
-                        }
-                        block_time_quantiles_timer = Instant::now();
-                    }
-                }
-
-                info!("Exiting block time quantiles task");
-                Ok(())
-            }
-            .instrument(tracing::info_span!("block_time_quantiles")),
-        );
-        (block_time_quantiles_sender, block_time_quantiles_task)
-    }
-
     async fn metrics_watcher(
         health_check_endpoints: Option<String>,
-        shutdown_notifier: CancellationToken,
+        shutdown_notifier: &CancellationToken,
     ) -> Result<Option<task::JoinHandle<Result<(), BenchmarkError>>>, BenchmarkError> {
         if let Some(health_check_endpoints) = health_check_endpoints {
             let metrics_addresses = health_check_endpoints
@@ -480,6 +299,7 @@ impl<Env: Environment> Benchmark<Env> {
                 );
             }
 
+            let shutdown_notifier = shutdown_notifier.clone();
             let metrics_watcher: task::JoinHandle<Result<(), BenchmarkError>> = tokio::spawn(
                 async move {
                     let mut health_interval = time::interval(time::Duration::from_secs(5));
@@ -737,96 +557,129 @@ impl<Env: Environment> Benchmark<Env> {
 
     #[expect(clippy::too_many_arguments)]
     async fn run_benchmark_internal(
-        chain_group_index: usize,
+        chain_idx: usize,
+        chain_id: ChainId,
         bps: usize,
-        chain_group: Vec<(Vec<Operation>, AccountOwner)>,
-        chain_clients: Vec<ChainClient<Env>>,
+        chain_client: ChainClient<Env>,
+        all_chains: Vec<ChainId>,
+        transactions_per_block: usize,
+        fungible_application_id: Option<ApplicationId>,
         shutdown_notifier: CancellationToken,
         bps_count: Arc<AtomicUsize>,
-        committee: Committee,
-        block_time_quantiles_sender: mpsc::UnboundedSender<BlockTimings>,
         barrier: Arc<Barrier>,
         notifier: Arc<Notify>,
         runtime_control_sender: Option<mpsc::Sender<()>>,
-        delay_between_chain_groups_ms: Option<u64>,
+        delay_between_chains_ms: Option<u64>,
+        single_destination_per_block: bool,
     ) -> Result<(), BenchmarkError> {
         barrier.wait().await;
-        if let Some(delay_between_chain_groups_ms) = delay_between_chain_groups_ms {
+        if let Some(delay_between_chains_ms) = delay_between_chains_ms {
             time::sleep(time::Duration::from_millis(
-                (chain_group_index as u64) * delay_between_chain_groups_ms,
+                (chain_idx as u64) * delay_between_chains_ms,
             ))
             .await;
         }
-        info!("Starting benchmark for chain group {:?}", chain_group_index);
+        info!("Starting benchmark for chain {:?}", chain_id);
 
         if let Some(runtime_control_sender) = runtime_control_sender {
             runtime_control_sender.send(()).await?;
         }
 
-        for ((operations, chain_owner), chain_client) in chain_group
-            .into_iter()
-            .zip(chain_clients.into_iter())
-            .cycle()
-        {
-            if shutdown_notifier.is_cancelled() {
-                info!("Shutdown signal received, stopping benchmark");
-                break;
-            }
+        let owner = chain_client
+            .identity()
+            .await
+            .map_err(BenchmarkError::ChainClient)?;
+        let mut destination_manager = ChainDestinationManager::new(chain_id, all_chains)?;
 
-            let block_time_start = Instant::now();
-            let submit_fast_block_proposal_start = Instant::now();
-            let get_pending_message_bundles_start = Instant::now();
-            let incoming_bundles = chain_client.pending_message_bundles().await?;
-            let get_pending_message_bundles_ms =
-                get_pending_message_bundles_start.elapsed().as_millis() as u64;
-            let (
-                creating_proposal_ms,
-                stage_block_execution_ms,
-                creating_confirmed_block_ms,
-                submitting_block_proposal_ms,
-            ) = chain_client
-                .submit_fast_block_proposal(&committee, &operations, &incoming_bundles, chain_owner)
-                .await
-                .map_err(BenchmarkError::ChainClient)?;
-            let submit_fast_block_proposal_ms =
-                submit_fast_block_proposal_start.elapsed().as_millis() as u64;
-            let communicate_chain_updates_start = Instant::now();
-            // We assume the committee will not change during the benchmark.
-            chain_client
-                .communicate_chain_updates(&committee)
-                .await
-                .map_err(BenchmarkError::ChainClient)?;
-            let communicate_chain_updates_ms =
-                communicate_chain_updates_start.elapsed().as_millis() as u64;
-            let block_time_ms = block_time_start.elapsed().as_millis() as u64;
-            let block_metrics = BlockTimings {
-                block_time_ms,
-                block_time_timings: BlockTimeTimings {
-                    get_pending_message_bundles_ms,
-                    submit_fast_block_proposal_ms,
-                    submit_fast_block_proposal_timings: SubmitFastBlockProposalTimings {
-                        creating_proposal_ms,
-                        stage_block_execution_ms,
-                        creating_confirmed_block_ms,
-                        submitting_block_proposal_ms,
-                    },
-                    communicate_chain_updates_ms,
-                },
-            };
-            if let Err(e) = block_time_quantiles_sender.send(block_metrics) {
-                // The quantiles task might receive the shutdown signal first and exit before this
-                // one receives it.
-                warn!("Failed to send block time quantiles: {}", e);
-            }
+        loop {
+            tokio::select! {
+                biased;
 
-            let current_bps_count = bps_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if current_bps_count >= bps {
-                notifier.notified().await;
+                _ = shutdown_notifier.cancelled() => {
+                    info!("Shutdown signal received, stopping benchmark");
+                    break;
+                }
+                result = chain_client.execute_operations(
+                    Self::generate_operations(
+                        owner,
+                        transactions_per_block,
+                        fungible_application_id,
+                        &mut destination_manager,
+                        single_destination_per_block,
+                    ),
+                    vec![]
+                ) => {
+                    result
+                        .map_err(BenchmarkError::ChainClient)?
+                        .expect("should execute block with operations");
+
+                    let current_bps_count = bps_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current_bps_count >= bps {
+                        notifier.notified().await;
+                    }
+                }
             }
         }
 
         info!("Exiting task...");
         Ok(())
+    }
+
+    fn create_operation(
+        fungible_application_id: Option<ApplicationId>,
+        recipient_chain_id: ChainId,
+        owner: AccountOwner,
+        amount: Amount,
+    ) -> Operation {
+        match fungible_application_id {
+            Some(application_id) => {
+                Self::fungible_transfer(application_id, recipient_chain_id, owner, owner, amount)
+            }
+            None => Operation::system(SystemOperation::Transfer {
+                owner: AccountOwner::CHAIN,
+                recipient: Account::chain(recipient_chain_id),
+                amount,
+            }),
+        }
+    }
+
+    /// Generate operations for a single block, randomizing destinations after each full cycle
+    fn generate_operations(
+        owner: AccountOwner,
+        transactions_per_block: usize,
+        fungible_application_id: Option<ApplicationId>,
+        destination_manager: &mut ChainDestinationManager,
+        single_destination_per_block: bool,
+    ) -> Vec<Operation> {
+        let amount = Amount::from_attos(1);
+
+        if single_destination_per_block {
+            let recipient_chain_id = destination_manager.get_next_destination();
+
+            (0..transactions_per_block)
+                .map(|_| {
+                    Self::create_operation(
+                        fungible_application_id,
+                        recipient_chain_id,
+                        owner,
+                        amount,
+                    )
+                })
+                .collect()
+        } else {
+            let mut operations = Vec::with_capacity(transactions_per_block);
+            for _ in 0..transactions_per_block {
+                let recipient_chain_id = destination_manager.get_next_destination();
+
+                operations.push(Self::create_operation(
+                    fungible_application_id,
+                    recipient_chain_id,
+                    owner,
+                    amount,
+                ));
+            }
+            operations
+        }
     }
 
     /// Closes the chain that was created for the benchmark.
@@ -848,40 +701,24 @@ impl<Env: Environment> Benchmark<Env> {
         Ok(())
     }
 
-    /// Generates information related to one block per chain.
-    pub fn make_benchmark_block_info(
-        benchmark_chains: Vec<Vec<(ChainId, AccountOwner)>>,
-        transactions_per_block: usize,
-        fungible_application_id: Option<ApplicationId>,
-    ) -> Vec<Vec<(Vec<Operation>, AccountOwner)>> {
-        let mut blocks_infos = Vec::new();
-        for chains in benchmark_chains {
-            let mut infos = Vec::new();
-            let chains_len = chains.len();
-            let amount = Amount::from(1);
-            for i in 0..chains_len {
-                let owner = chains[i].1;
-                let recipient_chain_id = chains[(i + chains_len - 1) % chains_len].0;
-                let operation = match fungible_application_id {
-                    Some(application_id) => Self::fungible_transfer(
-                        application_id,
-                        recipient_chain_id,
-                        owner,
-                        owner,
-                        amount,
-                    ),
-                    None => Operation::system(SystemOperation::Transfer {
-                        owner: AccountOwner::CHAIN,
-                        recipient: Recipient::chain(recipient_chain_id),
-                        amount,
-                    }),
-                };
-                let operations = iter::repeat_n(operation, transactions_per_block).collect();
-                infos.push((operations, owner));
+    pub fn get_all_chains(
+        chains_config_path: Option<&Path>,
+        benchmark_chains: &[(ChainId, AccountOwner)],
+    ) -> Result<Vec<ChainId>, BenchmarkError> {
+        let all_chains = if let Some(config_path) = chains_config_path {
+            if !config_path.exists() {
+                return Err(BenchmarkError::ConfigFileNotFound(
+                    config_path.to_path_buf(),
+                ));
             }
-            blocks_infos.push(infos);
-        }
-        blocks_infos
+            let config = BenchmarkConfig::load_from_file(config_path)
+                .map_err(BenchmarkError::ConfigLoadError)?;
+            config.chain_ids
+        } else {
+            benchmark_chains.iter().map(|(id, _)| *id).collect()
+        };
+
+        Ok(all_chains)
     }
 
     /// Creates a fungible token transfer operation.
@@ -892,11 +729,11 @@ impl<Env: Environment> Benchmark<Env> {
         receiver: AccountOwner,
         amount: Amount,
     ) -> Operation {
-        let target_account = fungible::Account {
+        let target_account = Account {
             chain_id,
             owner: receiver,
         };
-        let bytes = bcs::to_bytes(&fungible::Operation::Transfer {
+        let bytes = bcs::to_bytes(&FungibleOperation::Transfer {
             owner: sender,
             amount,
             target_account,
@@ -905,6 +742,48 @@ impl<Env: Environment> Benchmark<Env> {
         Operation::User {
             application_id,
             bytes,
+        }
+    }
+}
+
+struct ChainDestinationManager {
+    source_chain_id: ChainId,
+    destination_index: usize,
+    destination_chains: Vec<ChainId>,
+    rng: SmallRng,
+}
+
+impl ChainDestinationManager {
+    fn new(
+        source_chain_id: ChainId,
+        mut destination_chains: Vec<ChainId>,
+    ) -> Result<Self, BenchmarkError> {
+        let mut rng = SmallRng::from_rng(thread_rng())?;
+        destination_chains.shuffle(&mut rng);
+
+        Ok(Self {
+            source_chain_id,
+            destination_index: 0,
+            destination_chains,
+            rng,
+        })
+    }
+
+    fn get_next_destination(&mut self) -> ChainId {
+        // Check if we've gone through all destinations
+        if self.destination_index >= self.destination_chains.len() {
+            // Reshuffle the destinations for the next cycle
+            self.destination_chains.shuffle(&mut self.rng);
+            self.destination_index = 0;
+        }
+
+        let destination_chain_id = self.destination_chains[self.destination_index];
+        self.destination_index += 1;
+
+        if destination_chain_id == self.source_chain_id {
+            self.get_next_destination()
+        } else {
+            destination_chain_id
         }
     }
 }

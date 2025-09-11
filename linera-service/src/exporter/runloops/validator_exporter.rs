@@ -13,11 +13,11 @@ use std::{
 use futures::{future::try_join_all, stream::FuturesOrdered};
 use linera_base::identifiers::BlobId;
 use linera_chain::types::ConfirmedBlockCertificate;
-use linera_client::config::DestinationId;
 use linera_core::node::{
     CrossChainMessageDelivery, NodeError, ValidatorNode, ValidatorNodeProvider,
 };
 use linera_rpc::grpc::{GrpcClient, GrpcNodeProvider};
+use linera_service::config::DestinationId;
 use linera_storage::Storage;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_stream::StreamExt;
@@ -27,50 +27,45 @@ use crate::{
     storage::ExporterStorage,
 };
 
-pub(crate) struct Exporter<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
+pub(crate) struct Exporter {
     node_provider: Arc<GrpcNodeProvider>,
     destination_id: DestinationId,
-    storage: ExporterStorage<S>,
     work_queue_size: usize,
 }
 
-impl<S> Exporter<S>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
+impl Exporter {
     pub(super) fn new(
-        node_provider: Arc<GrpcNodeProvider>,
         destination_id: DestinationId,
-        storage: ExporterStorage<S>,
+        node_provider: Arc<GrpcNodeProvider>,
         work_queue_size: usize,
     ) -> Self {
         Self {
             node_provider,
             destination_id,
-            storage,
             work_queue_size,
         }
     }
 
-    pub(super) async fn run_with_shutdown<F: IntoFuture<Output = ()>>(
+    pub(super) async fn run_with_shutdown<S, F: IntoFuture<Output = ()>>(
         self,
         shutdown_signal: F,
-    ) -> anyhow::Result<()> {
+        mut storage: ExporterStorage<S>,
+    ) -> anyhow::Result<()>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
         let address = self.destination_id.address().to_owned();
-        let destination_state = self.storage.load_destination_state(&self.destination_id);
+        let destination_state = storage.load_destination_state(&self.destination_id);
 
         let node = self.node_provider.make_node(&address)?;
 
         let (mut task_queue, task_receiver) = TaskQueue::new(
             self.work_queue_size,
             destination_state.load(Ordering::Acquire) as usize,
-            &self.storage,
+            storage.clone(),
         );
 
-        let export_task = ExportTask::new(node, &self.storage, destination_state);
+        let export_task = ExportTask::new(node, storage.clone(), destination_state);
 
         tokio::select! {
 
@@ -88,24 +83,24 @@ where
     }
 }
 
-struct ExportTask<'a, S>
+struct ExportTask<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     node: GrpcClient,
-    storage: &'a ExporterStorage<S>,
+    storage: ExporterStorage<S>,
     destination_state: Arc<AtomicU64>,
 }
 
-impl<'a, S> ExportTask<'a, S>
+impl<S> ExportTask<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     fn new(
         node: GrpcClient,
-        storage: &'a ExporterStorage<S>,
+        storage: ExporterStorage<S>,
         destination_state: Arc<AtomicU64>,
-    ) -> ExportTask<'a, S> {
+    ) -> ExportTask<S> {
         ExportTask {
             node,
             storage,
@@ -118,6 +113,10 @@ where
         mut receiver: Receiver<(Arc<ConfirmedBlockCertificate>, Vec<BlobId>)>,
     ) -> anyhow::Result<()> {
         while let Some((block, blobs_ids)) = receiver.recv().await {
+            #[cfg(with_metrics)]
+            crate::metrics::VALIDATOR_EXPORTER_QUEUE_LENGTH
+                .with_label_values(&[self.node.address()])
+                .set(receiver.len() as i64);
             match self.dispatch_block((*block).clone()).await {
                 Ok(_) => {}
 
@@ -141,6 +140,10 @@ where
 
     fn increment_destination_state(&self) {
         let _ = self.destination_state.fetch_add(1, Ordering::Release);
+        #[cfg(with_metrics)]
+        crate::metrics::DESTINATION_STATE_COUNTER
+            .with_label_values(&[self.node.address()])
+            .inc();
     }
 
     async fn upload_blobs(&self, blobs: Vec<BlobId>) -> anyhow::Result<()> {
@@ -152,11 +155,19 @@ where
                         "dispatching blob with id: {:#?} from linera exporter",
                         blob.id()
                     );
-                    self.node
+                    #[cfg(with_metrics)]
+                    let start = linera_base::time::Instant::now();
+                    let result = self
+                        .node
                         .upload_blob((*blob).clone().into())
                         .await
-                        .map_err(|e| ExporterError::GenericError(e.into()))
                         .map(|_| ())
+                        .map_err(|e| ExporterError::GenericError(e.into()));
+                    #[cfg(with_metrics)]
+                    crate::metrics::DISPATCH_BLOB_HISTOGRAM
+                        .with_label_values(&[self.node.address()])
+                        .observe(start.elapsed().as_secs_f64() * 1000.0);
+                    result
                 }
             }
         });
@@ -173,14 +184,26 @@ where
         let delivery = CrossChainMessageDelivery::NonBlocking;
         let block_id = BlockId::from_confirmed_block(certificate.value());
         tracing::info!(?block_id, "dispatching block");
-        match self
-            .node
-            .handle_confirmed_certificate(certificate, delivery)
-            .await
+        #[cfg(with_metrics)]
+        let start = linera_base::time::Instant::now();
+        match Box::pin(
+            self.node
+                .handle_confirmed_certificate(certificate, delivery),
+        )
+        .await
         {
-            Ok(_) => {}
+            Ok(_) => {
+                #[cfg(with_metrics)]
+                crate::metrics::DISPATCH_BLOCK_HISTOGRAM
+                    .with_label_values(&[self.node.address()])
+                    .observe(start.elapsed().as_secs_f64() * 1000.0);
+            }
             Err(e) => {
                 tracing::error!(error=%e, ?block_id, "error when dispatching block");
+                #[cfg(with_metrics)]
+                crate::metrics::DISPATCH_BLOCK_HISTOGRAM
+                    .with_label_values(&[self.node.address()])
+                    .observe(start.elapsed().as_secs_f64() * 1000.0);
                 Err(e)?
             }
         }
@@ -189,17 +212,17 @@ where
     }
 }
 
-struct TaskQueue<'a, S>
+struct TaskQueue<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     queue_size: usize,
     start_height: usize,
-    storage: &'a ExporterStorage<S>,
+    storage: ExporterStorage<S>,
     buffer: Sender<(Arc<ConfirmedBlockCertificate>, Vec<BlobId>)>,
 }
 
-impl<'a, S> TaskQueue<'a, S>
+impl<S> TaskQueue<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -207,9 +230,9 @@ where
     fn new(
         queue_size: usize,
         start_height: usize,
-        storage: &'a ExporterStorage<S>,
+        storage: ExporterStorage<S>,
     ) -> (
-        TaskQueue<'a, S>,
+        TaskQueue<S>,
         Receiver<(Arc<ConfirmedBlockCertificate>, Vec<BlobId>)>,
     ) {
         let (sender, receiver) = tokio::sync::mpsc::channel(queue_size);

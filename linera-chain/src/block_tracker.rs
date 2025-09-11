@@ -9,12 +9,12 @@ use linera_base::prometheus_util::MeasureLatency;
 use linera_base::{
     data_types::{Amount, Blob, BlockHeight, Event, OracleResponse, Timestamp},
     ensure,
-    identifiers::{AccountOwner, BlobId, ChainId, MessageId},
+    identifiers::{AccountOwner, BlobId, ChainId, StreamId},
 };
 use linera_execution::{
-    ExecutionRuntimeContext, ExecutionStateView, MessageContext, OperationContext, OutgoingMessage,
-    ResourceController, ResourceTracker, SystemExecutionStateView, TransactionOutcome,
-    TransactionTracker,
+    execution_state_actor::ExecutionStateActor, ExecutionRuntimeContext, ExecutionStateView,
+    MessageContext, OperationContext, OutgoingMessage, ResourceController, ResourceTracker,
+    SystemExecutionStateView, TransactionOutcome, TransactionTracker,
 };
 use linera_views::context::Context;
 
@@ -39,20 +39,19 @@ pub struct BlockExecutionTracker<'resources, 'blobs> {
     resource_controller: &'resources mut ResourceController<Option<AccountOwner>, ResourceTracker>,
     local_time: Timestamp,
     #[debug(skip_if = Option::is_none)]
-    pub replaying_oracle_responses: Option<Vec<Vec<OracleResponse>>>,
-    pub next_message_index: u32,
-    pub next_application_index: u32,
-    pub next_chain_index: u32,
+    replaying_oracle_responses: Option<Vec<Vec<OracleResponse>>>,
+    next_application_index: u32,
+    next_chain_index: u32,
     #[debug(skip_if = Vec::is_empty)]
-    pub oracle_responses: Vec<Vec<OracleResponse>>,
+    oracle_responses: Vec<Vec<OracleResponse>>,
     #[debug(skip_if = Vec::is_empty)]
-    pub events: Vec<Vec<Event>>,
+    events: Vec<Vec<Event>>,
     #[debug(skip_if = Vec::is_empty)]
-    pub blobs: Vec<Vec<Blob>>,
+    blobs: Vec<Vec<Blob>>,
     #[debug(skip_if = Vec::is_empty)]
-    pub messages: Vec<Vec<OutgoingMessage>>,
+    messages: Vec<Vec<OutgoingMessage>>,
     #[debug(skip_if = Vec::is_empty)]
-    pub operation_results: Vec<OperationResult>,
+    operation_results: Vec<OperationResult>,
     // Index of the currently executed transaction in a block.
     transaction_index: u32,
 
@@ -87,7 +86,6 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
             resource_controller,
             local_time,
             replaying_oracle_responses,
-            next_message_index: 0,
             next_application_index: 0,
             next_chain_index: 0,
             oracle_responses: Vec::new(),
@@ -97,14 +95,14 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
             operation_results: Vec::new(),
             transaction_index: 0,
             published_blobs,
-            expected_outcomes_count: proposal.incoming_bundles.len() + proposal.operations.len(),
+            expected_outcomes_count: proposal.transactions.len(),
         })
     }
 
     /// Executes a transaction in the context of the block.
     pub async fn execute_transaction<C>(
         &mut self,
-        transaction: Transaction<'_>,
+        transaction: &Transaction,
         round: Option<u32>,
         chain: &mut ExecutionStateView<C>,
     ) -> Result<(), ChainError>
@@ -112,7 +110,7 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
         C: Context + Clone + Send + Sync + 'static,
         C::Extra: ExecutionRuntimeContext,
     {
-        let chain_execution_context = self.chain_execution_context(&transaction);
+        let chain_execution_context = self.chain_execution_context(transaction);
         let mut txn_tracker = self.new_transaction_tracker()?;
 
         match transaction {
@@ -120,10 +118,9 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
                 self.resource_controller_mut()
                     .track_block_size_of(&incoming_bundle)
                     .with_execution_context(chain_execution_context)?;
-                for (message_id, posted_message) in incoming_bundle.messages_and_ids() {
+                for posted_message in incoming_bundle.messages() {
                     Box::pin(self.execute_message_in_block(
                         chain,
-                        message_id,
                         posted_message,
                         incoming_bundle,
                         round,
@@ -145,17 +142,13 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
                     height: self.block_height,
                     round,
                     authenticated_signer: self.authenticated_signer,
-                    authenticated_caller_id: None,
                     timestamp: self.timestamp,
                 };
-                Box::pin(chain.execute_operation(
-                    context,
-                    operation.clone(),
-                    &mut txn_tracker,
-                    self.resource_controller_mut(),
-                ))
-                .await
-                .with_execution_context(chain_execution_context)?;
+                let mut actor =
+                    ExecutionStateActor::new(chain, &mut txn_tracker, self.resource_controller);
+                Box::pin(actor.execute_operation(context, operation.clone()))
+                    .await
+                    .with_execution_context(chain_execution_context)?;
                 self.resource_controller_mut()
                     .with_state(&mut chain.system)
                     .await?
@@ -167,7 +160,7 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
         let txn_outcome = txn_tracker
             .into_outcome()
             .with_execution_context(chain_execution_context)?;
-        self.process_txn_outcome(&txn_outcome, &mut chain.system, chain_execution_context)
+        self.process_txn_outcome(txn_outcome, &mut chain.system, chain_execution_context)
             .await?;
         Ok(())
     }
@@ -177,10 +170,10 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
         Ok(TransactionTracker::new(
             self.local_time,
             self.transaction_index,
-            self.next_message_index,
             self.next_application_index,
             self.next_chain_index,
             self.oracle_responses()?,
+            &self.blobs,
         ))
     }
 
@@ -188,7 +181,6 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
     async fn execute_message_in_block<C>(
         &mut self,
         chain: &mut ExecutionStateView<C>,
-        message_id: MessageId,
         posted_message: &PostedMessage,
         incoming_bundle: &IncomingBundle,
         round: Option<u32>,
@@ -202,10 +194,10 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
         let _message_latency = metrics::MESSAGE_EXECUTION_LATENCY.measure_latency();
         let context = MessageContext {
             chain_id: self.chain_id,
+            origin: incoming_bundle.origin,
             is_bouncing: posted_message.is_bouncing(),
             height: self.block_height,
             round,
-            message_id,
             authenticated_signer: posted_message.authenticated_signer,
             refund_grant_to: posted_message.refund_grant_to,
             timestamp: self.timestamp,
@@ -218,18 +210,17 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
                 // Once a chain is closed, accepting incoming messages is not allowed.
                 ensure!(!chain.system.closed.get(), ChainError::ClosedChain);
 
-                Box::pin(chain.execute_message(
+                let mut actor =
+                    ExecutionStateActor::new(chain, txn_tracker, self.resource_controller);
+                Box::pin(actor.execute_message(
                     context,
                     posted_message.message.clone(),
                     (grant > Amount::ZERO).then_some(&mut grant),
-                    txn_tracker,
-                    self.resource_controller_mut(),
                 ))
                 .await
                 .with_execution_context(chain_execution_context)?;
-                chain
-                    .send_refund(context, grant, txn_tracker)
-                    .await
+                actor
+                    .send_refund(context, grant)
                     .with_execution_context(chain_execution_context)?;
             }
             MessageAction::Reject => {
@@ -243,17 +234,17 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
                         posted_message: Box::new(posted_message.clone()),
                     }
                 );
+                let mut actor =
+                    ExecutionStateActor::new(chain, txn_tracker, self.resource_controller);
                 if posted_message.is_tracked() {
                     // Bounce the message.
-                    chain
-                        .bounce_message(context, grant, posted_message.message.clone(), txn_tracker)
-                        .await
+                    actor
+                        .bounce_message(context, grant, posted_message.message.clone())
                         .with_execution_context(ChainExecutionContext::Block)?;
                 } else {
                     // Nothing to do except maybe refund the grant.
-                    chain
-                        .send_refund(context, grant, txn_tracker)
-                        .await
+                    actor
+                        .send_refund(context, grant)
                         .with_execution_context(ChainExecutionContext::Block)?;
                 }
             }
@@ -281,26 +272,13 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
     /// Tracks the resources used by the transaction - size of the incoming and outgoing messages, blobs, etc.
     pub async fn process_txn_outcome<C>(
         &mut self,
-        txn_outcome: &TransactionOutcome,
+        txn_outcome: TransactionOutcome,
         view: &mut SystemExecutionStateView<C>,
         context: ChainExecutionContext,
     ) -> Result<(), ChainError>
     where
         C: Context + Clone + Send + Sync + 'static,
     {
-        self.next_message_index = txn_outcome.next_message_index;
-        self.next_application_index = txn_outcome.next_application_index;
-        self.next_chain_index = txn_outcome.next_chain_index;
-        self.oracle_responses
-            .push(txn_outcome.oracle_responses.clone());
-        self.events.push(txn_outcome.events.clone());
-        self.blobs.push(txn_outcome.blobs.clone());
-        self.messages.push(txn_outcome.outgoing_messages.clone());
-        if matches!(context, ChainExecutionContext::Operation(_)) {
-            self.operation_results
-                .push(OperationResult(txn_outcome.operation_result.clone()));
-        }
-
         let mut resource_controller = self.resource_controller.with_state(view).await?;
 
         for message_out in &txn_outcome.outgoing_messages {
@@ -342,11 +320,21 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
             .track_block_size_of(&(&txn_outcome.operation_result))
             .with_execution_context(context)?;
 
+        self.next_application_index = txn_outcome.next_application_index;
+        self.next_chain_index = txn_outcome.next_chain_index;
+        self.oracle_responses.push(txn_outcome.oracle_responses);
+        self.events.push(txn_outcome.events);
+        self.blobs.push(txn_outcome.blobs);
+        self.messages.push(txn_outcome.outgoing_messages);
+        if matches!(context, ChainExecutionContext::Operation(_)) {
+            self.operation_results
+                .push(OperationResult(txn_outcome.operation_result));
+        }
         self.transaction_index += 1;
         Ok(())
     }
 
-    /// Returns recipient chain ids for outgoing messages in the block.
+    /// Returns recipient chain IDs for outgoing messages in the block.
     pub fn recipients(&self) -> BTreeSet<ChainId> {
         self.messages
             .iter()
@@ -355,8 +343,17 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
             .collect()
     }
 
+    /// Returns stream IDs for events published in the block.
+    pub fn event_streams(&self) -> BTreeSet<StreamId> {
+        self.events
+            .iter()
+            .flatten()
+            .map(|event| event.stream_id.clone())
+            .collect()
+    }
+
     /// Returns the execution context for the current transaction.
-    pub fn chain_execution_context(&self, transaction: &Transaction<'_>) -> ChainExecutionContext {
+    pub fn chain_execution_context(&self, transaction: &Transaction) -> ChainExecutionContext {
         match transaction {
             Transaction::ReceiveMessages(_) => {
                 ChainExecutionContext::IncomingBundle(self.transaction_index)
@@ -377,7 +374,8 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
     /// Finalizes the execution and returns the collected results.
     ///
     /// This method should be called after all transactions have been processed.
-    /// Panics if the number of outcomes does match the expected count.
+    /// Panics if the number of lists of oracle responses, outgoing messages,
+    /// events, or blobs does not match the expected counts.
     pub fn finalize(self) -> FinalizeExecutionResult {
         // Asserts that the number of outcomes matches the expected count.
         assert_eq!(self.oracle_responses.len(), self.expected_outcomes_count);

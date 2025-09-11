@@ -1,0 +1,23 @@
+[package]
+name = "linera-metrics"
+description = "A library for Linera server metrics."
+readme = "README.md"
+documentation = "https://docs.rs/linera-metrics/latest/linera_metrics/"
+
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+prometheus.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-util.workspace = true
+tracing.workspace = true

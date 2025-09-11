@@ -24,13 +24,13 @@ use crate::{
         AccountPublicKey, CryptoError, CryptoHash, Ed25519PublicKey, EvmPublicKey,
         Secp256k1PublicKey,
     },
-    data_types::{BlobContent, BlockHeight, ChainDescription},
+    data_types::{BlobContent, ChainDescription},
     doc_scalar, hex_debug,
     vm::VmRuntime,
 };
 
 /// An account owner.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, WitLoad, WitStore, WitType)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, WitLoad, WitStore, WitType)]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary))]
 pub enum AccountOwner {
     /// Short addresses reserved for the protocol.
@@ -38,8 +38,17 @@ pub enum AccountOwner {
     /// 32-byte account address.
     Address32(CryptoHash),
     /// 20-byte account EVM-compatible address.
-    #[debug(with = "hex_debug")]
     Address20([u8; 20]),
+}
+
+impl fmt::Debug for AccountOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reserved(byte) => f.debug_tuple("Reserved").field(byte).finish(),
+            Self::Address32(hash) => write!(f, "Address32({:?}..)", hash),
+            Self::Address20(bytes) => write!(f, "Address20({}..)", hex::encode(&bytes[..8])),
+        }
+    }
 }
 
 impl AccountOwner {
@@ -77,14 +86,27 @@ impl From<CryptoHash> for AccountOwner {
     }
 }
 
-/// A system account.
+/// An account.
 #[derive(
-    Debug, PartialEq, Eq, Hash, Copy, Clone, Serialize, Deserialize, WitLoad, WitStore, WitType,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Copy,
+    Clone,
+    Serialize,
+    Deserialize,
+    WitLoad,
+    WitStore,
+    WitType,
+    SimpleObject,
+    InputObject,
 )]
+#[graphql(name = "AccountOutput", input_name = "Account")]
 pub struct Account {
     /// The chain of the account.
     pub chain_id: ChainId,
-    /// The owner of the account, or `None` for the chain balance.
+    /// The owner of the account.
     pub owner: AccountOwner,
 }
 
@@ -99,6 +121,16 @@ impl Account {
         Account {
             chain_id,
             owner: AccountOwner::CHAIN,
+        }
+    }
+
+    /// An address used exclusively for tests
+    #[cfg(with_testing)]
+    pub fn burn_address(chain_id: ChainId) -> Self {
+        let hash = CryptoHash::test_hash("burn");
+        Account {
+            chain_id,
+            owner: hash.into(),
         }
     }
 }
@@ -298,30 +330,16 @@ impl<'a> Deserialize<'a> for BlobId {
     }
 }
 
-/// The index of a message in a chain.
+/// Hash of a data blob.
 #[derive(
-    Eq,
-    PartialEq,
-    Ord,
-    PartialOrd,
-    Copy,
-    Clone,
-    Hash,
-    Debug,
-    Serialize,
-    Deserialize,
-    WitLoad,
-    WitStore,
-    WitType,
+    Eq, Hash, PartialEq, Debug, Serialize, Deserialize, Clone, Copy, WitType, WitLoad, WitStore,
 )]
-#[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
-pub struct MessageId {
-    /// The chain ID that created the message.
-    pub chain_id: ChainId,
-    /// The height of the block that created the message.
-    pub height: BlockHeight,
-    /// The index of the message inside the block.
-    pub index: u32,
+pub struct DataBlobHash(pub CryptoHash);
+
+impl From<DataBlobHash> for BlobId {
+    fn from(hash: DataBlobHash) -> BlobId {
+        BlobId::new(hash.0, BlobType::Data)
+    }
 }
 
 /// A unique identifier for a user application from a blob.
@@ -943,6 +961,18 @@ impl<A> ApplicationId<A> {
 }
 
 #[cfg(with_revm)]
+impl From<Address> for ApplicationId {
+    fn from(address: Address) -> ApplicationId {
+        let mut arr = [0_u8; 32];
+        arr[..20].copy_from_slice(address.as_slice());
+        ApplicationId {
+            application_description_hash: arr.into(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+#[cfg(with_revm)]
 impl<A> ApplicationId<A> {
     /// Converts the `ApplicationId` into an Ethereum Address.
     pub fn evm_address(&self) -> Address {
@@ -1095,6 +1125,7 @@ impl From<ChainDescription> for ChainId {
 }
 
 bcs_scalar!(ApplicationId, "A unique identifier for a user application");
+doc_scalar!(DataBlobHash, "Hash of a Data Blob");
 doc_scalar!(
     GenericApplicationId,
     "A unique identifier for a user application or for the system application"
@@ -1106,12 +1137,11 @@ doc_scalar!(
     ChainDescription."
 );
 doc_scalar!(StreamName, "The name of an event stream");
-bcs_scalar!(MessageId, "The index of a message in a chain");
+
 doc_scalar!(
     AccountOwner,
     "A unique identifier for a user or an application."
 );
-doc_scalar!(Account, "An account");
 doc_scalar!(
     BlobId,
     "A content-addressed blob ID i.e. the hash of the `BlobContent`"

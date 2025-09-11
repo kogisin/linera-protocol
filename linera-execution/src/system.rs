@@ -6,10 +6,7 @@
 #[path = "./unit_tests/system_tests.rs"]
 mod tests;
 
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    mem,
-};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use custom_debug_derive::Debug;
 use linera_base::{
@@ -24,19 +21,19 @@ use linera_base::{
 };
 use linera_views::{
     context::Context,
-    map_view::{HashedMapView, MapView},
+    map_view::HashedMapView,
     register_view::HashedRegisterView,
     set_view::HashedSetView,
-    views::{ClonableView, HashableView, View},
+    views::{ClonableView, HashableView, ReplaceContext, View},
 };
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use crate::test_utils::SystemExecutionState;
 use crate::{
-    committee::Committee, ApplicationDescription, ApplicationId, ExecutionError,
-    ExecutionRuntimeContext, MessageContext, MessageKind, OperationContext, OutgoingMessage,
-    QueryContext, QueryOutcome, ResourceController, TransactionTracker,
+    committee::Committee, util::OracleResponseExt as _, ApplicationDescription, ApplicationId,
+    ExecutionError, ExecutionRuntimeContext, MessageContext, MessageKind, OperationContext,
+    OutgoingMessage, QueryContext, QueryOutcome, ResourceController, TransactionTracker,
 };
 
 /// The event stream name for new epochs and committees.
@@ -90,7 +87,31 @@ pub struct SystemExecutionStateView<C> {
     /// Blobs that have been used or published on this chain.
     pub used_blobs: HashedSetView<C, BlobId>,
     /// The event stream subscriptions of applications on this chain.
-    pub event_subscriptions: MapView<C, (ChainId, StreamId), EventSubscriptions>,
+    pub event_subscriptions: HashedMapView<C, (ChainId, StreamId), EventSubscriptions>,
+}
+
+impl<C: Context, C2: Context> ReplaceContext<C2> for SystemExecutionStateView<C> {
+    type Target = SystemExecutionStateView<C2>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        SystemExecutionStateView {
+            description: self.description.with_context(ctx.clone()).await,
+            epoch: self.epoch.with_context(ctx.clone()).await,
+            admin_id: self.admin_id.with_context(ctx.clone()).await,
+            committees: self.committees.with_context(ctx.clone()).await,
+            ownership: self.ownership.with_context(ctx.clone()).await,
+            balance: self.balance.with_context(ctx.clone()).await,
+            balances: self.balances.with_context(ctx.clone()).await,
+            timestamp: self.timestamp.with_context(ctx.clone()).await,
+            closed: self.closed.with_context(ctx.clone()).await,
+            application_permissions: self.application_permissions.with_context(ctx.clone()).await,
+            used_blobs: self.used_blobs.with_context(ctx.clone()).await,
+            event_subscriptions: self.event_subscriptions.with_context(ctx.clone()).await,
+        }
+    }
 }
 
 /// The applications subscribing to a particular stream, and the next event index.
@@ -141,7 +162,7 @@ pub enum SystemOperation {
     /// If no owner is given, try to take the units out of the unattributed account.
     Transfer {
         owner: AccountOwner,
-        recipient: Recipient,
+        recipient: Account,
         amount: Amount,
     },
     /// Claims `amount` units of value from the given owner's account in the remote
@@ -150,7 +171,7 @@ pub enum SystemOperation {
     Claim {
         owner: AccountOwner,
         target_id: ChainId,
-        recipient: Recipient,
+        recipient: Account,
         amount: Amount,
     },
     /// Creates (or activates) a new chain.
@@ -181,9 +202,8 @@ pub enum SystemOperation {
     PublishModule { module_id: ModuleId },
     /// Publishes a new data blob.
     PublishDataBlob { blob_hash: CryptoHash },
-    /// Reads a blob and discards the result.
-    // TODO(#2490): Consider removing this.
-    ReadBlob { blob_id: BlobId },
+    /// Verifies that the given blob exists. Otherwise the block fails.
+    VerifyBlob { blob_id: BlobId },
     /// Creates a new application.
     CreateApplication {
         module_id: ModuleId,
@@ -237,10 +257,8 @@ pub enum SystemMessage {
     Withdraw {
         owner: AccountOwner,
         amount: Amount,
-        recipient: Recipient,
+        recipient: Account,
     },
-    /// Notifies that a new application was created.
-    ApplicationCreated,
 }
 
 /// A query to the system state.
@@ -252,34 +270,6 @@ pub struct SystemQuery;
 pub struct SystemResponse {
     pub chain_id: ChainId,
     pub balance: Amount,
-}
-
-/// The recipient of a transfer.
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, Serialize, Deserialize)]
-pub enum Recipient {
-    /// This is mainly a placeholder for future extensions.
-    Burn,
-    /// Transfers to the balance of the given account.
-    Account(Account),
-}
-
-impl Recipient {
-    /// Returns the default recipient for the given chain (no owner).
-    pub fn chain(chain_id: ChainId) -> Recipient {
-        Recipient::Account(Account::chain(chain_id))
-    }
-}
-
-impl From<ChainId> for Recipient {
-    fn from(chain_id: ChainId) -> Self {
-        Recipient::chain(chain_id)
-    }
-}
-
-impl From<Account> for Recipient {
-    fn from(account: Account) -> Self {
-        Recipient::Account(account)
-    }
 }
 
 /// Optional user message attached to a transfer.
@@ -317,7 +307,6 @@ impl UserData {
 #[derive(Debug)]
 pub struct CreateApplicationResult {
     pub app_id: ApplicationId,
-    pub txn_tracker: TransactionTracker,
 }
 
 impl<C> SystemExecutionStateView<C>
@@ -390,7 +379,7 @@ where
             ChangeApplicationPermissions(application_permissions) => {
                 self.application_permissions.set(application_permissions);
             }
-            CloseChain => self.close_chain().await?,
+            CloseChain => self.close_chain(),
             Transfer {
                 owner,
                 amount,
@@ -399,7 +388,7 @@ where
                 let maybe_message = self
                     .transfer(context.authenticated_signer, None, owner, recipient, amount)
                     .await?;
-                txn_tracker.add_outgoing_messages(maybe_message)?;
+                txn_tracker.add_outgoing_messages(maybe_message);
             }
             Claim {
                 owner,
@@ -407,7 +396,7 @@ where
                 recipient,
                 amount,
             } => {
-                let message = self
+                let maybe_message = self
                     .claim(
                         context.authenticated_signer,
                         None,
@@ -417,7 +406,7 @@ where
                         amount,
                     )
                     .await?;
-                txn_tracker.add_outgoing_message(message)?;
+                txn_tracker.add_outgoing_messages(maybe_message);
             }
             Admin(admin_operation) => {
                 ensure!(
@@ -469,34 +458,27 @@ where
                 instantiation_argument,
                 required_application_ids,
             } => {
-                let txn_tracker_moved = mem::take(txn_tracker);
-                let CreateApplicationResult {
-                    app_id,
-                    txn_tracker: txn_tracker_moved,
-                } = self
+                let CreateApplicationResult { app_id } = self
                     .create_application(
                         context.chain_id,
                         context.height,
                         module_id,
                         parameters,
                         required_application_ids,
-                        txn_tracker_moved,
+                        txn_tracker,
                     )
                     .await?;
-                *txn_tracker = txn_tracker_moved;
                 new_application = Some((app_id, instantiation_argument));
             }
             PublishDataBlob { blob_hash } => {
                 self.blob_published(&BlobId::new(blob_hash, BlobType::Data), txn_tracker)?;
             }
-            ReadBlob { blob_id } => {
-                let content = self.read_blob_content(blob_id).await?;
-                if blob_id.blob_type == BlobType::Data {
-                    resource_controller
-                        .with_state(self)
-                        .await?
-                        .track_blob_read(content.bytes().len() as u64)?;
-                }
+            VerifyBlob { blob_id } => {
+                self.assert_blob_exists(blob_id).await?;
+                resource_controller
+                    .with_state(self)
+                    .await?
+                    .track_blob_read(0)?;
                 self.blob_used(txn_tracker, blob_id).await?;
             }
             ProcessNewEpoch(epoch) => {
@@ -510,17 +492,14 @@ where
                     stream_id: StreamId::system(EPOCH_STREAM_NAME),
                     index: epoch.0,
                 };
-                let bytes = match txn_tracker.next_replayed_oracle_response()? {
-                    None => self.get_event(event_id.clone()).await?,
-                    Some(OracleResponse::Event(recorded_event_id, bytes))
-                        if recorded_event_id == event_id =>
-                    {
-                        bytes
-                    }
-                    Some(_) => return Err(ExecutionError::OracleResponseMismatch),
-                };
+                let bytes = txn_tracker
+                    .oracle(|| async {
+                        let bytes = self.get_event(event_id.clone()).await?;
+                        Ok(OracleResponse::Event(event_id.clone(), bytes))
+                    })
+                    .await?
+                    .to_event(&event_id)?;
                 let blob_id = BlobId::new(bcs::from_bytes(&bytes)?, BlobType::Committee);
-                txn_tracker.add_oracle_response(OracleResponse::Event(event_id, bytes));
                 let committee = bcs::from_bytes(self.read_blob_content(blob_id).await?.bytes())?;
                 self.blob_used(txn_tracker, blob_id).await?;
                 self.committees.get_mut().insert(epoch, committee);
@@ -540,18 +519,15 @@ where
                     stream_id: StreamId::system(REMOVED_EPOCH_STREAM_NAME),
                     index: epoch.0,
                 };
-                let bytes = match txn_tracker.next_replayed_oracle_response()? {
-                    None => self.get_event(event_id.clone()).await?,
-                    Some(OracleResponse::Event(recorded_event_id, bytes))
-                        if recorded_event_id == event_id =>
-                    {
-                        bytes
-                    }
-                    Some(_) => return Err(ExecutionError::OracleResponseMismatch),
-                };
-                txn_tracker.add_oracle_response(OracleResponse::Event(event_id, bytes));
+                txn_tracker
+                    .oracle(|| async {
+                        let bytes = self.get_event(event_id.clone()).await?;
+                        Ok(OracleResponse::Event(event_id, bytes))
+                    })
+                    .await?;
             }
             UpdateStreams(streams) => {
+                let mut missing_events = Vec::new();
                 for (chain_id, stream_id, next_index) in streams {
                     let subscriptions = self
                         .event_subscriptions
@@ -579,14 +555,20 @@ where
                         stream_id,
                         index,
                     };
-                    ensure!(
-                        self.context()
-                            .extra()
-                            .contains_event(event_id.clone())
-                            .await?,
-                        ExecutionError::EventNotFound(event_id)
-                    );
+                    let extra = self.context().extra();
+                    txn_tracker
+                        .oracle(|| async {
+                            if !extra.contains_event(event_id.clone()).await? {
+                                missing_events.push(event_id.clone());
+                            }
+                            Ok(OracleResponse::EventExists(event_id))
+                        })
+                        .await?;
                 }
+                ensure!(
+                    missing_events.is_empty(),
+                    ExecutionError::EventsNotFound(missing_events)
+                );
             }
         }
 
@@ -604,12 +586,48 @@ where
         Ok(())
     }
 
+    async fn credit(&mut self, owner: &AccountOwner, amount: Amount) -> Result<(), ExecutionError> {
+        if owner == &AccountOwner::CHAIN {
+            let new_balance = self.balance.get().saturating_add(amount);
+            self.balance.set(new_balance);
+        } else {
+            let balance = self.balances.get_mut_or_default(owner).await?;
+            *balance = balance.saturating_add(amount);
+        }
+        Ok(())
+    }
+
+    async fn credit_or_send_message(
+        &mut self,
+        source: AccountOwner,
+        recipient: Account,
+        amount: Amount,
+    ) -> Result<Option<OutgoingMessage>, ExecutionError> {
+        let source_chain_id = self.context().extra().chain_id();
+        if recipient.chain_id == source_chain_id {
+            // Handle same-chain transfer locally.
+            let target = recipient.owner;
+            self.credit(&target, amount).await?;
+            Ok(None)
+        } else {
+            // Handle cross-chain transfer with message.
+            let message = SystemMessage::Credit {
+                amount,
+                source,
+                target: recipient.owner,
+            };
+            Ok(Some(
+                OutgoingMessage::new(recipient.chain_id, message).with_kind(MessageKind::Tracked),
+            ))
+        }
+    }
+
     pub async fn transfer(
         &mut self,
         authenticated_signer: Option<AccountOwner>,
         authenticated_application_id: Option<ApplicationId>,
         source: AccountOwner,
-        recipient: Recipient,
+        recipient: Account,
         amount: Amount,
     ) -> Result<Option<OutgoingMessage>, ExecutionError> {
         if source == AccountOwner::CHAIN {
@@ -633,30 +651,18 @@ where
             ExecutionError::IncorrectTransferAmount
         );
         self.debit(&source, amount).await?;
-        match recipient {
-            Recipient::Account(account) => {
-                let message = SystemMessage::Credit {
-                    amount,
-                    source,
-                    target: account.owner,
-                };
-                Ok(Some(
-                    OutgoingMessage::new(account.chain_id, message).with_kind(MessageKind::Tracked),
-                ))
-            }
-            Recipient::Burn => Ok(None),
-        }
+        self.credit_or_send_message(source, recipient, amount).await
     }
 
     pub async fn claim(
-        &self,
+        &mut self,
         authenticated_signer: Option<AccountOwner>,
         authenticated_application_id: Option<ApplicationId>,
         source: AccountOwner,
         target_id: ChainId,
-        recipient: Recipient,
+        recipient: Account,
         amount: Amount,
-    ) -> Result<OutgoingMessage, ExecutionError> {
+    ) -> Result<Option<OutgoingMessage>, ExecutionError> {
         ensure!(
             authenticated_signer == Some(source)
                 || authenticated_application_id.map(AccountOwner::from) == Some(source),
@@ -664,15 +670,23 @@ where
         );
         ensure!(amount > Amount::ZERO, ExecutionError::IncorrectClaimAmount);
 
-        let message = SystemMessage::Withdraw {
-            amount,
-            owner: source,
-            recipient,
-        };
-        Ok(
-            OutgoingMessage::new(target_id, message)
-                .with_authenticated_signer(authenticated_signer),
-        )
+        let current_chain_id = self.context().extra().chain_id();
+        if target_id == current_chain_id {
+            // Handle same-chain claim locally by processing the withdraw operation directly
+            self.debit(&source, amount).await?;
+            self.credit_or_send_message(source, recipient, amount).await
+        } else {
+            // Handle cross-chain claim with Withdraw message
+            let message = SystemMessage::Withdraw {
+                amount,
+                owner: source,
+                recipient,
+            };
+            Ok(Some(
+                OutgoingMessage::new(target_id, message)
+                    .with_authenticated_signer(authenticated_signer),
+            ))
+        }
     }
 
     /// Debits an [`Amount`] of tokens from an account's balance.
@@ -721,13 +735,7 @@ where
                 target,
             } => {
                 let receiver = if context.is_bouncing { source } else { target };
-                if receiver == AccountOwner::CHAIN {
-                    let new_balance = self.balance.get().saturating_add(amount);
-                    self.balance.set(new_balance);
-                } else {
-                    let balance = self.balances.get_mut_or_default(&receiver).await?;
-                    *balance = balance.saturating_add(amount);
-                }
+                self.credit(&receiver, amount).await?;
             }
             Withdraw {
                 amount,
@@ -735,23 +743,13 @@ where
                 recipient,
             } => {
                 self.debit(&owner, amount).await?;
-                match recipient {
-                    Recipient::Account(account) => {
-                        let message = SystemMessage::Credit {
-                            amount,
-                            source: owner,
-                            target: account.owner,
-                        };
-                        outcome.push(
-                            OutgoingMessage::new(account.chain_id, message)
-                                .with_kind(MessageKind::Tracked),
-                        );
-                    }
-                    Recipient::Burn => (),
+                if let Some(message) = self
+                    .credit_or_send_message(owner, recipient, amount)
+                    .await?
+                {
+                    outcome.push(message);
                 }
             }
-            // This message is only a placeholder: Its ID is part of the application ID.
-            ApplicationCreated => {}
         }
         Ok(outcome)
     }
@@ -798,19 +796,19 @@ where
         Ok(false)
     }
 
-    pub async fn handle_query(
+    pub fn handle_query(
         &mut self,
         context: QueryContext,
         _query: SystemQuery,
-    ) -> Result<QueryOutcome<SystemResponse>, ExecutionError> {
+    ) -> QueryOutcome<SystemResponse> {
         let response = SystemResponse {
             chain_id: context.chain_id,
             balance: *self.balance.get(),
         };
-        Ok(QueryOutcome {
+        QueryOutcome {
             response,
             operations: vec![],
-        })
+        }
     }
 
     /// Returns the messages to open a new chain, and subtracts the new chain's balance
@@ -852,9 +850,8 @@ where
         Ok(child_id)
     }
 
-    pub async fn close_chain(&mut self) -> Result<(), ExecutionError> {
+    pub fn close_chain(&mut self) {
         self.closed.set(true);
-        Ok(())
     }
 
     pub async fn create_application(
@@ -864,15 +861,15 @@ where
         module_id: ModuleId,
         parameters: Vec<u8>,
         required_application_ids: Vec<ApplicationId>,
-        mut txn_tracker: TransactionTracker,
+        txn_tracker: &mut TransactionTracker,
     ) -> Result<CreateApplicationResult, ExecutionError> {
         let application_index = txn_tracker.next_application_index();
 
-        let blob_ids = self.check_bytecode_blobs(&module_id).await?;
+        let blob_ids = self.check_bytecode_blobs(&module_id, txn_tracker).await?;
         // We only remember to register the blobs that aren't recorded in `used_blobs`
         // already.
         for blob_id in blob_ids {
-            self.blob_used(&mut txn_tracker, blob_id).await?;
+            self.blob_used(txn_tracker, blob_id).await?;
         }
 
         let application_description = ApplicationDescription {
@@ -883,7 +880,7 @@ where
             parameters,
             required_application_ids,
         };
-        self.check_required_applications(&application_description, &mut txn_tracker)
+        self.check_required_applications(&application_description, txn_tracker)
             .await?;
 
         let blob = Blob::new_application_description(&application_description);
@@ -892,7 +889,6 @@ where
 
         Ok(CreateApplicationResult {
             app_id: ApplicationId::from(&application_description),
-            txn_tracker,
         })
     }
 
@@ -915,14 +911,16 @@ where
         txn_tracker: &mut TransactionTracker,
     ) -> Result<ApplicationDescription, ExecutionError> {
         let blob_id = id.description_blob_id();
-        let blob_content = match txn_tracker.created_blobs().get(&blob_id) {
-            Some(blob) => blob.content().clone(),
+        let content = match txn_tracker.created_blobs().get(&blob_id) {
+            Some(content) => content.clone(),
             None => self.read_blob_content(blob_id).await?,
         };
         self.blob_used(txn_tracker, blob_id).await?;
-        let description: ApplicationDescription = bcs::from_bytes(blob_content.bytes())?;
+        let description: ApplicationDescription = bcs::from_bytes(content.bytes())?;
 
-        let blob_ids = self.check_bytecode_blobs(&description.module_id).await?;
+        let blob_ids = self
+            .check_bytecode_blobs(&description.module_id, txn_tracker)
+            .await?;
         // We only remember to register the blobs that aren't recorded in `used_blobs`
         // already.
         for blob_id in blob_ids {
@@ -1020,11 +1018,17 @@ where
     async fn check_bytecode_blobs(
         &mut self,
         module_id: &ModuleId,
+        txn_tracker: &TransactionTracker,
     ) -> Result<Vec<BlobId>, ExecutionError> {
         let blob_ids = module_id.bytecode_blob_ids();
 
         let mut missing_blobs = Vec::new();
         for blob_id in &blob_ids {
+            // First check if blob is present in created_blobs
+            if txn_tracker.created_blobs().contains_key(blob_id) {
+                continue; // Blob found in created_blobs, it's ok
+            }
+            // If not in created_blobs, check storage
             if !self.context().extra().contains_blob(*blob_id).await? {
                 missing_blobs.push(*blob_id);
             }

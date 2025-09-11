@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 metrics = ["prometheus"]
 reqwest = ["dep:reqwest"]
@@ -52,7 +55,7 @@ prometheus = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true, features = ["alloc"] }
 rand.workspace = true
 reqwest = { workspace = true, optional = true }
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde-name.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true

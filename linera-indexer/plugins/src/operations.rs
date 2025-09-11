@@ -9,7 +9,10 @@ use std::{
 use async_graphql::{OneofObject, SimpleObject};
 use axum::Router;
 use linera_base::{crypto::CryptoHash, data_types::BlockHeight, doc_scalar, identifiers::ChainId};
-use linera_chain::types::{CertificateValue as _, ConfirmedBlock};
+use linera_chain::{
+    data_types::Transaction,
+    types::{CertificateValue as _, ConfirmedBlock},
+};
 use linera_execution::Operation;
 use linera_indexer::{
     common::IndexerError,
@@ -18,7 +21,7 @@ use linera_indexer::{
 use linera_views::{
     context::{Context, ViewContext},
     map_view::MapView,
-    store::KeyValueStore,
+    store::{KeyValueDatabase, KeyValueStore},
     views::RootView,
 };
 use serde::{Deserialize, Serialize};
@@ -110,37 +113,41 @@ static NAME: &str = "operations";
 
 /// Implements `Plugin`
 #[async_trait::async_trait]
-impl<S> Plugin<S> for OperationsPlugin<ViewContext<(), S>>
+impl<D> Plugin<D> for OperationsPlugin<ViewContext<(), D::Store>>
 where
-    S: KeyValueStore + Clone + Send + Sync + 'static,
-    S::Error: From<bcs::Error> + Send + Sync + std::error::Error + 'static,
+    D: KeyValueDatabase + Clone + Send + Sync + 'static,
+    D::Store: KeyValueStore + Clone + Send + Sync + 'static,
+    D::Error: From<bcs::Error> + Send + Sync + std::error::Error + 'static,
 {
     fn name(&self) -> String {
         NAME.to_string()
     }
 
-    async fn load(store: S) -> Result<Self, IndexerError>
+    async fn load(database: D) -> Result<Self, IndexerError>
     where
         Self: Sized,
     {
-        Ok(Self(load(store, NAME).await?))
+        Ok(Self(load(database, NAME).await?))
     }
 
     async fn register(&self, value: &ConfirmedBlock) -> Result<(), IndexerError> {
         let mut plugin = self.0.lock().await;
         let chain_id = value.chain_id();
-        for (index, content) in value.block().body.operations.iter().enumerate() {
-            let key = OperationKey {
-                chain_id,
-                height: value.height(),
-                index,
-            };
-            match plugin
-                .register_operation(key, value.hash(), content.clone())
-                .await
-            {
-                Err(e) => return Err(e),
-                Ok(()) => continue,
+        // Iterate over all transactions to find operations and their actual transaction indices
+        for (transaction_index, transaction) in value.block().body.transactions.iter().enumerate() {
+            if let Transaction::ExecuteOperation(operation) = transaction {
+                let key = OperationKey {
+                    chain_id,
+                    height: value.height(),
+                    index: transaction_index,
+                };
+                match plugin
+                    .register_operation(key, value.hash(), operation.clone())
+                    .await
+                {
+                    Err(e) => return Err(e),
+                    Ok(()) => continue,
+                }
             }
         }
         Ok(plugin.save().await?)
@@ -151,7 +158,7 @@ where
     }
 
     fn route(&self, app: Router) -> Router {
-        route(&self.name(), self.clone(), app)
+        route(NAME, self.clone(), app)
     }
 }
 

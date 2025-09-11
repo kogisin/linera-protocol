@@ -1,15 +1,13 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::large_futures)]
-
 use std::{sync::Arc, time::Duration};
 
 use futures::{lock::Mutex, FutureExt as _};
 use linera_base::{
     crypto::{AccountPublicKey, InMemorySigner},
-    data_types::{Amount, BlockHeight, TimeDelta, Timestamp},
-    identifiers::{AccountOwner, ChainId},
+    data_types::{Amount, BlockHeight, Epoch, TimeDelta, Timestamp},
+    identifiers::{Account, AccountOwner, ChainId},
     ownership::{ChainOwnership, TimeoutConfig},
 };
 use linera_core::{
@@ -17,7 +15,6 @@ use linera_core::{
     environment,
     test_utils::{MemoryStorageBuilder, StorageBuilder as _, TestBuilder},
 };
-use linera_execution::system::Recipient;
 use linera_storage::Storage;
 use tokio_util::sync::CancellationToken;
 
@@ -48,11 +45,18 @@ impl chain_listener::ClientContext for ClientContext {
         &self.client
     }
 
+    fn timing_sender(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<(u64, linera_core::client::TimingType)>> {
+        None
+    }
+
     async fn update_wallet_for_new_chain(
         &mut self,
         chain_id: ChainId,
         owner: Option<AccountOwner>,
         timestamp: Timestamp,
+        epoch: Epoch,
     ) -> Result<(), Error> {
         if self.wallet.get(chain_id).is_none() {
             self.wallet.insert(UserChain {
@@ -62,6 +66,7 @@ impl chain_listener::ClientContext for ClientContext {
                 timestamp,
                 next_block_height: BlockHeight::ZERO,
                 pending_proposal: None,
+                epoch: Some(epoch),
             });
         }
 
@@ -100,6 +105,8 @@ async fn test_chain_listener() -> anyhow::Result<()> {
     let genesis_config = make_genesis_config(&builder);
     let admin_id = genesis_config.admin_id();
     let storage = builder.make_storage().await?;
+    let epoch0 = client0.chain_info().await?.epoch;
+    let epoch1 = client1.chain_info().await?.epoch;
 
     let mut context = ClientContext {
         wallet: Wallet::new(genesis_config),
@@ -118,13 +125,14 @@ async fn test_chain_listener() -> anyhow::Result<()> {
         )),
     };
     context
-        .update_wallet_for_new_chain(chain_id0, Some(owner), clock.current_time())
+        .update_wallet_for_new_chain(chain_id0, Some(owner), clock.current_time(), epoch0)
         .await?;
     context
         .update_wallet_for_new_chain(
             client1.chain_id(),
             client1.preferred_owner(),
             clock.current_time(),
+            epoch1,
         )
         .await?;
 
@@ -143,15 +151,15 @@ async fn test_chain_listener() -> anyhow::Result<()> {
     let context = Arc::new(Mutex::new(context));
     let cancellation_token = CancellationToken::new();
     let child_token = cancellation_token.child_token();
-    let handle = linera_base::task::spawn(async move {
-        ChainListener::new(config, context, storage, child_token)
-            .run()
-            .await
-            .unwrap()
-    });
+    let chain_listener = ChainListener::new(config, context, storage, child_token)
+        .run()
+        .await
+        .unwrap();
+
+    let handle = linera_base::task::spawn(async move { chain_listener.await.unwrap() });
     // Transfer one token to chain 0. The listener should eventually become leader and receive
     // the message.
-    let recipient0 = Recipient::chain(chain_id0);
+    let recipient0 = Account::chain(chain_id0);
     client1
         .transfer(AccountOwner::CHAIN, Amount::ONE, recipient0)
         .await?;
@@ -204,20 +212,15 @@ async fn test_chain_listener_admin_chain() -> anyhow::Result<()> {
     let context = Arc::new(Mutex::new(context));
     let cancellation_token = CancellationToken::new();
     let child_token = cancellation_token.child_token();
-    let handle = linera_base::task::spawn({
-        let storage = storage.clone();
-        async move {
-            ChainListener::new(config, context, storage, child_token)
-                .run()
-                .await
-                .unwrap()
-        }
-    });
-    // Burn one token.
-    let certificate = client0
-        .burn(AccountOwner::CHAIN, Amount::ONE)
-        .await?
+    let chain_listener = ChainListener::new(config, context, storage.clone(), child_token)
+        .run()
+        .await
         .unwrap();
+
+    let handle = linera_base::task::spawn(async move { chain_listener.await.unwrap() });
+    let committee = builder.initial_committee.clone();
+    // Stage a committee (this will emit events that the listener should be listening to).
+    let certificate = client0.stage_new_committee(committee).await?.unwrap();
     for i in 0.. {
         linera_base::time::timer::sleep(Duration::from_secs(i)).await;
         let result = storage.read_certificate(certificate.hash()).await?;

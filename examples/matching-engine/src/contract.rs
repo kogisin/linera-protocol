@@ -6,9 +6,9 @@
 mod state;
 use std::cmp::min;
 
-use fungible::{Account, FungibleTokenAbi};
+use fungible::FungibleTokenAbi;
 use linera_sdk::{
-    linera_base_types::{AccountOwner, Amount, ApplicationId, ChainId, WithContractAbi},
+    linera_base_types::{Account, AccountOwner, Amount, ApplicationId, ChainId, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -118,14 +118,13 @@ impl Contract for MatchingEngineContract {
         match message {
             Message::ExecuteOrder { order } => {
                 let owner = Self::get_owner(&order);
-                let message_id = self
-                    .runtime
-                    .message_id()
-                    .expect("Incoming message ID has to be available when executing a message");
+                let origin_chain_id = self.runtime.message_origin_chain_id().expect(
+                    "Incoming message origin chain ID has to be available when executing a message",
+                );
                 self.runtime
                     .check_account_permission(owner)
                     .expect("Permission for ExecuteOrder message");
-                self.execute_order_local(order, message_id.chain_id).await;
+                self.execute_order_local(order, origin_chain_id).await;
             }
         }
     }
@@ -191,7 +190,7 @@ impl MatchingEngineContract {
         target_account: Account,
         token_idx: u32,
     ) {
-        let transfer = fungible::Operation::Transfer {
+        let transfer = fungible::FungibleOperation::Transfer {
             owner,
             amount,
             target_account,

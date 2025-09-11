@@ -20,8 +20,8 @@ use crate::{
     common::{CustomSerialize, HasherOutput, Update},
     context::{BaseKey, Context},
     hashable_wrapper::WrappedHashableContainerView,
-    store::{KeyIterable, ReadableKeyValueStore as _},
-    views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
+    store::ReadableKeyValueStore as _,
+    views::{ClonableView, HashableView, Hasher, ReplaceContext, View, ViewError, MIN_VIEW_TAG},
 };
 
 #[cfg(with_metrics)]
@@ -83,6 +83,46 @@ pub struct ReentrantByteCollectionView<C, W> {
     updates: BTreeMap<Vec<u8>, Update<Arc<RwLock<W>>>>,
     /// Entries cached in memory that have the exact same state as in the persistent storage.
     cached_entries: Mutex<BTreeMap<Vec<u8>, Arc<RwLock<W>>>>,
+}
+
+impl<W, C2> ReplaceContext<C2> for ReentrantByteCollectionView<W::Context, W>
+where
+    W: View + ReplaceContext<C2>,
+    C2: Context,
+{
+    type Target = ReentrantByteCollectionView<C2, <W as ReplaceContext<C2>>::Target>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        let mut updates: BTreeMap<_, Update<Arc<RwLock<W::Target>>>> = BTreeMap::new();
+        let mut cached_entries = BTreeMap::new();
+        for (key, update) in &self.updates {
+            let new_value = match update {
+                Update::Removed => Update::Removed,
+                Update::Set(x) => Update::Set(Arc::new(RwLock::new(
+                    x.write().await.with_context(ctx.clone()).await,
+                ))),
+            };
+            updates.insert(key.clone(), new_value);
+        }
+        let old_cached_entries = self.cached_entries.lock().unwrap().clone();
+        for (key, entry) in old_cached_entries {
+            cached_entries.insert(
+                key,
+                Arc::new(RwLock::new(
+                    entry.write().await.with_context(ctx.clone()).await,
+                )),
+            );
+        }
+        ReentrantByteCollectionView {
+            context: ctx(self.context()),
+            delete_storage_first: self.delete_storage_first,
+            updates,
+            cached_entries: Mutex::new(cached_entries),
+        }
+    }
 }
 
 /// We need to find new base keys in order to implement the collection view.
@@ -184,7 +224,7 @@ impl<W: View> View for ReentrantByteCollectionView<W::Context, W> {
 }
 
 impl<W: ClonableView> ClonableView for ReentrantByteCollectionView<W::Context, W> {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
+    fn clone_unchecked(&mut self) -> Self {
         let cloned_updates = self
             .updates
             .iter()
@@ -194,21 +234,21 @@ impl<W: ClonableView> ClonableView for ReentrantByteCollectionView<W::Context, W
                     Update::Set(view_lock) => {
                         let mut view = view_lock
                             .try_write()
-                            .ok_or(ViewError::TryLockError(key.to_vec()))?;
+                            .expect("Unable to acquire write lock during clone_unchecked");
 
-                        Update::Set(Arc::new(RwLock::new(view.clone_unchecked()?)))
+                        Update::Set(Arc::new(RwLock::new(view.clone_unchecked())))
                     }
                 };
-                Ok((key.clone(), cloned_value))
+                (key.clone(), cloned_value)
             })
-            .collect::<Result<_, ViewError>>()?;
+            .collect();
 
-        Ok(ReentrantByteCollectionView {
+        ReentrantByteCollectionView {
             context: self.context.clone(),
             delete_storage_first: self.delete_storage_first,
             updates: cloned_updates,
             cached_entries: Mutex::new(BTreeMap::new()),
-        })
+        }
     }
 }
 
@@ -903,29 +943,22 @@ impl<W: View> ReentrantByteCollectionView<W::Context, W> {
         let mut update = updates.next();
         if !self.delete_storage_first {
             let base = self.get_index_key(&[]);
-            for index in self
-                .context
-                .store()
-                .find_keys_by_prefix(&base)
-                .await?
-                .iterator()
-            {
-                let index = index?;
+            for index in self.context.store().find_keys_by_prefix(&base).await? {
                 loop {
                     match update {
-                        Some((key, value)) if key.as_slice() <= index => {
+                        Some((key, value)) if key <= &index => {
                             if let Update::Set(_) = value {
                                 if !f(key)? {
                                     return Ok(());
                                 }
                             }
                             update = updates.next();
-                            if key == index {
+                            if key == &index {
                                 break;
                             }
                         }
                         _ => {
-                            if !f(index)? {
+                            if !f(&index)? {
                                 return Ok(());
                             }
                             break;
@@ -1072,6 +1105,25 @@ pub struct ReentrantCollectionView<C, I, W> {
     _phantom: PhantomData<I>,
 }
 
+impl<I, W, C2> ReplaceContext<C2> for ReentrantCollectionView<W::Context, I, W>
+where
+    W: View + ReplaceContext<C2>,
+    I: Send + Sync + Serialize + DeserializeOwned,
+    C2: Context,
+{
+    type Target = ReentrantCollectionView<C2, I, <W as ReplaceContext<C2>>::Target>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        ReentrantCollectionView {
+            collection: self.collection.with_context(ctx).await,
+            _phantom: self._phantom,
+        }
+    }
+}
+
 impl<I, W> View for ReentrantCollectionView<W::Context, I, W>
 where
     W: View,
@@ -1123,11 +1175,11 @@ where
     W: ClonableView,
     I: Send + Sync + Serialize + DeserializeOwned,
 {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(ReentrantCollectionView {
-            collection: self.collection.clone_unchecked()?,
+    fn clone_unchecked(&mut self) -> Self {
+        ReentrantCollectionView {
+            collection: self.collection.clone_unchecked(),
             _phantom: PhantomData,
-        })
+        }
     }
 }
 
@@ -1630,11 +1682,11 @@ where
     W: ClonableView,
     Self: View,
 {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(ReentrantCustomCollectionView {
-            collection: self.collection.clone_unchecked()?,
+    fn clone_unchecked(&mut self) -> Self {
+        ReentrantCustomCollectionView {
+            collection: self.collection.clone_unchecked(),
             _phantom: PhantomData,
-        })
+        }
     }
 }
 
@@ -2123,7 +2175,7 @@ mod graphql {
     {
         fn type_name() -> Cow<'static, str> {
             format!(
-                "ReentrantCollectionView_{}_{}_{}",
+                "ReentrantCollectionView_{}_{}_{:08x}",
                 mangle(K::type_name()),
                 mangle(V::type_name()),
                 hash_name::<(K, V)>(),

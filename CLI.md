@@ -24,6 +24,9 @@ This document contains the help content for the `linera` command-line program.
 * [`linera remove-validator`↴](#linera-remove-validator)
 * [`linera revoke-epochs`↴](#linera-revoke-epochs)
 * [`linera resource-control-policy`↴](#linera-resource-control-policy)
+* [`linera benchmark`↴](#linera-benchmark)
+* [`linera benchmark single`↴](#linera-benchmark-single)
+* [`linera benchmark multi`↴](#linera-benchmark-multi)
 * [`linera create-genesis-config`↴](#linera-create-genesis-config)
 * [`linera watch`↴](#linera-watch)
 * [`linera service`↴](#linera-service)
@@ -88,6 +91,7 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `remove-validator` — Remove a validator (admin only)
 * `revoke-epochs` — Deprecates all committees up to and including the specified one
 * `resource-control-policy` — View or update the resource control policy
+* `benchmark` — Run benchmarks to test network performance
 * `create-genesis-config` — Create genesis configuration for a Linera deployment. Create initial user chains and print information to be used for initialization of validator setup. This will also create an initial wallet for the owner of the initial "root" chains
 * `watch` — Watch the network for notifications
 * `service` — Run a GraphQL service to explore and extend the chains of the wallet
@@ -144,6 +148,10 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
     Don't include any messages in blocks, and don't make any decision whether to accept or reject
 
 * `--restrict-chain-ids-to <RESTRICT_CHAIN_IDS_TO>` — A set of chains to restrict incoming messages from. By default, messages from all chains are accepted. To reject messages from all chains, specify an empty string
+* `--timings` — Enable timing reports during operations
+* `--timing-interval <TIMING_INTERVAL>` — Interval in seconds between timing reports (defaults to 5)
+
+  Default value: `5`
 * `--grace-period <GRACE_PERIOD>` — An additional delay, after reaching a quorum, to wait for additional validator signatures, as a fraction of time taken to reach quorum
 
   Default value: `0.2`
@@ -203,6 +211,7 @@ Open (i.e. activate) a new chain deriving the UID from an existing one
 * `--initial-balance <BALANCE>` — The initial balance of the new chain. This is subtracted from the parent chain's balance
 
   Default value: `0`
+* `--super-owner` — Whether to create a super owner for the new chain
 
 
 
@@ -516,6 +525,96 @@ View or update the resource control policy
 
 
 
+## `linera benchmark`
+
+Run benchmarks to test network performance
+
+**Usage:** `linera benchmark <COMMAND>`
+
+###### **Subcommands:**
+
+* `single` — Start a single benchmark process, maintaining a given TPS
+* `multi` — Run multiple benchmark processes in parallel
+
+
+
+## `linera benchmark single`
+
+Start a single benchmark process, maintaining a given TPS
+
+**Usage:** `linera benchmark single [OPTIONS]`
+
+###### **Options:**
+
+* `--num-chains <NUM_CHAINS>` — How many chains to use
+
+  Default value: `10`
+* `--tokens-per-chain <TOKENS_PER_CHAIN>` — How many tokens to assign to each newly created chain. These need to cover the transaction fees per chain for the benchmark
+
+  Default value: `0.1`
+* `--transactions-per-block <TRANSACTIONS_PER_BLOCK>` — How many transactions to put in each block
+
+  Default value: `1`
+* `--fungible-application-id <FUNGIBLE_APPLICATION_ID>` — The application ID of a fungible token on the wallet's default chain. If none is specified, the benchmark uses the native token
+* `--bps <BPS>` — The fixed BPS (Blocks Per Second) rate that block proposals will be sent at
+
+  Default value: `10`
+* `--close-chains` — If provided, will close the chains after the benchmark is finished. Keep in mind that closing the chains might take a while, and will increase the validator latency while they're being closed
+* `--health-check-endpoints <HEALTH_CHECK_ENDPOINTS>` — A comma-separated list of host:port pairs to query for health metrics. If provided, the benchmark will check these endpoints for validator health and terminate if any validator is unhealthy. Example: "127.0.0.1:21100,validator-1.some-network.linera.net:21100"
+* `--wrap-up-max-in-flight <WRAP_UP_MAX_IN_FLIGHT>` — The maximum number of in-flight requests to validators when wrapping up the benchmark. While wrapping up, this controls the concurrency level when processing inboxes and closing chains
+
+  Default value: `5`
+* `--confirm-before-start` — Confirm before starting the benchmark
+* `--runtime-in-seconds <RUNTIME_IN_SECONDS>` — How long to run the benchmark for. If not provided, the benchmark will run until it is interrupted
+* `--delay-between-chains-ms <DELAY_BETWEEN_CHAINS_MS>` — The delay between chains, in milliseconds. For example, if set to 200ms, the first chain will start, then the second will start 200 ms after the first one, the third 200 ms after the second one, and so on. This is used for slowly ramping up the TPS, so we don't pound the validators with the full TPS all at once
+* `--config-path <CONFIG_PATH>` — Path to YAML file containing chain IDs to send transfers to. If not provided, only transfers between chains in the same wallet
+* `--single-destination-per-block` — Transaction distribution mode. If false (default), distributes transactions evenly across chains within each block. If true, sends all transactions in each block to a single chain, rotating through chains for subsequent blocks
+
+
+
+## `linera benchmark multi`
+
+Run multiple benchmark processes in parallel
+
+**Usage:** `linera benchmark multi [OPTIONS] --faucet <FAUCET>`
+
+###### **Options:**
+
+* `--num-chains <NUM_CHAINS>` — How many chains to use
+
+  Default value: `10`
+* `--tokens-per-chain <TOKENS_PER_CHAIN>` — How many tokens to assign to each newly created chain. These need to cover the transaction fees per chain for the benchmark
+
+  Default value: `0.1`
+* `--transactions-per-block <TRANSACTIONS_PER_BLOCK>` — How many transactions to put in each block
+
+  Default value: `1`
+* `--fungible-application-id <FUNGIBLE_APPLICATION_ID>` — The application ID of a fungible token on the wallet's default chain. If none is specified, the benchmark uses the native token
+* `--bps <BPS>` — The fixed BPS (Blocks Per Second) rate that block proposals will be sent at
+
+  Default value: `10`
+* `--close-chains` — If provided, will close the chains after the benchmark is finished. Keep in mind that closing the chains might take a while, and will increase the validator latency while they're being closed
+* `--health-check-endpoints <HEALTH_CHECK_ENDPOINTS>` — A comma-separated list of host:port pairs to query for health metrics. If provided, the benchmark will check these endpoints for validator health and terminate if any validator is unhealthy. Example: "127.0.0.1:21100,validator-1.some-network.linera.net:21100"
+* `--wrap-up-max-in-flight <WRAP_UP_MAX_IN_FLIGHT>` — The maximum number of in-flight requests to validators when wrapping up the benchmark. While wrapping up, this controls the concurrency level when processing inboxes and closing chains
+
+  Default value: `5`
+* `--confirm-before-start` — Confirm before starting the benchmark
+* `--runtime-in-seconds <RUNTIME_IN_SECONDS>` — How long to run the benchmark for. If not provided, the benchmark will run until it is interrupted
+* `--delay-between-chains-ms <DELAY_BETWEEN_CHAINS_MS>` — The delay between chains, in milliseconds. For example, if set to 200ms, the first chain will start, then the second will start 200 ms after the first one, the third 200 ms after the second one, and so on. This is used for slowly ramping up the TPS, so we don't pound the validators with the full TPS all at once
+* `--config-path <CONFIG_PATH>` — Path to YAML file containing chain IDs to send transfers to. If not provided, only transfers between chains in the same wallet
+* `--single-destination-per-block` — Transaction distribution mode. If false (default), distributes transactions evenly across chains within each block. If true, sends all transactions in each block to a single chain, rotating through chains for subsequent blocks
+* `--processes <PROCESSES>` — The number of benchmark processes to run in parallel
+
+  Default value: `1`
+* `--faucet <FAUCET>` — The faucet (which implicitly defines the network)
+* `--client-state-dir <CLIENT_STATE_DIR>` — If specified, a directory with a random name will be created in this directory, and the client state will be stored there. If not specified, a temporary directory will be used for each client
+* `--delay-between-processes <DELAY_BETWEEN_PROCESSES>` — The delay between starting the benchmark processes, in seconds. If --cross-wallet-transfers is true, this will be ignored
+
+  Default value: `10`
+* `--cross-wallet-transfers` — Whether to send transfers between chains in different wallets
+
+
+
 ## `linera create-genesis-config`
 
 Create genesis configuration for a Linera deployment. Create initial user chains and print information to be used for initialization of validator setup. This will also create an initial wallet for the owner of the initial "root" chains
@@ -636,6 +735,10 @@ Run a GraphQL service that exposes a faucet where users can claim tokens. This g
 * `--listener-delay-after-ms <DELAY_AFTER_MS>` — Wait after processing any notification (useful for rate limiting)
 
   Default value: `0`
+* `--storage-path <STORAGE_PATH>` — Path to the persistent storage file for faucet mappings
+* `--max-batch-size <MAX_BATCH_SIZE>` — Maximum number of operations to include in a single block (default: 100)
+
+  Default value: `100`
 
 
 
@@ -1039,9 +1142,15 @@ Start a Local Linera Network
 * `--faucet-amount <FAUCET_AMOUNT>` — The number of tokens to send to each new chain created by the faucet
 
   Default value: `1000`
-* `--block-exporters <BLOCK_EXPORTERS>` — The number of block exporters per validator in the local test network. Default is 0
+* `--with-block-exporter` — Whether to start a block exporter for each validator
 
-  Default value: `0`
+  Default value: `false`
+* `--exporter-address <EXPORTER_ADDRESS>` — The address of the block exporter
+
+  Default value: `localhost`
+* `--exporter-port <EXPORTER_PORT>` — The port on which to run the block exporter
+
+  Default value: `8081`
 
 
 

@@ -9,12 +9,12 @@ use linera_base::{
     abi::ServiceAbi,
     data_types::{Amount, BlockHeight, Timestamp},
     http,
-    identifiers::{AccountOwner, ApplicationId, ChainId},
+    identifiers::{AccountOwner, ApplicationId, ChainId, DataBlobHash},
 };
 use serde::Serialize;
 
 use super::wit::{base_runtime_api as base_wit, service_runtime_api as service_wit};
-use crate::{DataBlobHash, KeyValueStore, Service, ViewStorageContext};
+use crate::{KeyValueStore, Service, ViewStorageContext};
 
 /// The runtime available during execution of a query.
 pub struct ServiceRuntime<Application>
@@ -23,6 +23,7 @@ where
 {
     application_parameters: Mutex<Option<Application::Parameters>>,
     application_id: Mutex<Option<ApplicationId<Application::Abi>>>,
+    application_creator_chain_id: Mutex<Option<ChainId>>,
     chain_id: Mutex<Option<ChainId>>,
     next_block_height: Mutex<Option<BlockHeight>>,
     timestamp: Mutex<Option<Timestamp>>,
@@ -40,6 +41,7 @@ where
         ServiceRuntime {
             application_parameters: Mutex::new(None),
             application_id: Mutex::new(None),
+            application_creator_chain_id: Mutex::new(None),
             chain_id: Mutex::new(None),
             next_block_height: Mutex::new(None),
             timestamp: Mutex::new(None),
@@ -76,6 +78,13 @@ where
     pub fn application_id(&self) -> ApplicationId<Application::Abi> {
         Self::fetch_value_through_cache(&self.application_id, || {
             ApplicationId::from(base_wit::get_application_id()).with_abi()
+        })
+    }
+
+    /// Returns the chain ID of the current application creator.
+    pub fn application_creator_chain_id(&self) -> ChainId {
+        Self::fetch_value_through_cache(&self.application_creator_chain_id, || {
+            base_wit::get_application_creator_chain_id().into()
         })
     }
 
@@ -143,12 +152,12 @@ where
 
     /// Reads a data blob with the given hash from storage.
     pub fn read_data_blob(&self, hash: DataBlobHash) -> Vec<u8> {
-        base_wit::read_data_blob(hash.0.into())
+        base_wit::read_data_blob(hash.into())
     }
 
     /// Asserts that a data blob with the given hash exists in storage.
     pub fn assert_data_blob_exists(&self, hash: DataBlobHash) {
-        base_wit::assert_data_blob_exists(hash.0.into())
+        base_wit::assert_data_blob_exists(hash.into())
     }
 }
 

@@ -8,6 +8,7 @@ This module defines the client API for the Web extension.
 // We sometimes need functions in this module to be async in order to
 // ensure the generated code will return a `Promise`.
 #![allow(clippy::unused_async)]
+#![recursion_limit = "256"]
 
 pub mod signer;
 
@@ -35,18 +36,19 @@ use crate::signer::JsSigner;
 
 // TODO(#12): convert to IndexedDbStore once we refactor Context
 type WebStorage =
-    linera_storage::DbStorage<linera_views::memory::MemoryStore, linera_storage::WallClock>;
+    linera_storage::DbStorage<linera_views::memory::MemoryDatabase, linera_storage::WallClock>;
 
 type WebEnvironment =
     linera_core::environment::Impl<WebStorage, linera_rpc::node_provider::NodeProvider, JsSigner>;
 
 type JsResult<T> = Result<T, JsError>;
 
-async fn get_storage() -> Result<WebStorage, <linera_views::memory::MemoryStore as WithError>::Error>
-{
+async fn get_storage(
+) -> Result<WebStorage, <linera_views::memory::MemoryDatabase as WithError>::Error> {
     linera_storage::DbStorage::maybe_create_and_connect(
         &linera_views::memory::MemoryStoreConfig {
             max_stream_queries: 1,
+            kill_on_drop: false,
         },
         "linera",
         Some(linera_execution::WasmRuntime::Wasmer),
@@ -64,16 +66,16 @@ type ChainClient = linera_core::client::ChainClient<WebEnvironment>;
 
 // TODO(#13): get from user
 pub const OPTIONS: ClientContextOptions = ClientContextOptions {
-    send_timeout: std::time::Duration::from_millis(4000),
-    recv_timeout: std::time::Duration::from_millis(4000),
+    send_timeout: linera_base::time::Duration::from_millis(4000),
+    recv_timeout: linera_base::time::Duration::from_millis(4000),
     max_pending_message_bundles: 10,
-    retry_delay: std::time::Duration::from_millis(1000),
+    retry_delay: linera_base::time::Duration::from_millis(1000),
     max_retries: 10,
     wait_for_outgoing_messages: false,
     blanket_message_policy: linera_core::client::BlanketMessagePolicy::Accept,
     restrict_chain_ids_to: None,
     long_lived_services: false,
-    blob_download_timeout: std::time::Duration::from_millis(1000),
+    blob_download_timeout: linera_base::time::Duration::from_millis(1000),
     chain_worker_ttl: Duration::from_secs(30),
     grace_period: linera_core::DEFAULT_GRACE_PERIOD,
 
@@ -138,6 +140,7 @@ impl JsFaucet {
                     account_owner,
                     description.id(),
                     description.timestamp(),
+                    description.config().epoch,
                 )
             })
             .await??;
@@ -210,20 +213,24 @@ impl Client {
             signer,
         )));
         let client_context_clone = client_context.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            if let Err(error) = ChainListener::new(
-                ChainListenerConfig::default(),
-                client_context_clone,
-                storage,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .run()
-            .boxed_local()
-            .await
-            {
-                tracing::error!("ChainListener error: {error:?}");
+        let chain_listener = ChainListener::new(
+            ChainListenerConfig::default(),
+            client_context_clone,
+            storage,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .run()
+        .boxed_local()
+        .await?
+        .boxed_local();
+        wasm_bindgen_futures::spawn_local(
+            async move {
+                if let Err(error) = chain_listener.await {
+                    tracing::error!("ChainListener error: {error:?}");
+                }
             }
-        });
+            .boxed_local(),
+        );
         log::info!("Linera Web client successfully initialized");
         Ok(Self { client_context })
     }
@@ -243,7 +250,6 @@ impl Client {
                 .await
                 .unwrap()
                 .subscribe()
-                .await
                 .unwrap();
             while let Some(notification) = notifications.next().await {
                 tracing::debug!("received notification: {notification:?}");
@@ -281,7 +287,7 @@ impl Client {
                 Ok(WaitForTimeout(timeout)) => timeout,
                 Err(e) => break Ok(Err(e)),
             };
-            let mut stream = chain_client.subscribe().await?;
+            let mut stream = chain_client.subscribe()?;
             linera_client::util::wait_for_next_round(&mut stream, timeout).await;
         };
 
@@ -313,12 +319,25 @@ impl Client {
                 chain_client.transfer(
                     params.donor.unwrap_or(AccountOwner::CHAIN),
                     linera_base::data_types::Amount::from_tokens(params.amount.into()),
-                    linera_execution::system::Recipient::Account(params.recipient),
+                    params.recipient,
                 )
             })
             .await??;
 
         Ok(())
+    }
+
+    /// Gets the balance of the default chain.
+    ///
+    /// # Errors
+    /// If the chain couldn't be established.
+    pub async fn balance(&self) -> JsResult<String> {
+        Ok(self
+            .default_chain_client()
+            .await?
+            .query_balance()
+            .await?
+            .to_string())
     }
 
     /// Gets the identity of the default chain.
@@ -428,6 +447,7 @@ impl Application {
     // TODO(#14) allow passing bytes here rather than just strings
     // TODO(#15) a lot of this logic is shared with `linera_service::node_service`
     pub async fn query(&self, query: &str) -> JsResult<String> {
+        tracing::debug!("querying application: {query}");
         let chain_client = self.client.default_chain_client().await?;
 
         let linera_execution::QueryOutcome {

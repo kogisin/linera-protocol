@@ -44,7 +44,10 @@ query ChainInbox($chainId: ChainId!, $origin: ChainId!) {
               messages {
                 authenticatedSigner
                 grant
-                refundGrantTo
+                refundGrantTo {
+                  chainId
+                  owner
+                }
                 kind
                 index
                 message
@@ -60,7 +63,10 @@ query ChainInbox($chainId: ChainId!, $origin: ChainId!) {
               messages {
                 authenticatedSigner
                 grant
-                refundGrantTo
+                refundGrantTo {
+                  chainId
+                  owner
+                }
                 kind
                 index
                 message
@@ -78,6 +84,7 @@ query Chain(
   $inboxesInput: MapInput_ChainId_37f83aa9,
   $outboxesInput: MapInput_ChainId_37f83aa9,
   $previousMessageBlocksInput: MapInput_ChainId_37f83aa9,
+  $previousEventBlocksInput: MapInput_StreamIdInput_b7c3909d,
 ) {
   chain(chainId: $chainId) {
     chainId
@@ -137,7 +144,10 @@ query Chain(
               messages {
                 authenticatedSigner
                 grant
-                refundGrantTo
+                refundGrantTo {
+                  chainId
+                  owner
+                }
                 kind
                 index
                 message
@@ -153,7 +163,10 @@ query Chain(
               messages {
                 authenticatedSigner
                 grant
-                refundGrantTo
+                refundGrantTo {
+                  chainId
+                  owner
+                }
                 kind
                 index
                 message
@@ -183,7 +196,19 @@ query Chain(
         value
       }
     }
-
+    previousEventBlocks {
+      keys {
+        applicationId
+        streamName
+      }
+      entries(input: $previousEventBlocksInput) {
+        key {
+          applicationId
+          streamName
+        }
+        value
+      }
+    }
   }
 }
 
@@ -208,44 +233,29 @@ query Block($hash: CryptoHash, $chainId: ChainId!) {
         stateHash
         previousBlockHash
         authenticatedSigner
-        bundlesHash
-        operationsHash
+        transactionsHash
         messagesHash
         previousMessageBlocksHash
+        previousEventBlocksHash
         oracleResponsesHash
         eventsHash
         blobsHash
         operationResultsHash
       }
       body {
-        incomingBundles {
-          origin
-          bundle {
-            height
-            timestamp
-            certificateHash
-            transactionIndex
-            messages {
-              authenticatedSigner
-              grant
-              refundGrantTo
-              kind
-              index
-              message
-            }
-          }
-          action
-        }
-        operations
         messages {
           destination
           authenticatedSigner
           grant
-          refundGrantTo
+          refundGrantTo {
+            chainId
+            owner
+          }
           kind
           message
         }
         previousMessageBlocks
+        previousEventBlocks
         oracleResponses
         events {
           streamId {
@@ -257,6 +267,36 @@ query Block($hash: CryptoHash, $chainId: ChainId!) {
         }
         blobs
         operationResults
+        transactionMetadata {
+          transactionType
+          incomingBundle {
+            origin
+            bundle {
+              height
+              timestamp
+              certificateHash
+              transactionIndex
+              messages {
+                authenticatedSigner
+                grant
+                refundGrantTo {
+                  chainId
+                  owner
+                }
+                kind
+                index
+                message
+              }
+            }
+            action
+          }
+          operation {
+            operationType
+            applicationId
+            userBytesHex
+            systemBytesHex
+          }
+        }
       }
     }
   }
@@ -275,44 +315,29 @@ query Blocks($from: CryptoHash, $chainId: ChainId!, $limit: Int) {
         stateHash
         previousBlockHash
         authenticatedSigner
-        bundlesHash
-        operationsHash
+        transactionsHash
         messagesHash
         previousMessageBlocksHash
+        previousEventBlocksHash
         oracleResponsesHash
         eventsHash
         blobsHash
         operationResultsHash
       }
       body {
-        incomingBundles {
-          origin
-          bundle {
-            height
-            timestamp
-            certificateHash
-            transactionIndex
-            messages {
-              authenticatedSigner
-              grant
-              refundGrantTo
-              kind
-              index
-              message
-            }
-          }
-          action
-        }
-        operations
         messages {
           destination
           authenticatedSigner
           grant
-          refundGrantTo
+          refundGrantTo {
+            chainId
+            owner
+          }
           kind
           message
         }
         previousMessageBlocks
+        previousEventBlocks
         oracleResponses
         events {
           streamId {
@@ -324,6 +349,36 @@ query Blocks($from: CryptoHash, $chainId: ChainId!, $limit: Int) {
         }
         blobs
         operationResults
+        transactionMetadata {
+          transactionType
+          incomingBundle {
+            origin
+            bundle {
+              height
+              timestamp
+              certificateHash
+              transactionIndex
+              messages {
+                authenticatedSigner
+                grant
+                refundGrantTo {
+                  chainId
+                  owner
+                }
+                kind
+                index
+                message
+              }
+            }
+            action
+          }
+          operation {
+            operationType
+            applicationId
+            userBytesHex
+            systemBytesHex
+          }
+        }
       }
     }
   }
@@ -333,6 +388,6 @@ subscription Notifications($chainId: ChainId!) {
   notifications(chainId: $chainId)
 }
 
-mutation Transfer($chainId: ChainId!, $owner: AccountOwner!, $recipient_chain: ChainId!, $recipient_account: AccountOwner!, $amount: Amount!) {
-  transfer(chainId: $chainId, owner: $owner, recipient: { Account: { chain_id: $recipient_chain, owner: $recipient_account } }, amount: $amount)
+mutation Transfer($chainId: ChainId!, $owner: AccountOwner!, $recipient: Account!, $amount: Amount!) {
+  transfer(chainId: $chainId, owner: $owner, recipient: $recipient, amount: $amount)
 }

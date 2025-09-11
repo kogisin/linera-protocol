@@ -28,15 +28,18 @@ use revm_interpreter::{
     CallInput, CallInputs, CallOutcome, CreateInputs, CreateOutcome, CreateScheme, Gas, InputsImpl,
     InstructionResult, InterpreterResult,
 };
-use revm_primitives::{address, hardfork::SpecId, Address, Log, TxKind};
+use revm_primitives::{address, hardfork::SpecId, Address, Log, TxKind, U256};
 use revm_state::EvmState;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    evm::database::{DatabaseRuntime, StorageStats, EVM_SERVICE_GAS_LIMIT},
-    BaseRuntime, ContractRuntime, ContractSyncRuntimeHandle, EvmExecutionError, EvmRuntime,
-    ExecutionError, ServiceRuntime, ServiceSyncRuntimeHandle, UserContract, UserContractInstance,
-    UserContractModule, UserService, UserServiceInstance, UserServiceModule,
+    evm::{
+        data_types::AmountU256,
+        database::{DatabaseRuntime, StorageStats, EVM_SERVICE_GAS_LIMIT},
+    },
+    BaseRuntime, ContractRuntime, ContractSyncRuntimeHandle, DataBlobHash, EvmExecutionError,
+    EvmRuntime, ExecutionError, ServiceRuntime, ServiceSyncRuntimeHandle, UserContract,
+    UserContractInstance, UserContractModule, UserService, UserServiceInstance, UserServiceModule,
 };
 
 /// This is the selector of the `execute_message` that should be called
@@ -45,11 +48,22 @@ const EXECUTE_MESSAGE_SELECTOR: &[u8] = &[173, 125, 234, 205];
 
 /// This is the selector of the `process_streams` that should be called
 /// only from a submitted message
-const PROCESS_STREAMS_SELECTOR: &[u8] = &[227, 9, 189, 153];
+const PROCESS_STREAMS_SELECTOR: &[u8] = &[254, 72, 102, 28];
 
 /// This is the selector of the `instantiate` that should be called
 /// only when creating a new instance of a shared contract
 const INSTANTIATE_SELECTOR: &[u8] = &[156, 163, 60, 158];
+
+/// The selector when calling for `InterpreterResult`. This is a fictional
+/// selector that does not correspond to a real function.
+const INTERPRETER_RESULT_SELECTOR: &[u8] = &[1, 2, 3, 4];
+
+/// The selector when accessing for the deployed bytecode. This is a fictional
+/// selector that does not correspond to a real function.
+const GET_DEPLOYED_BYTECODE_SELECTOR: &[u8] = &[21, 34, 55, 89];
+
+/// The json serialization of a trivial vector.
+const JSON_EMPTY_VECTOR: &[u8] = &[91, 93];
 
 fn forbid_execute_operation_origin(vec: &[u8]) -> Result<(), EvmExecutionError> {
     if vec == EXECUTE_MESSAGE_SELECTOR {
@@ -89,10 +103,6 @@ fn ensure_selector_presence(
     Ok(())
 }
 
-/// The selector when calling for `InterpreterResult`. This is a fictional
-/// selector that does not correspond to a real function.
-const INTERPRETER_RESULT_SELECTOR: &[u8] = &[1, 2, 3, 4];
-
 #[cfg(test)]
 mod tests {
     use revm_primitives::keccak256;
@@ -113,12 +123,8 @@ mod tests {
     fn check_process_streams_selector() {
         use alloy_sol_types::{sol, SolCall};
         sol! {
-            struct InternalCryptoHash {
-                bytes32 value;
-            }
-
             struct InternalApplicationId {
-                InternalCryptoHash application_description_hash;
+                bytes32 application_description_hash;
             }
 
             struct InternalGenericApplicationId {
@@ -136,7 +142,7 @@ mod tests {
             }
 
             struct InternalChainId {
-                InternalCryptoHash value;
+                bytes32 value;
             }
 
             struct InternalStreamUpdate {
@@ -150,7 +156,7 @@ mod tests {
         }
         assert_eq!(
             process_streamsCall::SIGNATURE,
-            "process_streams((((bytes32)),((uint8,((bytes32))),(bytes)),uint32,uint32)[])"
+            "process_streams(((bytes32),((uint8,(bytes32)),(bytes)),uint32,uint32)[])"
         );
         assert_eq!(process_streamsCall::SELECTOR, PROCESS_STREAMS_SELECTOR);
     }
@@ -223,12 +229,8 @@ fn get_revm_process_streams_bytes(streams: Vec<StreamUpdate>) -> Vec<u8> {
     use alloy_sol_types::{sol, SolCall};
     use linera_base::identifiers::{GenericApplicationId, StreamId};
     sol! {
-        struct InternalCryptoHash {
-            bytes32 value;
-        }
-
         struct InternalApplicationId {
-            InternalCryptoHash application_description_hash;
+            bytes32 application_description_hash;
         }
 
         struct InternalGenericApplicationId {
@@ -246,7 +248,7 @@ fn get_revm_process_streams_bytes(streams: Vec<StreamUpdate>) -> Vec<u8> {
         }
 
         struct InternalChainId {
-            InternalCryptoHash value;
+            bytes32 value;
         }
 
         struct InternalStreamUpdate {
@@ -259,11 +261,10 @@ fn get_revm_process_streams_bytes(streams: Vec<StreamUpdate>) -> Vec<u8> {
         function process_streams(InternalStreamUpdate[] internal_streams);
     }
 
-    fn crypto_hash_to_internal_crypto_hash(hash: CryptoHash) -> InternalCryptoHash {
+    fn crypto_hash_to_internal_crypto_hash(hash: CryptoHash) -> B256 {
         let hash: [u64; 4] = <[u64; 4]>::from(hash);
         let hash: [u8; 32] = linera_base::crypto::u64_array_to_be_bytes(hash);
-        let value: B256 = hash.into();
-        InternalCryptoHash { value }
+        hash.into()
     }
 
     fn chain_id_to_internal_chain_id(chain_id: ChainId) -> InternalChainId {
@@ -291,7 +292,7 @@ fn get_revm_process_streams_bytes(streams: Vec<StreamUpdate>) -> Vec<u8> {
     ) -> InternalGenericApplicationId {
         match generic_application_id {
             GenericApplicationId::System => {
-                let application_description_hash = InternalCryptoHash { value: B256::ZERO };
+                let application_description_hash = B256::ZERO;
                 InternalGenericApplicationId {
                     choice: 0,
                     user: InternalApplicationId {
@@ -346,34 +347,32 @@ pub enum EvmContractModule {
 
 impl EvmContractModule {
     /// Creates a new [`EvmContractModule`] using the EVM module with the provided `contract_bytecode`.
-    pub async fn new(
+    pub fn new(
         contract_bytecode: Bytecode,
         runtime: EvmRuntime,
     ) -> Result<Self, EvmExecutionError> {
         match runtime {
             #[cfg(with_revm)]
-            EvmRuntime::Revm => Self::from_revm(contract_bytecode).await,
+            EvmRuntime::Revm => Self::from_revm(contract_bytecode),
         }
     }
 
     /// Creates a new [`EvmContractModule`] using the EVM module in `contract_bytecode_file`.
     #[cfg(with_fs)]
-    pub async fn from_file(
+    pub fn from_file(
         contract_bytecode_file: impl AsRef<std::path::Path>,
         runtime: EvmRuntime,
     ) -> Result<Self, EvmExecutionError> {
         Self::new(
             Bytecode::load_from_file(contract_bytecode_file)
-                .await
                 .map_err(anyhow::Error::from)
                 .map_err(EvmExecutionError::LoadContractModule)?,
             runtime,
         )
-        .await
     }
 
     /// Creates a new [`EvmContractModule`] using Revm with the provided bytecode files.
-    pub async fn from_revm(contract_bytecode: Bytecode) -> Result<Self, EvmExecutionError> {
+    pub fn from_revm(contract_bytecode: Bytecode) -> Result<Self, EvmExecutionError> {
         let module = contract_bytecode.bytes;
         Ok(EvmContractModule::Revm { module })
     }
@@ -407,34 +406,29 @@ pub enum EvmServiceModule {
 
 impl EvmServiceModule {
     /// Creates a new [`EvmServiceModule`] using the EVM module with the provided bytecode.
-    pub async fn new(
-        service_bytecode: Bytecode,
-        runtime: EvmRuntime,
-    ) -> Result<Self, EvmExecutionError> {
+    pub fn new(service_bytecode: Bytecode, runtime: EvmRuntime) -> Result<Self, EvmExecutionError> {
         match runtime {
             #[cfg(with_revm)]
-            EvmRuntime::Revm => Self::from_revm(service_bytecode).await,
+            EvmRuntime::Revm => Self::from_revm(service_bytecode),
         }
     }
 
     /// Creates a new [`EvmServiceModule`] using the EVM module in `service_bytecode_file`.
     #[cfg(with_fs)]
-    pub async fn from_file(
+    pub fn from_file(
         service_bytecode_file: impl AsRef<std::path::Path>,
         runtime: EvmRuntime,
     ) -> Result<Self, EvmExecutionError> {
         Self::new(
             Bytecode::load_from_file(service_bytecode_file)
-                .await
                 .map_err(anyhow::Error::from)
                 .map_err(EvmExecutionError::LoadServiceModule)?,
             runtime,
         )
-        .await
     }
 
     /// Creates a new [`EvmServiceModule`] using Revm with the provided bytecode files.
-    pub async fn from_revm(contract_bytecode: Bytecode) -> Result<Self, EvmExecutionError> {
+    pub fn from_revm(contract_bytecode: Bytecode) -> Result<Self, EvmExecutionError> {
         let module = contract_bytecode.bytes;
         Ok(EvmServiceModule::Revm { module })
     }
@@ -484,35 +478,49 @@ fn address_to_user_application_id(address: Address) -> ApplicationId {
 enum BaseRuntimePrecompile {
     /// Calling `chain_id` of `BaseRuntime`
     ChainId,
+    /// Calling `block_height_id` of `BaseRuntime`
+    BlockHeight,
     /// Calling `application_creator_chain_id` of `BaseRuntime`
     ApplicationCreatorChainId,
+    /// Calling `read_system_timestamp` of `BaseRuntime`
+    ReadSystemTimestamp,
+    /// Calling `read_chain_balance` of `BaseRuntime`
+    ReadChainBalance,
+    /// Calling `read_owner_balance` of `BaseRuntime`
+    ReadOwnerBalance(AccountOwner),
+    /// Calling `read_owner_balances` of `BaseRuntime`
+    ReadOwnerBalances,
+    /// Calling `read_balance_owners` of `BaseRuntime`
+    ReadBalanceOwners,
     /// Calling `chain_ownership` of `BaseRuntime`
     ChainOwnership,
     /// Calling `read_data_blob` of `BaseRuntime`
-    ReadDataBlob { hash: CryptoHash },
+    ReadDataBlob(DataBlobHash),
     /// Calling `assert_data_blob_exists` of `BaseRuntime`
-    AssertDataBlobExists { hash: CryptoHash },
+    AssertDataBlobExists(DataBlobHash),
 }
 
 /// Some functionalities from the ContractRuntime not in BaseRuntime
 #[derive(Debug, Serialize, Deserialize)]
 enum ContractRuntimePrecompile {
-    /// Calling `try_call_application` of `ContractRuntime`
-    TryCallApplication {
-        target: ApplicationId,
-        argument: Vec<u8>,
-    },
-    /// Calling `validation_round` of `ContractRuntime`
-    ValidationRound,
+    /// Calling `authenticated_signer` of `ContractRuntime`
+    AuthenticatedSigner,
+    /// Calling `message_origin_chain_id` of `ContractRuntime`
+    MessageOriginChainId,
+    /// Calling `message_is_bouncing` of `ContractRuntime`
+    MessageIsBouncing,
+    /// Calling `authenticated_caller_id` of `ContractRuntime`
+    AuthenticatedCallerId,
     /// Calling `send_message` of `ContractRuntime`
     SendMessage {
         destination: ChainId,
         message: Vec<u8>,
     },
-    /// Calling `message_id` of `ContractRuntime`
-    MessageId,
-    /// Calling `message_is_bouncing` of `ContractRuntime`
-    MessageIsBouncing,
+    /// Calling `try_call_application` of `ContractRuntime`
+    TryCallApplication {
+        target: ApplicationId,
+        argument: Vec<u8>,
+    },
     /// Calling `emit` of `ContractRuntime`
     Emit {
         stream_name: StreamName,
@@ -536,6 +544,13 @@ enum ContractRuntimePrecompile {
         application_id: ApplicationId,
         stream_name: StreamName,
     },
+    /// Calling `query_service` of `ContractRuntime`
+    QueryService {
+        application_id: ApplicationId,
+        query: Vec<u8>,
+    },
+    /// Calling `validation_round` of `ContractRuntime`
+    ValidationRound,
 }
 
 /// Some functionalities from the ServiceRuntime not in BaseRuntime
@@ -556,10 +571,7 @@ enum RuntimePrecompile {
     Service(ServiceRuntimePrecompile),
 }
 
-fn get_precompile_output(
-    output: Vec<u8>,
-    gas_limit: u64,
-) -> Result<Option<InterpreterResult>, String> {
+fn get_precompile_output(output: Vec<u8>, gas_limit: u64) -> InterpreterResult {
     // The gas usage is set to `gas_limit` and no spending is being done on it.
     // This means that for REVM, it looks like the precompile call costs nothing.
     // This is because the costs of the EVM precompile calls is accounted for
@@ -567,11 +579,11 @@ fn get_precompile_output(
     let output = Bytes::from(output);
     let result = InstructionResult::default();
     let gas = Gas::new(gas_limit);
-    Ok(Some(InterpreterResult {
+    InterpreterResult {
         result,
         output,
         gas,
-    }))
+    }
 }
 
 fn get_precompile_argument<Ctx: ContextTr>(context: &mut Ctx, input: &CallInput) -> Vec<u8> {
@@ -584,28 +596,53 @@ fn base_runtime_call<Runtime: BaseRuntime>(
     request: BaseRuntimePrecompile,
     context: &mut Ctx<'_, Runtime>,
 ) -> Result<Vec<u8>, ExecutionError> {
-    let mut runtime = context
-        .db()
-        .0
-        .runtime
-        .lock()
-        .expect("The lock should be possible");
+    let mut runtime = context.db().0.runtime.lock().unwrap();
     match request {
         BaseRuntimePrecompile::ChainId => {
             let chain_id = runtime.chain_id()?;
             Ok(bcs::to_bytes(&chain_id)?)
         }
+        BaseRuntimePrecompile::BlockHeight => {
+            let block_height = runtime.block_height()?;
+            Ok(bcs::to_bytes(&block_height)?)
+        }
         BaseRuntimePrecompile::ApplicationCreatorChainId => {
             let chain_id = runtime.application_creator_chain_id()?;
             Ok(bcs::to_bytes(&chain_id)?)
+        }
+        BaseRuntimePrecompile::ReadSystemTimestamp => {
+            let timestamp = runtime.read_system_timestamp()?;
+            Ok(bcs::to_bytes(&timestamp)?)
+        }
+        BaseRuntimePrecompile::ReadChainBalance => {
+            let balance: linera_base::data_types::Amount = runtime.read_chain_balance()?;
+            let balance: AmountU256 = balance.into();
+            Ok(bcs::to_bytes(&balance)?)
+        }
+        BaseRuntimePrecompile::ReadOwnerBalance(account_owner) => {
+            let balance = runtime.read_owner_balance(account_owner)?;
+            let balance = Into::<U256>::into(balance);
+            Ok(bcs::to_bytes(&balance)?)
+        }
+        BaseRuntimePrecompile::ReadOwnerBalances => {
+            let owner_balances = runtime.read_owner_balances()?;
+            let owner_balances = owner_balances
+                .into_iter()
+                .map(|(account_owner, balance)| (account_owner, balance.into()))
+                .collect::<Vec<(AccountOwner, AmountU256)>>();
+            Ok(bcs::to_bytes(&owner_balances)?)
+        }
+        BaseRuntimePrecompile::ReadBalanceOwners => {
+            let owners = runtime.read_balance_owners()?;
+            Ok(bcs::to_bytes(&owners)?)
         }
         BaseRuntimePrecompile::ChainOwnership => {
             let chain_ownership = runtime.chain_ownership()?;
             Ok(bcs::to_bytes(&chain_ownership)?)
         }
-        BaseRuntimePrecompile::ReadDataBlob { hash } => runtime.read_data_blob(&hash),
-        BaseRuntimePrecompile::AssertDataBlobExists { hash } => {
-            runtime.assert_data_blob_exists(&hash)?;
+        BaseRuntimePrecompile::ReadDataBlob(hash) => runtime.read_data_blob(hash),
+        BaseRuntimePrecompile::AssertDataBlobExists(hash) => {
+            runtime.assert_data_blob_exists(hash)?;
             Ok(Vec::new())
         }
     }
@@ -644,7 +681,7 @@ impl<'a, Runtime: ContractRuntime> PrecompileProvider<Ctx<'a, Runtime>> for Cont
             let input = get_precompile_argument(context, &inputs.input);
             let output = Self::call_or_fail(&input, context)
                 .map_err(|error| format!("ContractPrecompile error: {error}"))?;
-            return get_precompile_output(output, gas_limit);
+            return Ok(Some(get_precompile_output(output, gas_limit)));
         }
         self.inner
             .run(context, address, inputs, is_static, gas_limit)
@@ -666,20 +703,25 @@ impl<'a> ContractPrecompile {
         request: ContractRuntimePrecompile,
         context: &mut Ctx<'a, Runtime>,
     ) -> Result<Vec<u8>, ExecutionError> {
-        let mut runtime = context
-            .db()
-            .0
-            .runtime
-            .lock()
-            .expect("The lock should be possible");
+        let mut runtime = context.db().0.runtime.lock().unwrap();
         match request {
-            ContractRuntimePrecompile::TryCallApplication { target, argument } => {
-                let authenticated = true;
-                runtime.try_call_application(authenticated, target, argument)
+            ContractRuntimePrecompile::AuthenticatedSigner => {
+                let account_owner = runtime.authenticated_signer()?;
+                Ok(bcs::to_bytes(&account_owner)?)
             }
-            ContractRuntimePrecompile::ValidationRound => {
-                let value = runtime.validation_round()?;
-                Ok(bcs::to_bytes(&value)?)
+
+            ContractRuntimePrecompile::MessageOriginChainId => {
+                let origin_chain_id = runtime.message_origin_chain_id()?;
+                Ok(bcs::to_bytes(&origin_chain_id)?)
+            }
+
+            ContractRuntimePrecompile::MessageIsBouncing => {
+                let result = runtime.message_is_bouncing()?;
+                Ok(bcs::to_bytes(&result)?)
+            }
+            ContractRuntimePrecompile::AuthenticatedCallerId => {
+                let application_id = runtime.authenticated_caller_id()?;
+                Ok(bcs::to_bytes(&application_id)?)
             }
             ContractRuntimePrecompile::SendMessage {
                 destination,
@@ -698,13 +740,9 @@ impl<'a> ContractPrecompile {
                 runtime.send_message(send_message_request)?;
                 Ok(vec![])
             }
-            ContractRuntimePrecompile::MessageId => {
-                let message_id = runtime.message_id()?;
-                Ok(bcs::to_bytes(&message_id)?)
-            }
-            ContractRuntimePrecompile::MessageIsBouncing => {
-                let result = runtime.message_is_bouncing()?;
-                Ok(bcs::to_bytes(&result)?)
+            ContractRuntimePrecompile::TryCallApplication { target, argument } => {
+                let authenticated = true;
+                runtime.try_call_application(authenticated, target, argument)
             }
             ContractRuntimePrecompile::Emit { stream_name, value } => {
                 let result = runtime.emit(stream_name, value)?;
@@ -730,6 +768,14 @@ impl<'a> ContractPrecompile {
             } => {
                 runtime.unsubscribe_from_events(chain_id, application_id, stream_name)?;
                 Ok(vec![])
+            }
+            ContractRuntimePrecompile::QueryService {
+                application_id,
+                query,
+            } => runtime.query_service(application_id, query),
+            ContractRuntimePrecompile::ValidationRound => {
+                let value = runtime.validation_round()?;
+                Ok(bcs::to_bytes(&value)?)
             }
         }
     }
@@ -761,12 +807,7 @@ impl<'a> ServicePrecompile {
         request: ServiceRuntimePrecompile,
         context: &mut Ctx<'a, Runtime>,
     ) -> Result<Vec<u8>, ExecutionError> {
-        let mut runtime = context
-            .db()
-            .0
-            .runtime
-            .lock()
-            .expect("The lock should be possible");
+        let mut runtime = context.db().0.runtime.lock().unwrap();
         match request {
             ServiceRuntimePrecompile::TryQueryApplication { target, argument } => {
                 runtime.try_query_application(target, argument)
@@ -810,7 +851,7 @@ impl<'a, Runtime: ServiceRuntime> PrecompileProvider<Ctx<'a, Runtime>> for Servi
             let input = get_precompile_argument(context, &inputs.input);
             let output = Self::call_or_fail(&input, context)
                 .map_err(|error| format!("ServicePrecompile error: {error}"))?;
-            return get_precompile_output(output, gas_limit);
+            return Ok(Some(get_precompile_output(output, gas_limit)));
         }
         self.inner
             .run(context, address, inputs, is_static, gas_limit)
@@ -827,14 +868,39 @@ impl<'a, Runtime: ServiceRuntime> PrecompileProvider<Ctx<'a, Runtime>> for Servi
     }
 }
 
-fn map_result_call_outcome(
+fn map_result_create_outcome<Runtime: BaseRuntime>(
+    database: &DatabaseRuntime<Runtime>,
+    result: Result<Option<CreateOutcome>, ExecutionError>,
+) -> Option<CreateOutcome> {
+    match result {
+        Err(error) => {
+            database.insert_error(error);
+            // The use of Revert immediately stops the execution.
+            let result = InstructionResult::Revert;
+            let output = Bytes::default();
+            let gas = Gas::default();
+            let result = InterpreterResult {
+                result,
+                output,
+                gas,
+            };
+            Some(CreateOutcome {
+                result,
+                address: None,
+            })
+        }
+        Ok(result) => result,
+    }
+}
+
+fn map_result_call_outcome<Runtime: BaseRuntime>(
+    database: &DatabaseRuntime<Runtime>,
     result: Result<Option<CallOutcome>, ExecutionError>,
 ) -> Option<CallOutcome> {
     match result {
-        Err(_error) => {
-            // An alternative way would be to return None, which would induce
-            // Revm to call the smart contract in its database, where it is
-            // non-existent.
+        Err(error) => {
+            database.insert_error(error);
+            // The use of Revert immediately stops the execution.
             let result = InstructionResult::Revert;
             let output = Bytes::default();
             let gas = Gas::default();
@@ -905,13 +971,11 @@ impl<'a, Runtime: ContractRuntime> Inspector<Ctx<'a, Runtime>>
 {
     fn create(
         &mut self,
-        _context: &mut Ctx<'a, Runtime>,
+        context: &mut Ctx<'a, Runtime>,
         inputs: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
-        inputs.scheme = CreateScheme::Custom {
-            address: self.contract_address,
-        };
-        None
+        let result = self.create_or_fail(context, inputs);
+        map_result_create_outcome(&self.db, result)
     }
 
     fn call(
@@ -920,11 +984,130 @@ impl<'a, Runtime: ContractRuntime> Inspector<Ctx<'a, Runtime>>
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
         let result = self.call_or_fail(context, inputs);
-        map_result_call_outcome(result)
+        map_result_call_outcome(&self.db, result)
     }
 }
 
 impl<Runtime: ContractRuntime> CallInterceptorContract<Runtime> {
+    /// The function `fn create` of the inspector trait is called
+    /// when a contract is going to be instantiated. Since the
+    /// function can have some error case which are not supported
+    /// in `fn create`, we call a `fn create_or_fail` that can
+    /// return errors.
+    /// When the database runtime is created, the REVM contract
+    /// may or may not have been created. Therefore, at startup
+    /// we have `is_revm_instantiated = false`. That boolean
+    /// can be updated after `set_is_initialized`.
+    ///
+    /// The inspector can do two things:
+    /// * It can change the inputs in `CreateInputs`. Here we
+    ///   change the address being created.
+    /// * It can return some specific CreateInput to be used.
+    ///
+    /// Therefore, the first case of the call is going to
+    /// be about the creation of the contract with just the
+    /// address being the one chosen by Linera.
+    ///
+    /// The second case occurs when the first contract has
+    /// been created and that contrac starts making new
+    /// contracts.
+    /// In relation to bytecode, the following notions are
+    /// relevant:
+    /// * The bytecode is created from the compilation.
+    /// * The bytecode concatenated with the constructor
+    ///   argument. This is what is sent to EVM when we
+    ///   create a new contract.
+    /// * The deployed bytecode. This is essentially the
+    ///   bytecode minus the constructor code.
+    ///
+    /// In relation to that, the following points are
+    /// important:
+    /// * The inputs.init_code is formed by the concatenation
+    ///   of compiled bytecode + constructor argument.
+    /// * It is impossible to separate the compiled bytecode
+    ///   from the constructor argument. Think for example
+    ///   of the following two contracts:
+    ///   constructor(uint a, uint b) {
+    ///   value = a + b
+    ///   }
+    ///   or
+    ///   constructor(uint b) {
+    ///   value = 3 + b
+    ///   }
+    ///   Calling the first constructor with (3,4) leads
+    ///   to the same concatenation as the second constructor
+    ///   with input (4).
+    /// * It turns out that we do not need to determine the
+    ///   constructor argument.
+    /// * What needs to be determined is the deployed bytecode.
+    ///   This is stored in the AccountInfo entry. It is
+    ///   the result of the execution by the REVM interpreter
+    ///   and there is no way to do it without doing the execution.
+    ///
+    /// The strategy for creating the contract is thus:
+    /// * For the case of a new contract being created, we proceed
+    ///   like for services. We just adjust the address of the
+    ///   creation.
+    /// * In the second case, we first create the contract and
+    ///   service bytecode (empty, but not used) and then publish
+    ///   the module.
+    /// * The parameters is empty because the constructor argument
+    ///   have already put in the init_code.
+    /// * The instantiation argument is empty since an EVM contract
+    ///   creating a new contract will not support Linera features.
+    ///   This is simply not part of create/create2 in the EVM.
+    /// * That call to `create_application` leads to a creation of
+    ///   a new contract and so a call to `fn create_or_fail` in
+    ///   another instance of REVM.
+    /// * When returning the `CreateOutcome`, we need to have the
+    ///   deployed bytecode. This is implemented through a special
+    ///   call to `GET_DEPLOYED_BYTECODE_SELECTOR`. This is done
+    ///   with an `execute_operation`.
+    /// * Data is put together as a `Some(...)` which tells REVM
+    ///   that it does not need to execute the bytecode since the
+    ///   output is given to it.
+    fn create_or_fail(
+        &mut self,
+        context: &mut Ctx<'_, Runtime>,
+        inputs: &mut CreateInputs,
+    ) -> Result<Option<CreateOutcome>, ExecutionError> {
+        if !self.db.is_revm_instantiated {
+            self.db.is_revm_instantiated = true;
+            inputs.scheme = CreateScheme::Custom {
+                address: self.contract_address,
+            };
+            Ok(None)
+        } else {
+            let contract = linera_base::data_types::Bytecode::new(inputs.init_code.to_vec());
+            let service = linera_base::data_types::Bytecode::new(vec![]);
+            let mut runtime = context.db().0.runtime.lock().unwrap();
+            let module_id = runtime.publish_module(contract, service, VmRuntime::Evm)?;
+            let parameters = JSON_EMPTY_VECTOR.to_vec(); // No constructor
+            let argument = JSON_EMPTY_VECTOR.to_vec(); // No call to "fn instantiate"
+            let required_application_ids = Vec::new();
+            let application_id = runtime.create_application(
+                module_id,
+                parameters,
+                argument,
+                required_application_ids,
+            )?;
+            let argument = GET_DEPLOYED_BYTECODE_SELECTOR.to_vec();
+            let deployed_bytecode: Vec<u8> =
+                runtime.try_call_application(false, application_id, argument)?;
+            let result = InterpreterResult {
+                result: InstructionResult::Return, // Only possibility if no error occured.
+                output: Bytes::from(deployed_bytecode),
+                gas: Gas::new(inputs.gas_limit),
+            };
+            let address = application_id.evm_address();
+            let creation_outcome = CreateOutcome {
+                result,
+                address: Some(address),
+            };
+            Ok(Some(creation_outcome))
+        }
+    }
+
     fn call_or_fail(
         &mut self,
         context: &mut Ctx<'_, Runtime>,
@@ -947,7 +1130,7 @@ impl<Runtime: ContractRuntime> CallInterceptorContract<Runtime> {
         let argument = get_call_argument(context, inputs);
         let authenticated = true;
         let result = {
-            let mut runtime = self.db.runtime.lock().expect("The lock should be possible");
+            let mut runtime = self.db.runtime.lock().unwrap();
             runtime.try_call_application(authenticated, target, argument)?
         };
         let call_outcome = CallOutcome {
@@ -976,38 +1159,81 @@ impl<Runtime> Clone for CallInterceptorService<Runtime> {
 }
 
 impl<'a, Runtime: ServiceRuntime> Inspector<Ctx<'a, Runtime>> for CallInterceptorService<Runtime> {
+    /// See below on `fn create_or_fail`.
     fn create(
         &mut self,
-        _context: &mut Ctx<'a, Runtime>,
+        context: &mut Ctx<'a, Runtime>,
         inputs: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
-        inputs.scheme = CreateScheme::Custom {
-            address: self.contract_address,
-        };
-        None
+        let result = self.create_or_fail(context, inputs);
+        map_result_create_outcome(&self.db, result)
     }
 
+    /// See below on `fn call_or_fail`.
     fn call(
         &mut self,
         context: &mut Ctx<'a, Runtime>,
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
         let result = self.call_or_fail(context, inputs);
-        map_result_call_outcome(result)
+        map_result_call_outcome(&self.db, result)
     }
 }
 
 impl<Runtime: ServiceRuntime> CallInterceptorService<Runtime> {
+    /// The function `fn create` of the inspector trait is called
+    /// when a contract is going to be instantiated. Since the
+    /// function can have some error case which are not supported
+    /// in `fn create`, we call a `fn create_or_fail` that can
+    /// return errors.
+    /// When the database runtime is created, the REVM contract
+    /// may or may not have been created. Therefore, at startup
+    /// we have `is_revm_instantiated = false`. That boolean
+    /// can be updated after `set_is_initialized`.
+    ///
+    /// The inspector can do two things:
+    /// * It can change the inputs in `CreateInputs`. Here we
+    ///   change the address being created.
+    /// * It can return some specific CreateInput to be used.
+    ///
+    /// Therefore, the first case of the call is going to
+    /// be about the creation of the contract with just the
+    /// address being the one chosen by Linera.
+    /// The second case of creating a new contract does not
+    /// apply in services and so lead to an error.
+    fn create_or_fail(
+        &mut self,
+        _context: &mut Ctx<'_, Runtime>,
+        inputs: &mut CreateInputs,
+    ) -> Result<Option<CreateOutcome>, ExecutionError> {
+        if !self.db.is_revm_instantiated {
+            self.db.is_revm_instantiated = true;
+            inputs.scheme = CreateScheme::Custom {
+                address: self.contract_address,
+            };
+            Ok(None)
+        } else {
+            Err(EvmExecutionError::NoContractCreationInService.into())
+        }
+    }
+
+    /// Every call to a contract passes by this function.
+    /// Three kinds:
+    /// --- Call to the EVM smart contract itself
+    /// --- Call to the PRECOMPILE smart contract.
+    /// --- Call to other EVM smart contract
+    ///
+    /// The first kind is the call to the contract itself like
+    /// constructor or from an external call.
+    /// The second kind is precompile calls. This include the
+    /// classic one but also the one that accesses the Linera
+    /// functionalities.
+    /// The last kind is the calls to other EVM smart contracts.
     fn call_or_fail(
         &mut self,
         context: &mut Ctx<'_, Runtime>,
         inputs: &mut CallInputs,
     ) -> Result<Option<CallOutcome>, ExecutionError> {
-        // Every call to a contract passes by this function.
-        // Three kinds:
-        // --- Call to the PRECOMPILE smart contract.
-        // --- Call to the EVM smart contract itself
-        // --- Call to other EVM smart contract
         if self.precompile_addresses.contains(&inputs.target_address)
             || inputs.target_address == self.contract_address
         {
@@ -1021,7 +1247,7 @@ impl<Runtime: ServiceRuntime> CallInterceptorService<Runtime> {
         let result = {
             let evm_query = EvmQuery::Query(argument);
             let evm_query = serde_json::to_vec(&evm_query)?;
-            let mut runtime = self.db.runtime.lock().expect("The lock should be possible");
+            let mut runtime = self.db.runtime.lock().unwrap();
             runtime.try_query_application(target, evm_query)?
         };
         let call_outcome = CallOutcome {
@@ -1112,6 +1338,9 @@ where
     fn execute_operation(&mut self, operation: Vec<u8>) -> Result<Vec<u8>, ExecutionError> {
         self.db.set_contract_address()?;
         ensure_message_length(operation.len(), 4)?;
+        if operation == GET_DEPLOYED_BYTECODE_SELECTOR {
+            return self.db.get_deployed_bytecode();
+        }
         let caller = self.get_msg_address()?;
         let (gas_final, output, logs) = if &operation[..4] == INTERPRETER_RESULT_SELECTOR {
             ensure_message_length(operation.len(), 8)?;
@@ -1147,7 +1376,7 @@ where
         ensure_selector_presence(
             &self.module,
             PROCESS_STREAMS_SELECTOR,
-            "function process_streams(LineraTypes.StreamUpdate[] memory streams)",
+            "function process_streams(Linera.StreamUpdate[] memory streams)",
         )?;
         // For process_streams, authenticated_signer and authenticated_called_id are None.
         let caller = Address::ZERO;
@@ -1232,7 +1461,7 @@ where
         // An application can be instantiated in Linera sense, but not in EVM sense,
         // that is the contract entries corresponding to the deployed contract may
         // be missing.
-        if !self.db.is_initialized()? {
+        if !self.db.set_is_initialized()? {
             self.initialize_contract(caller)?;
         }
         self.transact_commit(EvmTxKind::Call, vec, caller)
@@ -1263,7 +1492,7 @@ where
     /// on the EVM and that users and contracts outside of that realm can still
     /// call EVM smart contracts.
     fn get_msg_address(&self) -> Result<Address, ExecutionError> {
-        let mut runtime = self.db.runtime.lock().expect("The lock should be possible");
+        let mut runtime = self.db.runtime.lock().unwrap();
         let application_id = runtime.authenticated_caller_id()?;
         if let Some(application_id) = application_id {
             return Ok(if application_id.is_evm() {
@@ -1297,7 +1526,7 @@ where
         };
         let block_env = self.db.get_contract_block_env()?;
         let gas_limit = {
-            let mut runtime = self.db.runtime.lock().expect("The lock should be possible");
+            let mut runtime = self.db.runtime.lock().unwrap();
             runtime.remaining_fuel(VmRuntime::Evm)?
         };
         let nonce = self.db.get_nonce(&caller)?;
@@ -1337,6 +1566,7 @@ where
                 EvmExecutionError::TransactCommitError(error)
             })
         }?;
+        self.db.process_any_error()?;
         let storage_stats = self.db.take_storage_stats();
         self.db.commit_changes()?;
         let result = process_execution_result(storage_stats, result)?;
@@ -1344,14 +1574,14 @@ where
     }
 
     fn consume_fuel(&mut self, gas_final: u64) -> Result<(), ExecutionError> {
-        let mut runtime = self.db.runtime.lock().expect("The lock should be possible");
+        let mut runtime = self.db.runtime.lock().unwrap();
         runtime.consume_fuel(gas_final, VmRuntime::Evm)
     }
 
     fn write_logs(&mut self, logs: Vec<Log>, origin: &str) -> Result<(), ExecutionError> {
         // TODO(#3758): Extracting Ethereum events from the Linera events.
         if !logs.is_empty() {
-            let mut runtime = self.db.runtime.lock().expect("The lock should be possible");
+            let mut runtime = self.db.runtime.lock().unwrap();
             let block_height = runtime.block_height()?;
             let stream_name = bcs::to_bytes("ethereum_event")?;
             let stream_name = StreamName(stream_name);
@@ -1389,7 +1619,7 @@ where
         let query = match evm_query {
             EvmQuery::Query(vec) => vec,
             EvmQuery::Mutation(operation) => {
-                let mut runtime = self.db.runtime.lock().expect("The lock should be possible");
+                let mut runtime = self.db.runtime.lock().unwrap();
                 runtime.schedule_operation(operation)?;
                 return Ok(Vec::new());
             }
@@ -1420,7 +1650,7 @@ where
         // In case of a shared application, we need to instantiate it first
         // However, since in ServiceRuntime, we cannot modify the storage,
         // therefore the compiled contract is saved in the changes.
-        if !self.db.is_initialized()? {
+        if !self.db.set_is_initialized()? {
             let changes = {
                 let mut vec_init = self.module.clone();
                 let constructor_argument = self.db.constructor_argument()?;
@@ -1490,6 +1720,7 @@ where
                 EvmExecutionError::TransactCommitError(error)
             })
         }?;
+        self.db.process_any_error()?;
         let storage_stats = self.db.take_storage_stats();
         Ok((
             process_execution_result(storage_stats, result_state.result)?,

@@ -5,8 +5,11 @@
 
 // TODO(#3362): generate this code
 
+use std::collections::BTreeMap;
+
 use linera_base::{crypto::ValidatorPublicKey, data_types::ChainDescription};
 use linera_client::config::GenesisConfig;
+use linera_execution::{committee::ValidatorState, Committee, ResourceControlPolicy};
 use linera_version::VersionInfo;
 use thiserror_context::Context;
 
@@ -53,7 +56,7 @@ impl Faucet {
         let builder = reqwest::ClientBuilder::new();
 
         #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder.timeout(std::time::Duration::from_secs(30));
+        let builder = builder.timeout(linera_base::time::Duration::from_secs(30));
 
         let response: GraphQlResponse<Response> = builder
             .build()
@@ -70,7 +73,25 @@ impl Faucet {
             .await?;
 
         if let Some(errors) = response.errors {
-            Err(ErrorInner::GraphQl(errors).into())
+            // Extract just the error messages, ignore locations and path
+            let messages = errors
+                .iter()
+                .filter_map(|error| {
+                    error
+                        .get("message")
+                        .and_then(|msg| msg.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect::<Vec<_>>();
+
+            if messages.is_empty() {
+                Err(ErrorInner::GraphQl(errors).into())
+            } else {
+                Err(
+                    ErrorInner::GraphQl(vec![serde_json::Value::String(messages.join("; "))])
+                        .into(),
+                )
+            }
         } else {
             Ok(response
                 .data
@@ -108,7 +129,6 @@ impl Faucet {
         struct Response {
             claim: ChainDescription,
         }
-
         Ok(self
             .query::<Response>(format!("mutation {{ claim(owner: \"{owner}\") }}"))
             .await?
@@ -136,5 +156,35 @@ impl Faucet {
             .into_iter()
             .map(|validator| (validator.public_key, validator.network_address))
             .collect())
+    }
+
+    pub async fn current_committee(&self) -> Result<Committee, Error> {
+        #[derive(serde::Deserialize)]
+        struct CommitteeResponse {
+            validators: BTreeMap<ValidatorPublicKey, ValidatorState>,
+            policy: ResourceControlPolicy,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            current_committee: CommitteeResponse,
+        }
+
+        let response = self
+            .query::<Response>(
+                "query { currentCommittee { \
+                    validators \
+                    policy \
+                } }",
+            )
+            .await?;
+
+        let committee_response = response.current_committee;
+
+        Ok(Committee::new(
+            committee_response.validators,
+            committee_response.policy,
+        ))
     }
 }

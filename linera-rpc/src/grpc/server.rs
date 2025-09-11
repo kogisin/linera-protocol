@@ -5,11 +5,14 @@ use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
     task::{Context, Poll},
-    time::{Duration, Instant},
 };
 
 use futures::{channel::mpsc, future::BoxFuture, FutureExt as _};
-use linera_base::{data_types::Blob, identifiers::ChainId};
+use linera_base::{
+    data_types::Blob,
+    identifiers::ChainId,
+    time::{Duration, Instant},
+};
 use linera_core::{
     join_set_ext::JoinSet,
     node::NodeError,
@@ -231,7 +234,7 @@ where
             });
         }
 
-        let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
         let grpc_server = GrpcServer {
             state,
@@ -317,7 +320,7 @@ where
                     %error,
                     nickname,
                     ?notification,
-                    "could not send notification",
+                    "proxy: could not send notification",
                 )
             }
 
@@ -329,7 +332,7 @@ where
                             %error,
                             nickname,
                             ?notification,
-                            "could not send notification",
+                            "block exporter: could not send notification",
                         )
                     }
                 }
@@ -409,7 +412,7 @@ where
     }
 
     fn log_request_outcome_and_latency(start: Instant, success: bool, method_name: &str) {
-        #![allow(unused_variables)]
+        #![cfg_attr(not(with_metrics), allow(unused_variables))]
         #[cfg(with_metrics)]
         {
             metrics::SERVER_REQUEST_LATENCY_PER_REQUEST_TYPE

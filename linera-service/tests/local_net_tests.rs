@@ -15,22 +15,17 @@ use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use guard::INTEGRATION_TEST_GUARD;
-#[cfg(any(feature = "benchmark", feature = "ethereum"))]
-use linera_base::vm::VmRuntime;
 use linera_base::{
     crypto::Secp256k1SecretKey,
     data_types::{Amount, BlockHeight, Epoch},
     identifiers::{Account, AccountOwner},
-};
-use linera_client::config::{
-    BlockExporterConfig, Destination, DestinationConfig, DestinationKind, LimitsConfig,
+    vm::VmRuntime,
 };
 use linera_core::{data_types::ChainInfoQuery, node::ValidatorNode};
-use linera_rpc::config::{ExporterServiceConfig, TlsConfig};
 use linera_sdk::linera_base_types::AccountSecretKey;
 use linera_service::{
     cli_wrappers::{
-        local_net::{get_node_port, Database, LocalNet, LocalNetConfig, ProcessInbox},
+        local_net::{get_node_port, Database, LocalNetConfig, ProcessInbox},
         ClientWrapper, LineraNet, LineraNetConfig, Network,
     },
     test_name,
@@ -44,7 +39,6 @@ use {
     linera_base::port::get_free_port, linera_service::cli_wrappers::Faucet, std::process::Command,
 };
 
-#[cfg(feature = "benchmark")]
 fn get_fungible_account_owner(client: &ClientWrapper) -> AccountOwner {
     client.get_owner().unwrap()
 }
@@ -105,7 +99,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     let address = format!(
         "{}:127.0.0.1:{}",
         network.short(),
-        LocalNet::proxy_public_port(0, 0)
+        net.proxy_public_port(0, 0)
     );
     assert_eq!(
         client.query_validator(&address).await?,
@@ -130,7 +124,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     let address = format!(
         "{}:127.0.0.1:{}",
         network.short(),
-        LocalNet::proxy_public_port(4, 0)
+        net.proxy_public_port(4, 0)
     );
 
     assert_eq!(
@@ -142,7 +136,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     client
         .set_validator(
             net.validator_keys(4).unwrap(),
-            LocalNet::proxy_public_port(4, 0),
+            net.proxy_public_port(4, 0),
             100,
         )
         .await?;
@@ -151,14 +145,16 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     client.query_validators(Some(chain_1)).await?;
 
     if matches!(network, Network::Grpc) {
-        assert_eq!(faucet.current_validators().await?.len(), 5);
+        assert!(
+            eventually(|| async { faucet.current_validators().await.unwrap().len() == 5 }).await
+        );
     }
 
     // Add 6th validator
     client
         .set_validator(
             net.validator_keys(5).unwrap(),
-            LocalNet::proxy_public_port(5, 0),
+            net.proxy_public_port(5, 0),
             100,
         )
         .await?;
@@ -241,6 +237,19 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         );
     }
 
+    if matches!(network, Network::Grpc) {
+        let client = net.make_client().await;
+        client.wallet_init(Some(&faucet)).await?;
+        let (chain_id, _owner) = client.request_chain(&faucet, true).await?;
+        let port = get_node_port().await;
+        let service = client
+            .run_node_service(port, ProcessInbox::Automatic)
+            .await?;
+        service
+            .publish_data_blob(&chain_id, b"blob bytes".to_vec())
+            .await?;
+    }
+
     net.ensure_is_running().await?;
     net.terminate().await?;
 
@@ -295,7 +304,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
     let address = format!(
         "{}:127.0.0.1:{}",
         network.short(),
-        LocalNet::proxy_public_port(4, 0)
+        net.proxy_public_port(4, 0)
     );
 
     assert_eq!(
@@ -307,7 +316,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
     client
         .set_validator(
             net.validator_keys(4).unwrap(),
-            LocalNet::proxy_public_port(4, 0),
+            net.proxy_public_port(4, 0),
             100,
         )
         .await?;
@@ -392,7 +401,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     let address = format!(
         "{}:127.0.0.1:{}",
         network.short(),
-        LocalNet::proxy_public_port(4, 0)
+        net.proxy_public_port(4, 0)
     );
 
     assert_eq!(
@@ -404,7 +413,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     client
         .set_validator(
             net.validator_keys(4).unwrap(),
-            LocalNet::proxy_public_port(4, 0),
+            net.proxy_public_port(4, 0),
             100,
         )
         .await?;
@@ -440,7 +449,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     let address = format!(
         "{}:127.0.0.1:{}",
         network.short(),
-        LocalNet::proxy_public_port(5, 0)
+        net.proxy_public_port(5, 0)
     );
 
     assert_eq!(
@@ -452,7 +461,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     client
         .set_validator(
             net.validator_keys(5).unwrap(),
-            LocalNet::proxy_public_port(5, 0),
+            net.proxy_public_port(5, 0),
             100,
         )
         .await?;
@@ -779,7 +788,6 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
     return Ok(());
 }
 
-#[cfg(feature = "benchmark")]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
@@ -791,7 +799,7 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
 
     use fungible::{FungibleTokenAbi, InitialState, Parameters};
-    use linera_service::cli::command::BenchmarkCommand;
+    use linera_service::cli::command::{BenchmarkCommand, BenchmarkOptions};
 
     config.num_other_initial_chains = 2;
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -802,12 +810,15 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
     assert_eq!(client.load_wallet()?.num_chains(), 3);
     // Launch local benchmark using some additional chains.
     client
-        .benchmark(BenchmarkCommand {
-            num_chain_groups: Some(2),
-            transactions_per_block: 10,
-            runtime_in_seconds: Some(1),
-            close_chains: true,
-            ..Default::default()
+        .benchmark(BenchmarkCommand::Single {
+            options: BenchmarkOptions {
+                num_chains: 2,
+                transactions_per_block: 10,
+                bps: 2,
+                runtime_in_seconds: Some(5),
+                close_chains: true,
+                ..Default::default()
+            },
         })
         .await?;
     assert_eq!(client.load_wallet()?.num_chains(), 3);
@@ -831,14 +842,16 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
         )
         .await?;
     client
-        .benchmark(BenchmarkCommand {
-            bps: 1,
-            num_chain_groups: Some(2),
-            transactions_per_block: 10,
-            runtime_in_seconds: Some(1),
-            fungible_application_id: Some(application_id.forget_abi()),
-            close_chains: true,
-            ..Default::default()
+        .benchmark(BenchmarkCommand::Single {
+            options: BenchmarkOptions {
+                num_chains: 2,
+                transactions_per_block: 10,
+                bps: 2,
+                runtime_in_seconds: Some(5),
+                fungible_application_id: Some(application_id.forget_abi()),
+                close_chains: true,
+                ..Default::default()
+            },
         })
         .await?;
 
@@ -890,7 +903,7 @@ async fn test_sync_validator(config: LocalNetConfig) -> Result<()> {
     // Restart the stopped validator
     net.restart_validator(LAGGING_VALIDATOR_INDEX).await?;
 
-    let lagging_validator = net.validator_client(LAGGING_VALIDATOR_INDEX).await?;
+    let lagging_validator = net.validator_client(LAGGING_VALIDATOR_INDEX)?;
 
     let state_before_sync = lagging_validator
         .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
@@ -973,7 +986,7 @@ async fn test_sync_child_chain(config: LocalNetConfig) -> Result<()> {
     // Restart the stopped validator
     net.restart_validator(LAGGING_VALIDATOR_INDEX).await?;
 
-    let lagging_validator = net.validator_client(LAGGING_VALIDATOR_INDEX).await?;
+    let lagging_validator = net.validator_client(LAGGING_VALIDATOR_INDEX)?;
 
     let state_before_sync = lagging_validator
         .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
@@ -1054,7 +1067,7 @@ async fn test_update_validator_sender_gaps(config: LocalNetConfig) -> Result<()>
     net.restart_validator(UNAWARE_VALIDATOR_INDEX).await?;
     net.stop_validator(STOPPED_VALIDATOR_INDEX).await?;
 
-    let unaware_validator = net.validator_client(UNAWARE_VALIDATOR_INDEX).await?;
+    let unaware_validator = net.validator_client(UNAWARE_VALIDATOR_INDEX)?;
 
     let sender_state_before_sync = unaware_validator
         .handle_chain_info_query(ChainInfoQuery::new(sender_chain))
@@ -1175,11 +1188,7 @@ async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> 
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
 
-    let app = EthereumTrackerApp(
-        node_service
-            .make_application(&chain, &application_id)
-            .await?,
-    );
+    let app = EthereumTrackerApp(node_service.make_application(&chain, &application_id)?);
 
     // Check after the initialization
 
@@ -1250,63 +1259,4 @@ impl EthereumTrackerApp {
         let mutation = format!("update(toBlock: {})", to_block);
         self.0.mutate(mutation).await.unwrap();
     }
-}
-
-#[cfg_attr(feature = "storage-service", test_case(Database::Service, Network::Grpc ; "storage_service_grpc"))]
-#[cfg_attr(feature = "scylladb", test_case(Database::ScyllaDb, Network::Grpc ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(Database::DynamoDb, Network::Grpc ; "aws_grpc"))]
-#[test_log::test(tokio::test)]
-async fn test_linera_exporter(database: Database, network: Network) -> Result<()> {
-    let _guard = INTEGRATION_TEST_GUARD.lock().await;
-    tracing::info!("Starting test {}", test_name!());
-
-    let destination = Destination {
-        tls: TlsConfig::ClearText,
-        kind: DestinationKind::Validator,
-        endpoint: "127.0.0.1".to_owned(),
-        port: LocalNet::proxy_public_port(1, 0) as u16,
-    };
-
-    let destination_config = DestinationConfig {
-        committee_destination: false,
-        destinations: vec![destination],
-    };
-
-    let block_exporter_config = BlockExporterConfig {
-        destination_config,
-        id: 0,
-        service_config: ExporterServiceConfig {
-            host: "".to_owned(),
-            port: 0,
-        },
-        limits: LimitsConfig::default(),
-    };
-
-    let config = LocalNetConfig {
-        num_initial_validators: 1,
-        num_shards: 1,
-        block_exporters: vec![block_exporter_config],
-        ..LocalNetConfig::new_test(database, network)
-    };
-
-    let (mut net, client) = config.instantiate().await?;
-
-    net.generate_validator_config(1).await?;
-    net.start_validator(1).await?;
-
-    let chain = client.default_chain().expect("Client has no default chain");
-    client
-        .transfer_with_silent_logs(1.into(), chain, chain)
-        .await?;
-
-    tokio::time::sleep(Duration::from_secs(4)).await;
-
-    let validator_client = net.validator_client(1).await?;
-    let chain_info = validator_client
-        .handle_chain_info_query(ChainInfoQuery::new(chain))
-        .await?;
-
-    assert!(chain_info.info.next_block_height == 1.into());
-
-    Ok(())
 }

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
@@ -14,7 +14,7 @@ use linera_base::{
     data_types::{ApplicationDescription, ArithmeticError, Blob, BlockHeight, Epoch, Round},
     doc_scalar,
     hashed::Hashed,
-    identifiers::{AccountOwner, ApplicationId, BlobId, ChainId},
+    identifiers::{AccountOwner, ApplicationId, BlobId, ChainId, EventId, StreamId},
     time::timer::{sleep, timeout},
 };
 #[cfg(with_testing)]
@@ -29,7 +29,7 @@ use linera_chain::{
 };
 use linera_execution::{ExecutionError, ExecutionStateView, Query, QueryOutcome};
 use linera_storage::Storage;
-use linera_views::ViewError;
+use linera_views::{context::InactiveContext, ViewError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, OwnedRwLockReadGuard};
@@ -52,9 +52,10 @@ mod metrics {
     use std::sync::LazyLock;
 
     use linera_base::prometheus_util::{
-        exponential_bucket_interval, register_histogram_vec, register_int_counter_vec,
+        exponential_bucket_interval, register_histogram_vec, register_int_counter,
+        register_int_counter_vec,
     };
-    use prometheus::{HistogramVec, IntCounterVec};
+    use prometheus::{HistogramVec, IntCounter, IntCounterVec};
 
     pub static NUM_ROUNDS_IN_CERTIFICATE: LazyLock<HistogramVec> = LazyLock::new(|| {
         register_histogram_vec(
@@ -86,6 +87,13 @@ mod metrics {
             "certificates_signed",
             "Number of confirmed block certificates signed by each validator",
             &["validator_name"],
+        )
+    });
+
+    pub static CHAIN_INFO_QUERIES: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter(
+            "chain_info_queries",
+            "Number of chain info queries processed",
         )
     });
 }
@@ -124,6 +132,11 @@ pub enum Reason {
     NewBlock {
         height: BlockHeight,
         hash: CryptoHash,
+    },
+    NewEvents {
+        height: BlockHeight,
+        hash: CryptoHash,
+        event_streams: BTreeSet<StreamId>,
     },
     NewIncomingBundle {
         origin: ChainId,
@@ -174,8 +187,9 @@ pub enum WorkerError {
         chain_epoch: Epoch,
         epoch: Epoch,
     },
-    #[error("Proposal on chain {chain_id:} claims an unknown epoch {epoch:}")]
-    UnknownEpoch { chain_id: ChainId, epoch: Epoch },
+
+    #[error("Events not found: {0:?}")]
+    EventsNotFound(Vec<EventId>),
 
     // Other server-side errors
     #[error("Invalid cross-chain request")]
@@ -221,6 +235,8 @@ pub enum WorkerError {
     UnexpectedBlob,
     #[error("Number of published blobs per block must not exceed {0}")]
     TooManyPublishedBlobs(u64),
+    #[error("Missing network description")]
+    MissingNetworkDescription,
 }
 
 impl From<ChainError> for WorkerError {
@@ -276,7 +292,7 @@ where
     /// Configuration options for the [`ChainWorker`]s.
     chain_worker_config: ChainWorkerConfig,
     block_cache: Arc<ValueCache<CryptoHash, Hashed<Block>>>,
-    execution_state_cache: Arc<ValueCache<CryptoHash, ExecutionStateView<StorageClient::Context>>>,
+    execution_state_cache: Arc<ValueCache<CryptoHash, ExecutionStateView<InactiveContext>>>,
     /// Chain IDs that should be tracked by a worker.
     tracked_chains: Option<Arc<RwLock<HashSet<ChainId>>>>,
     /// One-shot channels to notify callers when messages of a particular chain have been
@@ -413,14 +429,6 @@ where
     #[cfg(feature = "test")]
     pub fn storage_client(&self) -> &StorageClient {
         &self.storage
-    }
-
-    #[instrument(level = "trace", skip(self, key_pair))]
-    #[cfg(test)]
-    pub(crate) async fn with_key_pair(mut self, key_pair: Option<Arc<ValidatorSecretKey>>) -> Self {
-        self.chain_worker_config.key_pair = key_pair;
-        self.chain_workers.lock().unwrap().clear();
-        self
     }
 
     #[instrument(level = "trace", skip(self, certificate))]
@@ -581,21 +589,14 @@ where
         notify_when_messages_are_delivered: Option<oneshot::Sender<()>>,
     ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
         let chain_id = certificate.block().header.chain_id;
-
-        let (response, actions) = self
-            .query_chain_worker(chain_id, move |callback| {
-                ChainWorkerRequest::ProcessConfirmedBlock {
-                    certificate,
-                    notify_when_messages_are_delivered,
-                    callback,
-                }
-            })
-            .await?;
-
-        #[cfg(with_metrics)]
-        metrics::NUM_BLOCKS.with_label_values(&[]).inc();
-
-        Ok((response, actions))
+        self.query_chain_worker(chain_id, move |callback| {
+            ChainWorkerRequest::ProcessConfirmedBlock {
+                certificate,
+                notify_when_messages_are_delivered,
+                callback,
+            }
+        })
+        .await
     }
 
     /// Processes a validated block issued from a multi-owner chain.
@@ -605,7 +606,6 @@ where
         certificate: ValidatedBlockCertificate,
     ) -> Result<(ChainInfoResponse, NetworkActions, bool), WorkerError> {
         let chain_id = certificate.block().header.chain_id;
-
         self.query_chain_worker(chain_id, move |callback| {
             ChainWorkerRequest::ProcessValidatedBlock {
                 certificate,
@@ -799,9 +799,9 @@ where
     /// Processes a certificate, e.g. to extend a chain with a confirmed block.
     // Other fields will be included in handle_certificate's span.
     #[instrument(skip_all, fields(hash = %certificate.value.value_hash))]
-    pub async fn handle_lite_certificate<'a>(
+    pub async fn handle_lite_certificate(
         &self,
-        certificate: LiteCertificate<'a>,
+        certificate: LiteCertificate<'_>,
         notify_when_messages_are_delivered: Option<oneshot::Sender<()>>,
     ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
         match self.full_certificate(certificate).await? {
@@ -834,32 +834,62 @@ where
     ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
         trace!("{} <-- {:?}", self.nickname, certificate);
         #[cfg(with_metrics)]
+        let metrics_data = if self
+            .chain_state_view(certificate.block().header.chain_id)
+            .await?
+            .tip_state
+            .get()
+            .next_block_height
+            == certificate.block().header.height
         {
-            let confirmed_transactions = (certificate.block().body.incoming_bundles.len()
-                + certificate.block().body.operations.len())
-                as u64;
+            Some((
+                certificate.inner().to_log_str(),
+                certificate.round.type_name(),
+                certificate.round.number(),
+                certificate.block().body.transactions.len() as u64,
+                certificate
+                    .signatures()
+                    .iter()
+                    .map(|(validator_name, _)| validator_name.to_string())
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            // Block already processed or will only be preprocessed, no metrics to report.
+            None
+        };
 
-            metrics::NUM_ROUNDS_IN_CERTIFICATE
-                .with_label_values(&[
-                    certificate.inner().to_log_str(),
-                    certificate.round.type_name(),
-                ])
-                .observe(certificate.round.number() as f64);
-            if confirmed_transactions > 0 {
-                metrics::TRANSACTION_COUNT
-                    .with_label_values(&[])
-                    .inc_by(confirmed_transactions);
-            }
+        let result = self
+            .process_confirmed_block(certificate, notify_when_messages_are_delivered)
+            .await?;
 
-            for (validator_name, _) in certificate.signatures() {
-                metrics::CERTIFICATES_SIGNED
-                    .with_label_values(&[&validator_name.to_string()])
-                    .inc();
+        #[cfg(with_metrics)]
+        {
+            if let Some(metrics_data) = metrics_data {
+                let (
+                    certificate_log_str,
+                    round_type,
+                    round_number,
+                    confirmed_transactions,
+                    validators_with_signatures,
+                ) = metrics_data;
+                metrics::NUM_BLOCKS.with_label_values(&[]).inc();
+                metrics::NUM_ROUNDS_IN_CERTIFICATE
+                    .with_label_values(&[certificate_log_str, round_type])
+                    .observe(round_number as f64);
+                if confirmed_transactions > 0 {
+                    metrics::TRANSACTION_COUNT
+                        .with_label_values(&[])
+                        .inc_by(confirmed_transactions);
+                }
+
+                for validator_name in validators_with_signatures {
+                    metrics::CERTIFICATES_SIGNED
+                        .with_label_values(&[&validator_name])
+                        .inc();
+                }
             }
         }
-
-        self.process_confirmed_block(certificate, notify_when_messages_are_delivered)
-            .await
+        Ok(result)
     }
 
     /// Processes a validated block certificate.
@@ -914,6 +944,8 @@ where
         query: ChainInfoQuery,
     ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
         trace!("{} <-- {:?}", self.nickname, query);
+        #[cfg(with_metrics)]
+        metrics::CHAIN_INFO_QUERIES.inc();
         let result = self
             .query_chain_worker(query.chain_id, move |callback| {
                 ChainWorkerRequest::HandleChainInfoQuery { query, callback }

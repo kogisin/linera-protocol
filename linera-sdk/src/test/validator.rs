@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use futures::{
     lock::{MappedMutexGuard, Mutex, MutexGuard},
     FutureExt as _,
@@ -29,7 +28,7 @@ use linera_execution::{
     ResourceControlPolicy, WasmRuntime,
 };
 use linera_storage::{DbStorage, Storage, TestClock};
-use linera_views::memory::MemoryStore;
+use linera_views::memory::MemoryDatabase;
 use serde::Serialize;
 
 use super::ActiveChain;
@@ -52,11 +51,11 @@ pub struct TestValidator {
     validator_secret: ValidatorSecretKey,
     account_secret: AccountSecretKey,
     committee: Arc<Mutex<(Epoch, Committee)>>,
-    storage: DbStorage<MemoryStore, TestClock>,
-    worker: WorkerState<DbStorage<MemoryStore, TestClock>>,
+    storage: DbStorage<MemoryDatabase, TestClock>,
+    worker: WorkerState<DbStorage<MemoryDatabase, TestClock>>,
     clock: TestClock,
     admin_chain_id: ChainId,
-    chains: Arc<DashMap<ChainId, ActiveChain>>,
+    chains: Arc<papaya::HashMap<ChainId, ActiveChain>>,
 }
 
 impl Clone for TestValidator {
@@ -85,7 +84,7 @@ impl TestValidator {
             account_secret.public(),
         )]);
         let wasm_runtime = Some(WasmRuntime::default());
-        let storage = DbStorage::<MemoryStore, _>::make_test_storage(wasm_runtime)
+        let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(wasm_runtime)
             .now_or_never()
             .expect("execution of DbStorage::new should not await anything");
         let clock = storage.clock().clone();
@@ -149,7 +148,7 @@ impl TestValidator {
 
         let chain = ActiveChain::new(key_pair, description.clone(), validator.clone());
 
-        validator.chains.insert(description.id(), chain);
+        validator.chains.pin().insert(description.id(), chain);
 
         validator
     }
@@ -163,7 +162,7 @@ impl TestValidator {
         ModuleId<Abi, Parameters, InstantiationArgument>,
     ) {
         let validator = TestValidator::new().await;
-        let publisher = validator.new_chain().await;
+        let publisher = Box::pin(validator.new_chain()).await;
 
         let module_id = publisher.publish_current_module().await;
 
@@ -200,12 +199,12 @@ impl TestValidator {
     }
 
     /// Returns this validator's storage.
-    pub(crate) fn storage(&self) -> &DbStorage<MemoryStore, TestClock> {
+    pub(crate) fn storage(&self) -> &DbStorage<MemoryDatabase, TestClock> {
         &self.storage
     }
 
     /// Returns the locked [`WorkerState`] of this validator.
-    pub(crate) fn worker(&self) -> WorkerState<DbStorage<MemoryStore, TestClock>> {
+    pub(crate) fn worker(&self) -> WorkerState<DbStorage<MemoryDatabase, TestClock>> {
         self.worker.clone()
     }
 
@@ -268,9 +267,8 @@ impl TestValidator {
             })
             .await;
 
-        for entry in self.chains.iter() {
-            let chain = entry.value();
-
+        let pinned = self.chains.pin();
+        for chain in pinned.values() {
             if chain.id() != self.admin_chain_id {
                 chain
                     .add_block(|block| {
@@ -291,7 +289,7 @@ impl TestValidator {
 
         chain.handle_received_messages().await;
 
-        self.chains.insert(description.id(), chain.clone());
+        self.chains.pin().insert(description.id(), chain.clone());
 
         chain
     }
@@ -305,7 +303,7 @@ impl TestValidator {
 
     /// Adds an existing [`ActiveChain`].
     pub fn add_chain(&self, chain: ActiveChain) {
-        self.chains.insert(chain.id(), chain);
+        self.chains.pin().insert(chain.id(), chain);
     }
 
     /// Adds a block to the admin chain to create a new chain.
@@ -313,8 +311,8 @@ impl TestValidator {
     /// Returns the [`ChainDescription`] of the new chain.
     async fn request_new_chain_from_admin_chain(&self, owner: AccountOwner) -> ChainDescription {
         let admin_id = self.admin_chain_id;
-        let admin_chain = self
-            .chains
+        let pinned = self.chains.pin();
+        let admin_chain = pinned
             .get(&admin_id)
             .expect("Admin chain should be created when the `TestValidator` is constructed");
 
@@ -345,6 +343,10 @@ impl TestValidator {
 
     /// Returns the [`ActiveChain`] reference to the microchain identified by `chain_id`.
     pub fn get_chain(&self, chain_id: &ChainId) -> ActiveChain {
-        self.chains.get(chain_id).expect("Chain not found").clone()
+        self.chains
+            .pin()
+            .get(chain_id)
+            .expect("Chain not found")
+            .clone()
     }
 }

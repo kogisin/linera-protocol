@@ -4,7 +4,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Not,
-    sync::Arc,
 };
 
 use custom_debug_derive::Debug;
@@ -15,21 +14,14 @@ use linera_base::{
     ownership::ChainOwnership,
 };
 use linera_views::{
-    context::{Context, MemoryContext},
-    random::generate_test_namespace,
+    context::MemoryContext,
     views::{CryptoHashView, View},
-    ViewError,
 };
 
-use super::{
-    dummy_chain_description, dummy_committees, AccountPublicKey, MockApplication,
-    RegisterMockApplication, ValidatorPublicKey,
-};
+use super::{dummy_chain_description, dummy_committees, MockApplication, RegisterMockApplication};
 use crate::{
-    committee::Committee, execution::UserAction, ApplicationDescription, ExecutionError,
-    ExecutionRuntimeConfig, ExecutionRuntimeContext, ExecutionStateView, OperationContext,
-    ResourceControlPolicy, ResourceController, ResourceTracker, TestExecutionRuntimeContext,
-    UserContractCode,
+    committee::Committee, ApplicationDescription, ExecutionRuntimeConfig, ExecutionRuntimeContext,
+    ExecutionStateView, TestExecutionRuntimeContext,
 };
 
 /// A system execution state, not represented as a view but as a simple struct.
@@ -124,8 +116,12 @@ impl SystemExecutionState {
         for (id, mock_application) in mock_applications {
             extra
                 .user_contracts()
+                .pin()
                 .insert(id, mock_application.clone().into());
-            extra.user_services().insert(id, mock_application.into());
+            extra
+                .user_services()
+                .pin()
+                .insert(id, mock_application.into());
         }
 
         let context = MemoryContext::new_for_testing(extra);

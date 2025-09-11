@@ -7,11 +7,10 @@ mod state;
 
 use std::collections::BTreeSet;
 
-use fungible::Account;
 use linera_sdk::{
-    linera_base_types::{AccountOwner, WithContractAbi},
+    linera_base_types::{Account, AccountOwner, DataBlobHash, WithContractAbi},
     views::{RootView, View},
-    Contract, ContractRuntime, DataBlobHash,
+    Contract, ContractRuntime,
 };
 use non_fungible::{Message, Nft, NonFungibleTokenAbi, Operation, TokenId};
 

@@ -15,12 +15,15 @@ use std::{
     ops::{Bound, RangeBounds},
     path::Path,
     str::FromStr,
+    sync::Arc,
 };
 
+use alloy_primitives::U256;
 use async_graphql::{InputObject, SimpleObject};
 use custom_debug_derive::Debug;
 use linera_witty::{WitLoad, WitStore, WitType};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_with::{serde_as, Bytes};
 use thiserror::Error;
 
 #[cfg(with_metrics)]
@@ -79,6 +82,12 @@ impl<'de> Deserialize<'de> for Amount {
     }
 }
 
+impl From<Amount> for U256 {
+    fn from(amount: Amount) -> U256 {
+        U256::from(amount.0)
+    }
+}
+
 /// A block height to identify blocks in a chain.
 #[derive(
     Eq,
@@ -103,6 +112,7 @@ pub struct BlockHeight(pub u64);
 #[derive(
     Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Hash, Default, Debug, Serialize, Deserialize,
 )]
+#[cfg_attr(with_testing, derive(test_strategy::Arbitrary))]
 pub enum Round {
     /// The initial fast round.
     #[default]
@@ -934,11 +944,11 @@ pub struct ApplicationPermissions {
     #[graphql(default)]
     #[debug(skip_if = Vec::is_empty)]
     pub mandatory_applications: Vec<ApplicationId>,
-    /// These applications are allowed to close the current chain using the system API.
+    /// These applications are allowed to close the current chain.
     #[graphql(default)]
     #[debug(skip_if = Vec::is_empty)]
     pub close_chain: Vec<ApplicationId>,
-    /// These applications are allowed to change the application permissions using the system API.
+    /// These applications are allowed to change the application permissions.
     #[graphql(default)]
     #[debug(skip_if = Vec::is_empty)]
     pub change_application_permissions: Vec<ApplicationId>,
@@ -1003,16 +1013,14 @@ impl ApplicationPermissions {
     pub fn can_call_services(&self, app_id: &ApplicationId) -> bool {
         self.call_service_as_oracle
             .as_ref()
-            .map(|app_ids| app_ids.contains(app_id))
-            .unwrap_or(true)
+            .is_none_or(|app_ids| app_ids.contains(app_id))
     }
 
     /// Returns whether the given application can make HTTP requests.
     pub fn can_make_http_requests(&self, app_id: &ApplicationId) -> bool {
         self.make_http_requests
             .as_ref()
-            .map(|app_ids| app_ids.contains(app_id))
-            .unwrap_or(true)
+            .is_none_or(|app_ids| app_ids.contains(app_id))
     }
 }
 
@@ -1034,7 +1042,14 @@ pub enum OracleResponse {
     /// The block's validation round.
     Round(Option<u32>),
     /// An event was read.
-    Event(EventId, Vec<u8>),
+    Event(
+        EventId,
+        #[debug(with = "hex_debug")]
+        #[serde(with = "serde_bytes")]
+        Vec<u8>,
+    ),
+    /// An event exists.
+    EventExists(EventId),
 }
 
 impl BcsHashable<'_> for OracleResponse {}
@@ -1088,7 +1103,7 @@ impl ApplicationDescription {
 }
 
 /// A WebAssembly module's bytecode.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, WitType, WitLoad, WitStore)]
 pub struct Bytecode {
     /// Bytes of the bytecode.
     #[serde(with = "serde_bytes")]
@@ -1103,7 +1118,7 @@ impl Bytecode {
     }
 
     /// Load bytecode from a Wasm module file.
-    pub async fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         let bytes = fs::read(path)?;
         Ok(Bytecode { bytes })
     }
@@ -1113,10 +1128,31 @@ impl Bytecode {
     pub fn compress(&self) -> CompressedBytecode {
         #[cfg(with_metrics)]
         let _compression_latency = metrics::BYTECODE_COMPRESSION_LATENCY.measure_latency();
-        let compressed_bytes = zstd::stream::encode_all(&*self.bytes, 19)
+        let compressed_bytes_vec = zstd::stream::encode_all(&*self.bytes, 19)
             .expect("Compressing bytes in memory should not fail");
 
-        CompressedBytecode { compressed_bytes }
+        CompressedBytecode {
+            compressed_bytes: Arc::new(compressed_bytes_vec.into_boxed_slice()),
+        }
+    }
+
+    /// Compresses the [`Bytecode`] into a [`CompressedBytecode`].
+    #[cfg(target_arch = "wasm32")]
+    pub fn compress(&self) -> CompressedBytecode {
+        use ruzstd::encoding::{CompressionLevel, FrameCompressor};
+
+        #[cfg(with_metrics)]
+        let _compression_latency = metrics::BYTECODE_COMPRESSION_LATENCY.measure_latency();
+
+        let mut compressed_bytes_vec = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+        compressor.set_source(&*self.bytes);
+        compressor.set_drain(&mut compressed_bytes_vec);
+        compressor.compress();
+
+        CompressedBytecode {
+            compressed_bytes: Arc::new(compressed_bytes_vec.into_boxed_slice()),
+        }
     }
 }
 
@@ -1134,14 +1170,15 @@ pub enum DecompressionError {
     InvalidCompressedBytecode(#[from] io::Error),
 }
 
-/// A compressed WebAssembly module's bytecode.
+/// A compressed module bytecode (WebAssembly or EVM).
+#[serde_as]
 #[derive(Clone, Debug, Deserialize, Hash, Serialize, WitType, WitStore)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
 pub struct CompressedBytecode {
     /// Compressed bytes of the bytecode.
-    #[serde(with = "serde_bytes")]
-    #[debug(with = "hex_debug")]
-    pub compressed_bytes: Vec<u8>,
+    #[serde_as(as = "Arc<Bytes>")]
+    #[debug(skip)]
+    pub compressed_bytes: Arc<Box<[u8]>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1167,7 +1204,7 @@ impl CompressedBytecode {
     pub fn decompress(&self) -> Result<Bytecode, DecompressionError> {
         #[cfg(with_metrics)]
         let _decompression_latency = metrics::BYTECODE_DECOMPRESSION_LATENCY.measure_latency();
-        let bytes = zstd::stream::decode_all(&*self.compressed_bytes)?;
+        let bytes = zstd::stream::decode_all(&**self.compressed_bytes)?;
 
         Ok(Bytecode { bytes })
     }
@@ -1180,10 +1217,10 @@ impl CompressedBytecode {
         compressed_bytes: &[u8],
         limit: u64,
     ) -> Result<bool, DecompressionError> {
+        use ruzstd::decoding::StreamingDecoder;
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let mut writer = LimitedWriter::new(io::sink(), limit);
-        let mut decoder = ruzstd::streaming_decoder::StreamingDecoder::new(compressed_bytes)
-            .map_err(io::Error::other)?;
+        let mut decoder = StreamingDecoder::new(compressed_bytes).map_err(io::Error::other)?;
 
         // TODO(#2710): Decode multiple frames, if present
         match io::copy(&mut decoder, &mut writer) {
@@ -1197,14 +1234,14 @@ impl CompressedBytecode {
 
     /// Decompresses a [`CompressedBytecode`] into a [`Bytecode`].
     pub fn decompress(&self) -> Result<Bytecode, DecompressionError> {
-        use ruzstd::{io::Read, streaming_decoder::StreamingDecoder};
+        use ruzstd::{decoding::StreamingDecoder, io::Read};
 
         #[cfg(with_metrics)]
         let _decompression_latency = BYTECODE_DECOMPRESSION_LATENCY.measure_latency();
 
         let compressed_bytes = &*self.compressed_bytes;
         let mut bytes = Vec::new();
-        let mut decoder = StreamingDecoder::new(compressed_bytes).map_err(io::Error::other)?;
+        let mut decoder = StreamingDecoder::new(&**compressed_bytes).map_err(io::Error::other)?;
 
         // TODO(#2710): Decode multiple frames, if present
         while !decoder.get_ref().is_empty() {
@@ -1220,21 +1257,25 @@ impl CompressedBytecode {
 impl BcsHashable<'_> for BlobContent {}
 
 /// A blob of binary data.
+#[serde_as]
 #[derive(Hash, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobContent {
     /// The type of data represented by the bytes.
     blob_type: BlobType,
     /// The binary data.
-    #[serde(with = "serde_bytes")]
     #[debug(skip)]
-    bytes: Box<[u8]>,
+    #[serde_as(as = "Arc<Bytes>")]
+    bytes: Arc<Box<[u8]>>,
 }
 
 impl BlobContent {
     /// Creates a new [`BlobContent`] from the provided bytes and [`BlobId`].
     pub fn new(blob_type: BlobType, bytes: impl Into<Box<[u8]>>) -> Self {
         let bytes = bytes.into();
-        BlobContent { blob_type, bytes }
+        BlobContent {
+            blob_type,
+            bytes: Arc::new(bytes),
+        }
     }
 
     /// Creates a new data [`BlobContent`] from the provided bytes.
@@ -1244,23 +1285,26 @@ impl BlobContent {
 
     /// Creates a new contract bytecode [`BlobContent`] from the provided bytes.
     pub fn new_contract_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
-        BlobContent::new(
-            BlobType::ContractBytecode,
-            compressed_bytecode.compressed_bytes,
-        )
+        BlobContent {
+            blob_type: BlobType::ContractBytecode,
+            bytes: compressed_bytecode.compressed_bytes,
+        }
     }
 
     /// Creates a new contract bytecode [`BlobContent`] from the provided bytes.
     pub fn new_evm_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
-        BlobContent::new(BlobType::EvmBytecode, compressed_bytecode.compressed_bytes)
+        BlobContent {
+            blob_type: BlobType::EvmBytecode,
+            bytes: compressed_bytecode.compressed_bytes,
+        }
     }
 
     /// Creates a new service bytecode [`BlobContent`] from the provided bytes.
     pub fn new_service_bytecode(compressed_bytecode: CompressedBytecode) -> Self {
-        BlobContent::new(
-            BlobType::ServiceBytecode,
-            compressed_bytecode.compressed_bytes,
-        )
+        BlobContent {
+            blob_type: BlobType::ServiceBytecode,
+            bytes: compressed_bytecode.compressed_bytes,
+        }
     }
 
     /// Creates a new application description [`BlobContent`] from a [`ApplicationDescription`].
@@ -1286,8 +1330,14 @@ impl BlobContent {
         &self.bytes
     }
 
-    /// Gets the inner blob's bytes, consuming the blob.
-    pub fn into_bytes(self) -> Box<[u8]> {
+    /// Converts a `BlobContent` into `Vec<u8>` without cloning if possible.
+    pub fn into_vec_or_clone(self) -> Vec<u8> {
+        let bytes = Arc::unwrap_or_clone(self.bytes);
+        bytes.into_vec()
+    }
+
+    /// Gets the `Arc<Box<[u8]>>` directly without cloning.
+    pub fn into_arc_bytes(self) -> Arc<Box<[u8]>> {
         self.bytes
     }
 
@@ -1326,13 +1376,22 @@ impl Blob {
         Blob { hash, content }
     }
 
+    /// Creates a blob from ud and content without checks
+    pub fn new_with_hash_unchecked(blob_id: BlobId, content: BlobContent) -> Self {
+        Blob {
+            hash: blob_id.hash,
+            content,
+        }
+    }
+
     /// Creates a blob without checking that the hash actually matches the content.
     pub fn new_with_id_unchecked(blob_id: BlobId, bytes: impl Into<Box<[u8]>>) -> Self {
+        let bytes = bytes.into();
         Blob {
             hash: blob_id.hash,
             content: BlobContent {
                 blob_type: blob_id.blob_type,
-                bytes: bytes.into(),
+                bytes: Arc::new(bytes),
             },
         }
     }
@@ -1397,13 +1456,8 @@ impl Blob {
         self.content.bytes()
     }
 
-    /// Gets the inner blob's bytes.
-    pub fn into_bytes(self) -> Box<[u8]> {
-        self.content.into_bytes()
-    }
-
     /// Loads data blob from a file.
-    pub async fn load_data_blob_from_file(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn load_data_blob_from_file(path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self::new_data(fs::read(path)?))
     }
 
@@ -1494,7 +1548,7 @@ impl StreamUpdate {
 
 impl BcsHashable<'_> for Event {}
 
-doc_scalar!(Bytecode, "A WebAssembly module's bytecode");
+doc_scalar!(Bytecode, "A module bytecode (WebAssembly or EVM)");
 doc_scalar!(Amount, "A non-negative amount of tokens.");
 doc_scalar!(
     Epoch,
@@ -1555,7 +1609,8 @@ mod metrics {
 mod tests {
     use std::str::FromStr;
 
-    use super::Amount;
+    use super::{Amount, BlobContent};
+    use crate::identifiers::BlobType;
 
     #[test]
     fn display_amount() {
@@ -1581,5 +1636,36 @@ mod tests {
             "~+12.34~~",
             format!("{:~^+9.1}", Amount::from_str("12.34").unwrap())
         );
+    }
+
+    #[test]
+    fn blob_content_serialization_deserialization() {
+        let test_data = b"Hello, world!".as_slice();
+        let original_blob = BlobContent::new(BlobType::Data, test_data);
+
+        let serialized = bcs::to_bytes(&original_blob).expect("Failed to serialize BlobContent");
+        let deserialized: BlobContent =
+            bcs::from_bytes(&serialized).expect("Failed to deserialize BlobContent");
+        assert_eq!(original_blob, deserialized);
+
+        let serialized =
+            serde_json::to_vec(&original_blob).expect("Failed to serialize BlobContent");
+        let deserialized: BlobContent =
+            serde_json::from_slice(&serialized).expect("Failed to deserialize BlobContent");
+        assert_eq!(original_blob, deserialized);
+    }
+
+    #[test]
+    fn blob_content_hash_consistency() {
+        let test_data = b"Hello, world!";
+        let blob1 = BlobContent::new(BlobType::Data, test_data.as_slice());
+        let blob2 = BlobContent::new(BlobType::Data, Vec::from(test_data.as_slice()));
+
+        // Both should have same hash since they contain the same data
+        let hash1 = crate::crypto::CryptoHash::new(&blob1);
+        let hash2 = crate::crypto::CryptoHash::new(&blob2);
+
+        assert_eq!(hash1, hash2, "Hashes should be equal for same content");
+        assert_eq!(blob1.bytes(), blob2.bytes(), "Byte content should be equal");
     }
 }

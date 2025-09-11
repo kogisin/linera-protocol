@@ -28,8 +28,8 @@ use crate::{
     },
     context::Context,
     map_view::ByteMapView,
-    store::{KeyIterable, KeyValueIterable, ReadableKeyValueStore},
-    views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
+    store::ReadableKeyValueStore,
+    views::{ClonableView, HashableView, Hasher, ReplaceContext, View, ViewError, MIN_VIEW_TAG},
 };
 
 #[cfg(with_metrics)]
@@ -210,6 +210,27 @@ pub struct KeyValueStoreView<C> {
     hash: Mutex<Option<HasherOutput>>,
 }
 
+impl<C: Context, C2: Context> ReplaceContext<C2> for KeyValueStoreView<C> {
+    type Target = KeyValueStoreView<C2>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        let hash = *self.hash.lock().unwrap();
+        KeyValueStoreView {
+            context: ctx.clone()(self.context()),
+            deletion_set: self.deletion_set.clone(),
+            updates: self.updates.clone(),
+            stored_total_size: self.stored_total_size,
+            total_size: self.total_size,
+            sizes: self.sizes.with_context(ctx.clone()).await,
+            stored_hash: self.stored_hash,
+            hash: Mutex::new(hash),
+        }
+    }
+}
+
 impl<C: Context> View for KeyValueStoreView<C> {
     const NUM_INIT_KEYS: usize = 2 + ByteMapView::<C, u32>::NUM_INIT_KEYS;
 
@@ -347,17 +368,17 @@ impl<C: Context> View for KeyValueStoreView<C> {
 }
 
 impl<C: Context> ClonableView for KeyValueStoreView<C> {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(KeyValueStoreView {
+    fn clone_unchecked(&mut self) -> Self {
+        KeyValueStoreView {
             context: self.context.clone(),
             deletion_set: self.deletion_set.clone(),
             updates: self.updates.clone(),
             stored_total_size: self.stored_total_size,
             total_size: self.total_size,
-            sizes: self.sizes.clone_unchecked()?,
+            sizes: self.sizes.clone_unchecked(),
             stored_hash: self.stored_hash,
             hash: Mutex::new(*self.hash.get_mut().unwrap()),
-        })
+        }
     }
 }
 
@@ -420,24 +441,22 @@ impl<C: Context> KeyValueStoreView<C> {
                 .store()
                 .find_keys_by_prefix(&key_prefix)
                 .await?
-                .iterator()
             {
-                let index = index?;
                 loop {
                     match update {
-                        Some((key, value)) if key.as_slice() <= index => {
+                        Some((key, value)) if key <= &index => {
                             if let Update::Set(_) = value {
                                 if !f(key)? {
                                     return Ok(());
                                 }
                             }
                             update = updates.next();
-                            if key == index {
+                            if key == &index {
                                 break;
                             }
                         }
                         _ => {
-                            if !suffix_closed_set.find_key(index) && !f(index)? {
+                            if !suffix_closed_set.find_key(&index) && !f(&index)? {
                                 return Ok(());
                             }
                             break;
@@ -525,24 +544,23 @@ impl<C: Context> KeyValueStoreView<C> {
                 .store()
                 .find_key_values_by_prefix(&key_prefix)
                 .await?
-                .iterator()
             {
-                let (index, index_val) = entry?;
+                let (index, index_val) = entry;
                 loop {
                     match update {
-                        Some((key, value)) if key.as_slice() <= index => {
+                        Some((key, value)) if key <= &index => {
                             if let Update::Set(value) = value {
                                 if !f(key, value)? {
                                     return Ok(());
                                 }
                             }
                             update = updates.next();
-                            if key == index {
+                            if key == &index {
                                 break;
                             }
                         }
                         _ => {
-                            if !suffix_closed_set.find_key(index) && !f(index, index_val)? {
+                            if !suffix_closed_set.find_key(&index) && !f(&index, &index_val)? {
                                 return Ok(());
                             }
                             break;
@@ -1017,12 +1035,12 @@ impl<C: Context> KeyValueStoreView<C> {
                 .store()
                 .find_keys_by_prefix(&key_prefix_full)
                 .await?
-                .iterator()
             {
-                let key = key?;
                 loop {
                     match update {
-                        Some((update_key, update_value)) if &update_key[len..] <= key => {
+                        Some((update_key, update_value))
+                            if &update_key[len..] <= key.as_slice() =>
+                        {
                             if let Update::Set(_) = update_value {
                                 keys.push(update_key[len..].to_vec());
                             }
@@ -1033,9 +1051,9 @@ impl<C: Context> KeyValueStoreView<C> {
                         }
                         _ => {
                             let mut key_with_prefix = key_prefix.to_vec();
-                            key_with_prefix.extend_from_slice(key);
+                            key_with_prefix.extend_from_slice(&key);
                             if !suffix_closed_set.find_key(&key_with_prefix) {
-                                keys.push(key.to_vec());
+                                keys.push(key);
                             }
                             break;
                         }
@@ -1098,9 +1116,8 @@ impl<C: Context> KeyValueStoreView<C> {
                 .store()
                 .find_key_values_by_prefix(&key_prefix_full)
                 .await?
-                .into_iterator_owned()
             {
-                let (key, value) = entry?;
+                let (key, value) = entry;
                 loop {
                     match update {
                         Some((update_key, update_value)) if update_key[len..] <= key[..] => {
@@ -1215,8 +1232,6 @@ impl KeyValueStoreError for ViewContainerError {
 #[cfg(with_testing)]
 impl<C: Context> ReadableKeyValueStore for ViewContainer<C> {
     const MAX_KEY_SIZE: usize = <C::Store as ReadableKeyValueStore>::MAX_KEY_SIZE;
-    type Keys = Vec<Vec<u8>>;
-    type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn max_stream_queries(&self) -> usize {
         1
@@ -1248,7 +1263,7 @@ impl<C: Context> ReadableKeyValueStore for ViewContainer<C> {
     async fn find_keys_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::Keys, ViewContainerError> {
+    ) -> Result<Vec<Vec<u8>>, ViewContainerError> {
         let view = self.view.read().await;
         Ok(view.find_keys_by_prefix(key_prefix).await?)
     }
@@ -1256,7 +1271,7 @@ impl<C: Context> ReadableKeyValueStore for ViewContainer<C> {
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::KeyValues, ViewContainerError> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ViewContainerError> {
         let view = self.view.read().await;
         Ok(view.find_key_values_by_prefix(key_prefix).await?)
     }

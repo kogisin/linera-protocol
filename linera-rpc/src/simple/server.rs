@@ -379,12 +379,18 @@ where
             | RpcMessage::DownloadConfirmedBlockResponse(_)
             | RpcMessage::BlobLastUsedBy(_)
             | RpcMessage::BlobLastUsedByResponse(_)
+            | RpcMessage::BlobLastUsedByCertificate(_)
+            | RpcMessage::BlobLastUsedByCertificateResponse(_)
             | RpcMessage::MissingBlobIds(_)
             | RpcMessage::MissingBlobIdsResponse(_)
             | RpcMessage::DownloadCertificates(_)
             | RpcMessage::DownloadCertificatesResponse(_)
             | RpcMessage::UploadBlob(_)
-            | RpcMessage::UploadBlobResponse(_) => Err(NodeError::UnexpectedMessage),
+            | RpcMessage::UploadBlobResponse(_)
+            | RpcMessage::DownloadCertificatesByHeights(_, _)
+            | RpcMessage::DownloadCertificatesByHeightsResponse(_) => {
+                Err(NodeError::UnexpectedMessage)
+            }
         };
 
         self.server.packets_processed += 1;

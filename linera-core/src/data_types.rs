@@ -76,6 +76,8 @@ pub struct ChainInfoQuery {
     #[debug(skip_if = Not::not)]
     pub request_pending_message_bundles: bool,
     /// Query a range of certificate hashes sent from the chain.
+    //  dev: this field is left and unused to maintain backwards compatibility
+    //  after hotfixing Testnet Conway.
     #[debug(skip_if = Option::is_none)]
     pub request_sent_certificate_hashes_in_range: Option<BlockHeightRange>,
     /// Query new certificate sender chain IDs and block heights received from the chain.
@@ -84,12 +86,23 @@ pub struct ChainInfoQuery {
     /// Query values from the chain manager, not just votes.
     #[debug(skip_if = Not::not)]
     pub request_manager_values: bool,
-    /// Include a timeout vote for the current round, if appropriate.
-    #[debug(skip_if = Not::not)]
-    pub request_leader_timeout: bool,
+    /// Include a timeout vote for the specified round, if appropriate.
+    #[debug(skip_if = Option::is_none)]
+    pub request_leader_timeout: Option<(BlockHeight, Round)>,
     /// Include a vote to switch to fallback mode, if appropriate.
     #[debug(skip_if = Not::not)]
     pub request_fallback: bool,
+    /// Query for certificate hashes at block heights.
+    #[debug(skip_if = Vec::is_empty)]
+    pub request_sent_certificate_hashes_by_heights: Vec<BlockHeight>,
+    #[serde(default = "default_true")]
+    pub create_network_actions: bool,
+}
+
+// Default value for create_network_actions.
+// Default for bool returns false.
+fn default_true() -> bool {
+    true
 }
 
 impl ChainInfoQuery {
@@ -103,8 +116,10 @@ impl ChainInfoQuery {
             request_sent_certificate_hashes_in_range: None,
             request_received_log_excluding_first_n: None,
             request_manager_values: false,
-            request_leader_timeout: false,
+            request_leader_timeout: None,
             request_fallback: false,
+            request_sent_certificate_hashes_by_heights: Vec::new(),
+            create_network_actions: false,
         }
     }
 
@@ -128,8 +143,8 @@ impl ChainInfoQuery {
         self
     }
 
-    pub fn with_sent_certificate_hashes_in_range(mut self, range: BlockHeightRange) -> Self {
-        self.request_sent_certificate_hashes_in_range = Some(range);
+    pub fn with_sent_certificate_hashes_by_heights(mut self, heights: Vec<BlockHeight>) -> Self {
+        self.request_sent_certificate_hashes_by_heights = heights;
         self
     }
 
@@ -143,13 +158,18 @@ impl ChainInfoQuery {
         self
     }
 
-    pub fn with_timeout(mut self) -> Self {
-        self.request_leader_timeout = true;
+    pub fn with_timeout(mut self, height: BlockHeight, round: Round) -> Self {
+        self.request_leader_timeout = Some((height, round));
         self
     }
 
     pub fn with_fallback(mut self) -> Self {
         self.request_fallback = true;
+        self
+    }
+
+    pub fn with_network_actions(mut self) -> Self {
+        self.create_network_actions = true;
         self
     }
 }
@@ -310,6 +330,13 @@ impl ChainInfoResponse {
 
 impl BcsSignable<'_> for ChainInfo {}
 
+/// Request for downloading certificates by heights.
+#[derive(Debug, Clone)]
+pub struct CertificatesByHeightRequest {
+    pub chain_id: ChainId,
+    pub heights: Vec<BlockHeight>,
+}
+
 /// The outcome of trying to commit a list of operations to the chain.
 #[derive(Debug)]
 pub enum ClientOutcome<T> {
@@ -332,7 +359,7 @@ impl<T> ClientOutcome<T> {
     pub fn unwrap(self) -> T {
         match self {
             ClientOutcome::Committed(t) => t,
-            ClientOutcome::WaitForTimeout(_) => panic!(),
+            ClientOutcome::WaitForTimeout(timeout) => panic!("Unexpected timeout: {timeout:?}"),
         }
     }
 

@@ -27,19 +27,20 @@ use linera_chain::{
     types::ConfirmedBlock,
 };
 use linera_execution::{
-    system::SystemOperation, test_utils::SystemExecutionState, ExecutionRuntimeContext, Operation,
-    OperationContext, ResourceController, TransactionTracker, WasmContractModule, WasmRuntime,
+    system::SystemOperation, test_utils::SystemExecutionState, ExecutionRuntimeContext,
+    ExecutionStateActor, Operation, OperationContext, ResourceController, TransactionTracker,
+    WasmContractModule, WasmRuntime,
 };
 use linera_storage::{DbStorage, Storage};
 #[cfg(feature = "dynamodb")]
-use linera_views::dynamo_db::DynamoDbStore;
+use linera_views::dynamo_db::DynamoDbDatabase;
 #[cfg(feature = "rocksdb")]
-use linera_views::rocks_db::RocksDbStore;
+use linera_views::rocks_db::RocksDbDatabase;
 #[cfg(feature = "scylladb")]
-use linera_views::scylla_db::ScyllaDbStore;
+use linera_views::scylla_db::ScyllaDbDatabase;
 use linera_views::{
     context::Context,
-    memory::MemoryStore,
+    memory::MemoryDatabase,
     views::{CryptoHashView, View},
 };
 use test_case::test_case;
@@ -53,7 +54,7 @@ use crate::worker::WorkerError;
 async fn test_memory_handle_certificates_to_create_application(
     wasm_runtime: WasmRuntime,
 ) -> anyhow::Result<()> {
-    let storage = DbStorage::<MemoryStore, _>::make_test_storage(Some(wasm_runtime)).await;
+    let storage = DbStorage::<MemoryDatabase, _>::make_test_storage(Some(wasm_runtime)).await;
     run_test_handle_certificates_to_create_application(storage, wasm_runtime).await
 }
 
@@ -64,7 +65,7 @@ async fn test_memory_handle_certificates_to_create_application(
 async fn test_rocks_db_handle_certificates_to_create_application(
     wasm_runtime: WasmRuntime,
 ) -> anyhow::Result<()> {
-    let storage = DbStorage::<RocksDbStore, _>::make_test_storage(Some(wasm_runtime)).await;
+    let storage = DbStorage::<RocksDbDatabase, _>::make_test_storage(Some(wasm_runtime)).await;
     run_test_handle_certificates_to_create_application(storage, wasm_runtime).await
 }
 
@@ -75,7 +76,7 @@ async fn test_rocks_db_handle_certificates_to_create_application(
 async fn test_dynamo_db_handle_certificates_to_create_application(
     wasm_runtime: WasmRuntime,
 ) -> anyhow::Result<()> {
-    let storage = DbStorage::<DynamoDbStore, _>::make_test_storage(Some(wasm_runtime)).await;
+    let storage = DbStorage::<DynamoDbDatabase, _>::make_test_storage(Some(wasm_runtime)).await;
     run_test_handle_certificates_to_create_application(storage, wasm_runtime).await
 }
 
@@ -86,7 +87,7 @@ async fn test_dynamo_db_handle_certificates_to_create_application(
 async fn test_scylla_db_handle_certificates_to_create_application(
     wasm_runtime: WasmRuntime,
 ) -> anyhow::Result<()> {
-    let storage = DbStorage::<ScyllaDbStore, _>::make_test_storage(Some(wasm_runtime)).await;
+    let storage = DbStorage::<ScyllaDbDatabase, _>::make_test_storage(Some(wasm_runtime)).await;
     run_test_handle_certificates_to_create_application(storage, wasm_runtime).await
 }
 
@@ -107,8 +108,8 @@ where
     // Load the bytecode files for a module.
     let (contract_path, service_path) =
         linera_execution::wasm_test::get_example_bytecode_paths("counter")?;
-    let contract_bytecode = Bytecode::load_from_file(contract_path).await?;
-    let service_bytecode = Bytecode::load_from_file(service_path).await?;
+    let contract_bytecode = Bytecode::load_from_file(contract_path)?;
+    let service_bytecode = Bytecode::load_from_file(service_path)?;
 
     let contract_blob = Blob::new_contract_bytecode(contract_bytecode.clone().compress());
     let service_blob = Blob::new_service_bytecode(service_bytecode.compress());
@@ -137,6 +138,7 @@ where
         BlockExecutionOutcome {
             messages: vec![Vec::new()],
             previous_message_blocks: BTreeMap::new(),
+            previous_event_blocks: BTreeMap::new(),
             events: vec![Vec::new()],
             blobs: vec![Vec::new()],
             state_hash: publisher_state_hash,
@@ -214,6 +216,7 @@ where
         BlockExecutionOutcome {
             messages: vec![vec![]],
             previous_message_blocks: BTreeMap::new(),
+            previous_event_blocks: BTreeMap::new(),
             events: vec![Vec::new()],
             state_hash: creator_state.crypto_hash().await?,
             oracle_responses: vec![vec![
@@ -250,7 +253,8 @@ where
 
     // Execute an application operation
     let increment = 5_u64;
-    let user_operation = bcs::to_bytes(&increment)?;
+    let counter_operation = counter::CounterOperation::Increment(increment);
+    let user_operation = bcs::to_bytes(&counter_operation)?;
     let run_block = make_child_block(&create_certificate.into_value())
         .with_timestamp(3)
         .with_operation(Operation::User {
@@ -260,28 +264,26 @@ where
     let operation_context = OperationContext {
         chain_id: creator_chain.id(),
         authenticated_signer: None,
-        authenticated_caller_id: None,
         height: run_block.height,
         round: Some(0),
         timestamp: Timestamp::from(3),
     };
     let mut controller = ResourceController::default();
-    creator_state
+    let mut txn_tracker = TransactionTracker::new(
+        Timestamp::from(3),
+        0,
+        0,
+        0,
+        Some(vec![OracleResponse::Blob(application_description_blob_id)]),
+        &[],
+    );
+    ExecutionStateActor::new(&mut creator_state, &mut txn_tracker, &mut controller)
         .execute_operation(
             operation_context,
             Operation::User {
                 application_id,
                 bytes: user_operation,
             },
-            &mut TransactionTracker::new(
-                Timestamp::from(3),
-                0,
-                0,
-                0,
-                0,
-                Some(vec![OracleResponse::Blob(application_description_blob_id)]),
-            ),
-            &mut controller,
         )
         .await?;
     creator_state.system.timestamp.set(Timestamp::from(3));
@@ -293,6 +295,7 @@ where
         BlockExecutionOutcome {
             messages: vec![Vec::new()],
             previous_message_blocks: BTreeMap::new(),
+            previous_event_blocks: BTreeMap::new(),
             events: vec![Vec::new()],
             blobs: vec![Vec::new()],
             state_hash: creator_state.crypto_hash().await?,

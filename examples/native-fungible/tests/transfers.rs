@@ -7,10 +7,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use fungible::{self, FungibleTokenAbi};
+use fungible::{self, NativeFungibleTokenAbi};
 use linera_sdk::{
     linera_base_types::{Account, AccountOwner, Amount, CryptoHash},
-    test::{ActiveChain, Recipient, TestValidator},
+    test::{ActiveChain, TestValidator},
 };
 
 /// Tests if tokens from the shared chain balance can be sent to a different chain.
@@ -21,7 +21,7 @@ async fn chain_balance_transfers() {
     };
     let initial_state = fungible::InitialStateBuilder::default().build();
     let (validator, _application_id, recipient_chain) = TestValidator::with_current_application::<
-        FungibleTokenAbi,
+        NativeFungibleTokenAbi,
         _,
         _,
     >(parameters, initial_state)
@@ -29,7 +29,7 @@ async fn chain_balance_transfers() {
 
     let transfer_amount = Amount::ONE;
     let funding_chain = validator.get_chain(&validator.admin_chain_id());
-    let recipient = Recipient::chain(recipient_chain.id());
+    let recipient = Account::chain(recipient_chain.id());
 
     let transfer_certificate = funding_chain
         .add_block(|block| {
@@ -58,7 +58,7 @@ async fn transfer_to_owner() {
     };
     let initial_state = fungible::InitialStateBuilder::default().build();
     let (validator, _application_id, recipient_chain) = TestValidator::with_current_application::<
-        FungibleTokenAbi,
+        NativeFungibleTokenAbi,
         _,
         _,
     >(parameters, initial_state)
@@ -67,8 +67,7 @@ async fn transfer_to_owner() {
     let transfer_amount = Amount::from_tokens(2);
     let funding_chain = validator.get_chain(&validator.admin_chain_id());
     let owner = AccountOwner::from(CryptoHash::test_hash("owner"));
-    let account = Account::new(recipient_chain.id(), owner);
-    let recipient = Recipient::Account(account);
+    let recipient = Account::new(recipient_chain.id(), owner);
 
     let transfer_certificate = funding_chain
         .add_block(|block| {
@@ -93,7 +92,7 @@ async fn transfer_to_multiple_owners() {
     };
     let initial_state = fungible::InitialStateBuilder::default().build();
     let (validator, _application_id, recipient_chain) = TestValidator::with_current_application::<
-        FungibleTokenAbi,
+        NativeFungibleTokenAbi,
         _,
         _,
     >(parameters, initial_state)
@@ -110,8 +109,7 @@ async fn transfer_to_multiple_owners() {
     let recipients = account_owners
         .iter()
         .copied()
-        .map(|account_owner| Account::new(recipient_chain.id(), account_owner))
-        .map(Recipient::Account);
+        .map(|account_owner| Account::new(recipient_chain.id(), account_owner));
 
     let transfer_certificate = funding_chain
         .add_block(|block| {
@@ -142,7 +140,7 @@ async fn emptied_account_disappears_from_queries() {
     };
     let initial_state = fungible::InitialStateBuilder::default().build();
     let (validator, _application_id, recipient_chain) = TestValidator::with_current_application::<
-        FungibleTokenAbi,
+        NativeFungibleTokenAbi,
         _,
         _,
     >(parameters, initial_state)
@@ -152,7 +150,7 @@ async fn emptied_account_disappears_from_queries() {
     let funding_chain = validator.get_chain(&validator.admin_chain_id());
 
     let owner = AccountOwner::from(recipient_chain.public_key());
-    let recipient = Recipient::Account(Account::new(recipient_chain.id(), owner));
+    let recipient = Account::new(recipient_chain.id(), owner);
 
     let transfer_certificate = funding_chain
         .add_block(|block| {
@@ -168,7 +166,11 @@ async fn emptied_account_disappears_from_queries() {
 
     recipient_chain
         .add_block(|block| {
-            block.with_native_token_transfer(owner, Recipient::Burn, transfer_amount);
+            block.with_native_token_transfer(
+                owner,
+                Account::chain(recipient_chain.id()),
+                transfer_amount,
+            );
         })
         .await;
 

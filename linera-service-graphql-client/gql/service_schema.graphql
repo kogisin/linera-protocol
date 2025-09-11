@@ -1,7 +1,30 @@
 """
-An account
+An account.
 """
-scalar Account
+input Account {
+	"""
+	The chain of the account.
+	"""
+	chainId: ChainId!
+	"""
+	The owner of the account.
+	"""
+	owner: AccountOwner!
+}
+
+"""
+An account.
+"""
+type AccountOutput {
+	"""
+	The chain of the account.
+	"""
+	chainId: ChainId!
+	"""
+	The owner of the account.
+	"""
+	owner: AccountOwner!
+}
 
 """
 A unique identifier for a user or an application.
@@ -45,11 +68,11 @@ input ApplicationPermissions {
 	"""
 	mandatoryApplications: [ApplicationId!]! = []
 	"""
-	These applications are allowed to close the current chain using the system API.
+	These applications are allowed to close the current chain.
 	"""
 	closeChain: [ApplicationId!]! = []
 	"""
-	These applications are allowed to change the application permissions using the system API.
+	These applications are allowed to change the application permissions.
 	"""
 	changeApplicationPermissions: [ApplicationId!]! = []
 	"""
@@ -96,22 +119,17 @@ The body of a block containing all the data included in the block.
 """
 type BlockBody {
 	"""
-	A selection of incoming messages to be executed first. Successive messages of the same
-	sender and height are grouped together for conciseness.
-	"""
-	incomingBundles: [IncomingBundle!]!
-	"""
-	The operations to execute.
-	"""
-	operations: [Operation!]!
-	"""
 	The list of outgoing messages for each transaction.
 	"""
 	messages: [[OutgoingMessage!]!]!
 	"""
-	The hashes of previous blocks that sent messages to the same recipients.
+	The hashes and heights of previous blocks that sent messages to the same recipients.
 	"""
 	previousMessageBlocks: JSONObject!
+	"""
+	The hashes and heights of previous blocks that published events to the same channels.
+	"""
+	previousEventBlocks: JSONObject!
 	"""
 	The record of oracle responses for each transaction.
 	"""
@@ -128,6 +146,10 @@ type BlockBody {
 	The execution result for each operation.
 	"""
 	operationResults: [OperationResult!]!
+	"""
+	Metadata about the transactions in this block.
+	"""
+	transactionMetadata: [TransactionMetadata!]!
 }
 
 """
@@ -168,13 +190,9 @@ type BlockHeader {
 	"""
 	authenticatedSigner: AccountOwner
 	"""
-	Cryptographic hash of all the incoming bundles in the block.
+	Cryptographic hash of all the transactions in the block.
 	"""
-	bundlesHash: CryptoHash!
-	"""
-	Cryptographic hash of all the operations in the block.
-	"""
-	operationsHash: CryptoHash!
+	transactionsHash: CryptoHash!
 	"""
 	Cryptographic hash of all the messages in the block.
 	"""
@@ -183,6 +201,10 @@ type BlockHeader {
 	Cryptographic hash of the lookup table for previous sending blocks.
 	"""
 	previousMessageBlocksHash: CryptoHash!
+	"""
+	Cryptographic hash of the lookup table for previous blocks publishing events.
+	"""
+	previousEventBlocksHash: CryptoHash!
 	"""
 	Cryptographic hash of all the oracle responses in the block.
 	"""
@@ -229,7 +251,7 @@ type BundleInInbox {
 }
 
 """
-A WebAssembly module's bytecode
+A module bytecode (WebAssembly or EVM)
 """
 scalar Bytecode
 
@@ -321,7 +343,7 @@ type ChainStateExtendedView {
 	"""
 	The incomplete sets of blobs for upcoming proposals.
 	"""
-	pendingProposedBlobs: ReentrantCollectionView_AccountOwner_PendingBlobsView_1774202114!
+	pendingProposedBlobs: ReentrantCollectionView_AccountOwner_PendingBlobsView_d58d342d!
 	"""
 	Hashes of all certified blocks for this sender.
 	This ends with `block_hash` and has length `usize::from(next_block_height)`.
@@ -338,7 +360,7 @@ type ChainStateExtendedView {
 	"""
 	Mailboxes used to receive messages indexed by their origin.
 	"""
-	inboxes: ReentrantCollectionView_ChainId_InboxStateView_1502311823!
+	inboxes: ReentrantCollectionView_ChainId_InboxStateView_466640be!
 	"""
 	A queue of unskippable bundles, with the timestamp when we added them to the inbox.
 	"""
@@ -352,9 +374,18 @@ type ChainStateExtendedView {
 	"""
 	previousMessageBlocks: MapView_ChainId_BlockHeight_f2e56e12!
 	"""
+	The heights of previous blocks that published events to the same streams.
+	"""
+	previousEventBlocks: MapView_StreamId_BlockHeight_e6657ad9!
+	"""
 	Mailboxes used to send messages, indexed by their target.
 	"""
-	outboxes: ReentrantCollectionView_ChainId_OutboxStateView_1536326071!
+	outboxes: ReentrantCollectionView_ChainId_OutboxStateView_06c2376d!
+	"""
+	The indices of next events we expect to see per stream (could be ahead of the last
+	executed block in sparse chains).
+	"""
+	nextExpectedEvents: MapView_StreamId_Int_3d7f5335!
 	"""
 	Number of outgoing messages in flight for each block height.
 	We use a `RegisterView` to prioritize speed for small maps.
@@ -424,7 +455,7 @@ input Committee {
 	"""
 	The policy agreed on for this epoch.
 	"""
-	policy: ResourceControlPolicy!
+	policy: ResourceControlPolicyScalar!
 }
 
 type ConfirmedBlock {
@@ -454,7 +485,7 @@ type Entry_AccountOwner_Amount_aaf96548 {
 """
 A GraphQL-visible map item, complete with key.
 """
-type Entry_AccountOwner_PendingBlobsView_2740f04d {
+type Entry_AccountOwner_PendingBlobsView_5d91edcf {
 	key: AccountOwner!
 	value: PendingBlobsView!
 }
@@ -494,7 +525,7 @@ type Entry_ChainId_BlockHeight_2fe78645 {
 """
 A GraphQL-visible map item, complete with key.
 """
-type Entry_ChainId_InboxStateView_685a16a3 {
+type Entry_ChainId_InboxStateView_a9e4d828 {
 	key: ChainId!
 	value: InboxStateView!
 }
@@ -502,9 +533,25 @@ type Entry_ChainId_InboxStateView_685a16a3 {
 """
 A GraphQL-visible map item, complete with key.
 """
-type Entry_ChainId_OutboxStateView_258a4684 {
+type Entry_ChainId_OutboxStateView_855dcf53 {
 	key: ChainId!
 	value: OutboxStateView!
+}
+
+"""
+A GraphQL-visible map item, complete with key.
+"""
+type Entry_StreamId_BlockHeight_50cd702e {
+	key: StreamId!
+	value: BlockHeight
+}
+
+"""
+A GraphQL-visible map item, complete with key.
+"""
+type Entry_StreamId_Int_459c4ec3 {
+	key: StreamId!
+	value: Int
 }
 
 """
@@ -634,6 +681,10 @@ input MapFilters_ChainId_37f83aa9 {
 	keys: [ChainId!]
 }
 
+input MapFilters_StreamIdInput_b7c3909d {
+	keys: [StreamIdInput!]
+}
+
 input MapInput_AccountOwner_d6668c53 {
 	filters: MapFilters_AccountOwner_d6668c53
 }
@@ -648,6 +699,10 @@ input MapInput_BlockHeight_e824a938 {
 
 input MapInput_ChainId_37f83aa9 {
 	filters: MapFilters_ChainId_37f83aa9
+}
+
+input MapInput_StreamIdInput_b7c3909d {
+	filters: MapFilters_StreamIdInput_b7c3909d
 }
 
 type MapView_AccountOwner_Amount_11ef1379 {
@@ -678,6 +733,18 @@ type MapView_ChainId_BlockHeight_f2e56e12 {
 	keys(count: Int): [ChainId!]!
 	entry(key: ChainId!): Entry_ChainId_BlockHeight_2fe78645!
 	entries(input: MapInput_ChainId_37f83aa9): [Entry_ChainId_BlockHeight_2fe78645!]!
+}
+
+type MapView_StreamId_BlockHeight_e6657ad9 {
+	keys(count: Int): [StreamId!]!
+	entry(key: StreamIdInput!): Entry_StreamId_BlockHeight_50cd702e!
+	entries(input: MapInput_StreamIdInput_b7c3909d): [Entry_StreamId_BlockHeight_50cd702e!]!
+}
+
+type MapView_StreamId_Int_3d7f5335 {
+	keys(count: Int): [StreamId!]!
+	entry(key: StreamIdInput!): Entry_StreamId_Int_459c4ec3!
+	entries(input: MapInput_StreamIdInput_b7c3909d): [Entry_StreamId_Int_459c4ec3!]!
 }
 
 """
@@ -730,36 +797,119 @@ type MutationRoot {
 	"""
 	Processes the inbox and returns the lists of certificate hashes that were created, if any.
 	"""
-	processInbox(chainId: ChainId!): [CryptoHash!]!
+	processInbox(
+		"""
+		The chain whose inbox is being processed.
+		"""
+		chainId: ChainId!
+	): [CryptoHash!]!
 	"""
 	Retries the pending block that was unsuccessfully proposed earlier.
 	"""
-	retryPendingBlock(chainId: ChainId!): CryptoHash
+	retryPendingBlock(
+		"""
+		The chain on whose block is being retried.
+		"""
+		chainId: ChainId!
+	): CryptoHash
 	"""
 	Transfers `amount` units of value from the given owner's account to the recipient.
 	If no owner is given, try to take the units out of the chain account.
 	"""
-	transfer(chainId: ChainId!, owner: AccountOwner!, recipient: Recipient!, amount: Amount!): CryptoHash!
+	transfer(
+		"""
+		The chain which native tokens are being transferred from.
+		"""
+		chainId: ChainId!,
+		"""
+		The account being debited on the chain.
+		"""
+		owner: AccountOwner!,
+		"""
+		The recipient of the transfer.
+		"""
+		recipient: Account!,
+		"""
+		The amount being transferred.
+		"""
+		amount: Amount!
+	): CryptoHash!
 	"""
 	Claims `amount` units of value from the given owner's account in the remote
 	`target` chain. Depending on its configuration, the `target` chain may refuse to
 	process the message.
 	"""
-	claim(chainId: ChainId!, owner: AccountOwner!, targetId: ChainId!, recipient: Recipient!, amount: Amount!): CryptoHash!
+	claim(
+		"""
+		The chain for whom owner is one of the owner.
+		"""
+		chainId: ChainId!,
+		"""
+		The owner of chain targetId being debited.
+		"""
+		owner: AccountOwner!,
+		"""
+		The chain whose owner is being debited.
+		"""
+		targetId: ChainId!,
+		"""
+		The recipient of the transfer.
+		"""
+		recipient: Account!,
+		"""
+		The amount being transferred.
+		"""
+		amount: Amount!
+	): CryptoHash!
 	"""
 	Test if a data blob is readable from a transaction in the current chain.
 	"""
 	readDataBlob(chainId: ChainId!, hash: CryptoHash!): CryptoHash!
 	"""
-	Creates (or activates) a new chain with the given owner.
-	This will automatically subscribe to the future committees created by `admin_id`.
+	Creates a new single-owner chain.
 	"""
-	openChain(chainId: ChainId!, owner: AccountOwner!, balance: Amount): ChainId!
+	openChain(
+		"""
+		The chain paying for the creation of the new chain.
+		"""
+		chainId: ChainId!,
+		"""
+		The owner of the new chain.
+		"""
+		owner: AccountOwner!,
+		"""
+		The balance of the chain being created. Zero if `None`.
+		"""
+		balance: Amount
+	): ChainId!
 	"""
-	Creates (or activates) a new chain by installing the given authentication keys.
-	This will automatically subscribe to the future committees created by `admin_id`.
+	Creates a new multi-owner chain.
 	"""
-	openMultiOwnerChain(		chainId: ChainId!,		applicationPermissions: ApplicationPermissions,		owners: [AccountOwner!]!,		weights: [Int!],		multiLeaderRounds: Int,		balance: Amount,
+	openMultiOwnerChain(
+		"""
+		The chain paying for the creation of the new chain.
+		"""
+		chainId: ChainId!,
+		"""
+		Permissions for applications on the new chain
+		"""
+		applicationPermissions: ApplicationPermissions,
+		"""
+		The owners of the chain
+		"""
+		owners: [AccountOwner!]!,
+		"""
+		The weights of the owners
+		"""
+		weights: [Int!],
+		"""
+		The number of multi-leader rounds
+		"""
+		multiLeaderRounds: Int,
+		"""
+		The balance of the chain. Zero if `None`
+		"""
+		balance: Amount,
 		"""
 		The duration of the fast round, in milliseconds; default: no timeout
 		"""
@@ -778,17 +928,51 @@ type MutationRoot {
 		fallbackDurationMs: Int! = 86400000
 	): ChainId!
 	"""
-	Closes the chain. Returns `None` if it was already closed.
+	Closes the chain. Returns the new block hash if successful or `None` if it was already closed.
 	"""
-	closeChain(chainId: ChainId!): CryptoHash
+	closeChain(
+		"""
+		The chain being closed.
+		"""
+		chainId: ChainId!
+	): CryptoHash
 	"""
-	Changes the authentication key of the chain.
+	Changes the chain to a single-owner chain
 	"""
-	changeOwner(chainId: ChainId!, newOwner: AccountOwner!): CryptoHash!
+	changeOwner(
+		"""
+		The chain whose ownership changes
+		"""
+		chainId: ChainId!,
+		"""
+		The new single owner of the chain
+		"""
+		newOwner: AccountOwner!
+	): CryptoHash!
 	"""
-	Changes the authentication key of the chain.
+	Changes the ownership of the chain
 	"""
-	changeMultipleOwners(		chainId: ChainId!,		newOwners: [AccountOwner!]!,		newWeights: [Int!]!,		multiLeaderRounds: Int!,		openMultiLeaderRounds: Boolean!,
+	changeMultipleOwners(
+		"""
+		The chain whose ownership changes
+		"""
+		chainId: ChainId!,
+		"""
+		The new list of owners of the chain
+		"""
+		newOwners: [AccountOwner!]!,
+		"""
+		The new list of weights of the owners
+		"""
+		newWeights: [Int!]!,
+		"""
+		The multi-leader round of the chain
+		"""
+		multiLeaderRounds: Int!,
+		"""
+		Whether multi-leader rounds are unrestricted, that is not limited to chain owners.
+		"""
+		openMultiLeaderRounds: Boolean!,
 		"""
 		The duration of the fast round, in milliseconds; default: no timeout
 		"""
@@ -809,7 +993,38 @@ type MutationRoot {
 	"""
 	Changes the application permissions configuration on this chain.
 	"""
-	changeApplicationPermissions(chainId: ChainId!, closeChain: [ApplicationId!]!, executeOperations: [ApplicationId!], mandatoryApplications: [ApplicationId!]!, changeApplicationPermissions: [ApplicationId!]!, callServiceAsOracle: [ApplicationId!], makeHttpRequests: [ApplicationId!]): CryptoHash!
+	changeApplicationPermissions(
+		"""
+		The chain whose permissions are being changed
+		"""
+		chainId: ChainId!,
+		"""
+		These applications are allowed to close the current chain.
+		"""
+		closeChain: [ApplicationId!]!,
+		"""
+		If this is `None`, all system operations and application operations are allowed.
+		If it is `Some`, only operations from the specified applications are allowed,
+		and no system operations.
+		"""
+		executeOperations: [ApplicationId!],
+		"""
+		At least one operation or incoming message from each of these applications must occur in every block.
+		"""
+		mandatoryApplications: [ApplicationId!]!,
+		"""
+		These applications are allowed to change the application permissions.
+		"""
+		changeApplicationPermissions: [ApplicationId!]!,
+		"""
+		These applications are allowed to perform calls to services as oracles.
+		"""
+		callServiceAsOracle: [ApplicationId!],
+		"""
+		These applications are allowed to perform HTTP requests.
+		"""
+		makeHttpRequests: [ApplicationId!]
+	): CryptoHash!
 	"""
 	(admin chain only) Registers a new committee. This will notify the subscribers of
 	the admin chain so that they can migrate to the new epoch (by accepting the
@@ -825,15 +1040,62 @@ type MutationRoot {
 	"""
 	Publishes a new application module.
 	"""
-	publishModule(chainId: ChainId!, contract: Bytecode!, service: Bytecode!, vmRuntime: VmRuntime!): ModuleId!
+	publishModule(
+		"""
+		The chain publishing the module
+		"""
+		chainId: ChainId!,
+		"""
+		The bytecode of the contract code
+		"""
+		contract: Bytecode!,
+		"""
+		The bytecode of the service code (only relevant for WebAssembly)
+		"""
+		service: Bytecode!,
+		"""
+		The virtual machine being used (either Wasm or Evm)
+		"""
+		vmRuntime: VmRuntime!
+	): ModuleId!
 	"""
 	Publishes a new data blob.
 	"""
-	publishDataBlob(chainId: ChainId!, bytes: [Int!]!): CryptoHash!
+	publishDataBlob(
+		"""
+		The chain paying for the blob publication
+		"""
+		chainId: ChainId!,
+		"""
+		The content of the data blob being created
+		"""
+		bytes: [Int!]!
+	): CryptoHash!
 	"""
 	Creates a new application.
 	"""
-	createApplication(chainId: ChainId!, moduleId: ModuleId!, parameters: String!, instantiationArgument: String!, requiredApplicationIds: [ApplicationId!]!): ApplicationId!
+	createApplication(
+		"""
+		The chain paying for the creation of the application
+		"""
+		chainId: ChainId!,
+		"""
+		The module ID of the application being created
+		"""
+		moduleId: ModuleId!,
+		"""
+		The JSON serialization of the parameters of the application
+		"""
+		parameters: String!,
+		"""
+		The JSON serialization of the instantiation argument of the application
+		"""
+		instantiationArgument: String!,
+		"""
+		The dependencies of the application being created
+		"""
+		requiredApplicationIds: [ApplicationId!]!
+	): ApplicationId!
 }
 
 """
@@ -841,10 +1103,24 @@ Notify that a chain has a new certified block or a new message
 """
 scalar Notification
 
-"""
-An operation to be executed in a block
-"""
-scalar Operation
+type Operation {
+	"""
+	The type of operation: "System" or "User"
+	"""
+	operationType: String!
+	"""
+	For user operations, the application ID
+	"""
+	applicationId: ApplicationId
+	"""
+	For user operations, the serialized bytes (as a hex string for GraphQL)
+	"""
+	userBytesHex: String
+	"""
+	For system operations, the serialized bytes (as a hex string for GraphQL)
+	"""
+	systemBytesHex: String
+}
 
 """
 The execution result of a single operation.
@@ -896,7 +1172,7 @@ type OutgoingMessage {
 	"""
 	Where to send a refund for the unused part of the grant after execution, if any.
 	"""
-	refundGrantTo: Account
+	refundGrantTo: AccountOutput
 	"""
 	The kind of message being sent.
 	"""
@@ -944,7 +1220,7 @@ type PostedMessage {
 	"""
 	Where to send a refund for the unused part of the grant after execution, if any.
 	"""
-	refundGrantTo: Account
+	refundGrantTo: AccountOutput
 	"""
 	The kind of message being sent.
 	"""
@@ -976,163 +1252,28 @@ type QueueView_MessageBundle_f4399f0b {
 	entries(count: Int): [MessageBundle!]!
 }
 
-"""
-The recipient of a transfer
-"""
-scalar Recipient
-
-type ReentrantCollectionView_AccountOwner_PendingBlobsView_1774202114 {
+type ReentrantCollectionView_AccountOwner_PendingBlobsView_d58d342d {
 	keys: [AccountOwner!]!
-	entry(key: AccountOwner!): Entry_AccountOwner_PendingBlobsView_2740f04d!
-	entries(input: MapInput_AccountOwner_d6668c53): [Entry_AccountOwner_PendingBlobsView_2740f04d!]!
+	entry(key: AccountOwner!): Entry_AccountOwner_PendingBlobsView_5d91edcf!
+	entries(input: MapInput_AccountOwner_d6668c53): [Entry_AccountOwner_PendingBlobsView_5d91edcf!]!
 }
 
-type ReentrantCollectionView_ChainId_InboxStateView_1502311823 {
+type ReentrantCollectionView_ChainId_InboxStateView_466640be {
 	keys: [ChainId!]!
-	entry(key: ChainId!): Entry_ChainId_InboxStateView_685a16a3!
-	entries(input: MapInput_ChainId_37f83aa9): [Entry_ChainId_InboxStateView_685a16a3!]!
+	entry(key: ChainId!): Entry_ChainId_InboxStateView_a9e4d828!
+	entries(input: MapInput_ChainId_37f83aa9): [Entry_ChainId_InboxStateView_a9e4d828!]!
 }
 
-type ReentrantCollectionView_ChainId_OutboxStateView_1536326071 {
+type ReentrantCollectionView_ChainId_OutboxStateView_06c2376d {
 	keys: [ChainId!]!
-	entry(key: ChainId!): Entry_ChainId_OutboxStateView_258a4684!
-	entries(input: MapInput_ChainId_37f83aa9): [Entry_ChainId_OutboxStateView_258a4684!]!
+	entry(key: ChainId!): Entry_ChainId_OutboxStateView_855dcf53!
+	entries(input: MapInput_ChainId_37f83aa9): [Entry_ChainId_OutboxStateView_855dcf53!]!
 }
 
 """
-A collection of prices and limits associated with block execution.
+A collection of prices and limits associated with block execution
 """
-input ResourceControlPolicy {
-	"""
-	The price per unit of fuel (aka gas) for Wasm execution.
-	"""
-	wasmFuelUnit: Amount!
-	"""
-	The price per unit of fuel (aka gas) for EVM execution.
-	"""
-	evmFuelUnit: Amount!
-	"""
-	The price of one read operation.
-	"""
-	readOperation: Amount!
-	"""
-	The price of one write operation.
-	"""
-	writeOperation: Amount!
-	"""
-	The price of accessing one byte from the runtime.
-	"""
-	byteRuntime: Amount!
-	"""
-	The price of reading a byte.
-	"""
-	byteRead: Amount!
-	"""
-	The price of writing a byte
-	"""
-	byteWritten: Amount!
-	"""
-	The base price to read a blob.
-	"""
-	blobRead: Amount!
-	"""
-	The base price to publish a blob.
-	"""
-	blobPublished: Amount!
-	"""
-	The price to read a blob, per byte.
-	"""
-	blobByteRead: Amount!
-	"""
-	The price to publish a blob, per byte.
-	"""
-	blobBytePublished: Amount!
-	"""
-	The price of increasing storage by a byte.
-	"""
-	byteStored: Amount!
-	"""
-	The base price of adding an operation to a block.
-	"""
-	operation: Amount!
-	"""
-	The additional price for each byte in the argument of a user operation.
-	"""
-	operationByte: Amount!
-	"""
-	The base price of sending a message from a block.
-	"""
-	message: Amount!
-	"""
-	The additional price for each byte in the argument of a user message.
-	"""
-	messageByte: Amount!
-	"""
-	The price per query to a service as an oracle.
-	"""
-	serviceAsOracleQuery: Amount!
-	"""
-	The price for a performing an HTTP request.
-	"""
-	httpRequest: Amount!
-	"""
-	The maximum amount of Wasm fuel a block can consume.
-	"""
-	maximumWasmFuelPerBlock: Int!
-	"""
-	The maximum amount of EVM fuel a block can consume.
-	"""
-	maximumEvmFuelPerBlock: Int!
-	"""
-	The maximum time in milliseconds that a block can spend executing services as oracles.
-	"""
-	maximumServiceOracleExecutionMs: Int!
-	"""
-	The maximum size of a block. This includes the block proposal itself as well as
-	the execution outcome.
-	"""
-	maximumBlockSize: Int!
-	"""
-	The maximum size of decompressed contract or service bytecode, in bytes.
-	"""
-	maximumBytecodeSize: Int!
-	"""
-	The maximum size of a blob.
-	"""
-	maximumBlobSize: Int!
-	"""
-	The maximum number of published blobs per block.
-	"""
-	maximumPublishedBlobs: Int!
-	"""
-	The maximum size of a block proposal.
-	"""
-	maximumBlockProposalSize: Int!
-	"""
-	The maximum data to read per block
-	"""
-	maximumBytesReadPerBlock: Int!
-	"""
-	The maximum data to write per block
-	"""
-	maximumBytesWrittenPerBlock: Int!
-	"""
-	The maximum size in bytes of an oracle response.
-	"""
-	maximumOracleResponseBytes: Int!
-	"""
-	The maximum size in bytes of a received HTTP response.
-	"""
-	maximumHttpResponseBytes: Int!
-	"""
-	The maximum amount of time allowed to wait for an HTTP response.
-	"""
-	httpRequestTimeoutMs: Int!
-	"""
-	The list of hosts that contracts and services can send HTTP requests to.
-	"""
-	httpRequestAllowList: [String!]!
-}
+scalar ResourceControlPolicyScalar
 
 """
 A number to identify successive attempts to decide a value in a consensus protocol.
@@ -1207,6 +1348,24 @@ type TimestampedBundleInInbox {
 	The timestamp when the bundle was added to the inbox.
 	"""
 	seen: Timestamp!
+}
+
+"""
+GraphQL-compatible metadata about a transaction.
+"""
+type TransactionMetadata {
+	"""
+	The type of transaction: "ReceiveMessages" or "ExecuteOperation"
+	"""
+	transactionType: String!
+	"""
+	The incoming bundle, if this is a ReceiveMessages transaction
+	"""
+	incomingBundle: IncomingBundle
+	"""
+	The operation, if this is an ExecuteOperation transaction
+	"""
+	operation: Operation
 }
 
 scalar VersionInfo

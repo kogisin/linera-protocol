@@ -6,22 +6,20 @@ use std::{
     mem,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex},
-    time::Instant,
 };
 
 use custom_debug_derive::Debug;
 use linera_base::{
-    crypto::CryptoHash,
     data_types::{
-        Amount, ApplicationPermissions, ArithmeticError, BlockHeight, OracleResponse,
+        Amount, ApplicationPermissions, ArithmeticError, Blob, BlockHeight, Bytecode,
         SendMessageRequest, Timestamp,
     },
     ensure, http,
     identifiers::{
-        Account, AccountOwner, BlobId, BlobType, ChainId, EventId, GenericApplicationId, MessageId,
-        StreamId, StreamName,
+        Account, AccountOwner, ChainId, EventId, GenericApplicationId, StreamId, StreamName,
     },
     ownership::ChainOwnership,
+    time::Instant,
     vm::VmRuntime,
 };
 use linera_views::batch::Batch;
@@ -33,9 +31,9 @@ use crate::{
     resources::ResourceController,
     system::CreateApplicationResult,
     util::{ReceiverExt, UnboundedSenderExt},
-    ApplicationDescription, ApplicationId, BaseRuntime, ContractRuntime, ExecutionError,
-    FinalizeContext, Message, MessageContext, MessageKind, ModuleId, Operation, OutgoingMessage,
-    QueryContext, QueryOutcome, ServiceRuntime, TransactionTracker, UserContractCode,
+    ApplicationDescription, ApplicationId, BaseRuntime, ContractRuntime, DataBlobHash,
+    ExecutionError, FinalizeContext, Message, MessageContext, MessageKind, ModuleId, Operation,
+    OutgoingMessage, QueryContext, QueryOutcome, ServiceRuntime, UserContractCode,
     UserContractInstance, UserServiceCode, UserServiceInstance, MAX_STREAM_NAME_LEN,
 };
 
@@ -88,9 +86,6 @@ pub struct SyncRuntimeInternal<UserInstance: WithContext> {
     height: BlockHeight,
     /// The current consensus round. Only available during block validation in multi-leader rounds.
     round: Option<u32>,
-    /// The authenticated signer of the operation or message, if any.
-    #[debug(skip_if = Option::is_none)]
-    authenticated_signer: Option<AccountOwner>,
     /// The current message being executed, if there is one.
     #[debug(skip_if = Option::is_none)]
     executing_message: Option<ExecutingMessage>,
@@ -111,8 +106,6 @@ pub struct SyncRuntimeInternal<UserInstance: WithContext> {
     call_stack: Vec<ApplicationStatus>,
     /// The set of the IDs of the applications that are in the `call_stack`.
     active_applications: HashSet<ApplicationId>,
-    /// The tracking information for this transaction.
-    transaction_tracker: TransactionTracker,
     /// The operations scheduled during this query.
     scheduled_operations: Vec<Operation>,
 
@@ -312,20 +305,17 @@ impl<UserInstance: WithContext> SyncRuntimeInternal<UserInstance> {
         chain_id: ChainId,
         height: BlockHeight,
         round: Option<u32>,
-        authenticated_signer: Option<AccountOwner>,
         executing_message: Option<ExecutingMessage>,
         execution_state_sender: ExecutionStateSender,
         deadline: Option<Instant>,
         refund_grant_to: Option<Account>,
         resource_controller: ResourceController,
-        transaction_tracker: TransactionTracker,
         user_context: UserInstance::UserContext,
     ) -> Self {
         Self {
             chain_id,
             height,
             round,
-            authenticated_signer,
             executing_message,
             execution_state_sender,
             is_finalizing: false,
@@ -337,7 +327,6 @@ impl<UserInstance: WithContext> SyncRuntimeInternal<UserInstance> {
             deadline,
             refund_grant_to,
             resource_controller,
-            transaction_tracker,
             scheduled_operations: Vec::new(),
             user_context,
         }
@@ -413,16 +402,10 @@ impl SyncRuntimeInternal<UserContractInstance> {
             }
             #[cfg(not(web))]
             hash_map::Entry::Vacant(entry) => {
-                let txn_tracker_moved = mem::take(&mut self.transaction_tracker);
-                let (code, description, txn_tracker_moved) = self
+                let (code, description) = self
                     .execution_state_sender
-                    .send_request(move |callback| ExecutionRequest::LoadContract {
-                        id,
-                        callback,
-                        txn_tracker: txn_tracker_moved,
-                    })?
+                    .send_request(move |callback| ExecutionRequest::LoadContract { id, callback })?
                     .recv_response()?;
-                self.transaction_tracker = txn_tracker_moved;
 
                 let instance = code.instantiate(this)?;
 
@@ -475,9 +458,8 @@ impl SyncRuntimeInternal<UserContractInstance> {
     }
 
     /// Cleans up the runtime after the execution of a call to a different contract.
-    fn finish_call(&mut self) -> Result<(), ExecutionError> {
+    fn finish_call(&mut self) {
         self.pop_application();
-        Ok(())
     }
 
     /// Runs the service in a separate thread as an oracle.
@@ -486,41 +468,27 @@ impl SyncRuntimeInternal<UserContractInstance> {
         application_id: ApplicationId,
         query: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError> {
-        let context = QueryContext {
-            chain_id: self.chain_id,
-            next_block_height: self.height,
-            local_time: self.transaction_tracker.local_time(),
-        };
-        let sender = self.execution_state_sender.clone();
-
-        let txn_tracker = TransactionTracker::default()
-            .with_blobs(self.transaction_tracker.created_blobs().clone());
-
         let timeout = self
             .resource_controller
             .remaining_service_oracle_execution_time()?;
         let execution_start = Instant::now();
         let deadline = Some(execution_start + timeout);
+        let response = self
+            .execution_state_sender
+            .send_request(|callback| ExecutionRequest::QueryServiceOracle {
+                deadline,
+                application_id,
+                next_block_height: self.height,
+                query,
+                callback,
+            })?
+            .recv_response()?;
 
-        let mut service_runtime =
-            ServiceSyncRuntime::new_with_txn_tracker(sender, context, deadline, txn_tracker);
-
-        let result = service_runtime.run_query(application_id, query);
-
-        // Always track the execution time, irrespective to whether the service ran successfully or
-        // timed out
         self.resource_controller
             .track_service_oracle_execution(execution_start.elapsed())?;
-
-        let QueryOutcome {
-            response,
-            operations,
-        } = result?;
-
         self.resource_controller
             .track_service_oracle_response(response.len())?;
 
-        self.scheduled_operations.extend(operations);
         Ok(response)
     }
 }
@@ -543,16 +511,10 @@ impl SyncRuntimeInternal<UserServiceInstance> {
             }
             #[cfg(not(web))]
             hash_map::Entry::Vacant(entry) => {
-                let txn_tracker_moved = mem::take(&mut self.transaction_tracker);
-                let (code, description, txn_tracker_moved) = self
+                let (code, description) = self
                     .execution_state_sender
-                    .send_request(move |callback| ExecutionRequest::LoadService {
-                        id,
-                        callback,
-                        txn_tracker: txn_tracker_moved,
-                    })?
+                    .send_request(move |callback| ExecutionRequest::LoadService { id, callback })?
                     .recv_response()?;
-                self.transaction_tracker = txn_tracker_moved;
 
                 let instance = code.instantiate(this)?;
                 Ok(entry
@@ -898,72 +860,42 @@ where
 
         this.resource_controller.track_http_request()?;
 
-        let response =
-            if let Some(response) = this.transaction_tracker.next_replayed_oracle_response()? {
-                match response {
-                    OracleResponse::Http(response) => response,
-                    _ => return Err(ExecutionError::OracleResponseMismatch),
-                }
-            } else {
-                this.execution_state_sender
-                    .send_request(|callback| ExecutionRequest::PerformHttpRequest {
-                        request,
-                        http_responses_are_oracle_responses:
-                            Self::LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE,
-                        callback,
-                    })?
-                    .recv_response()?
-            };
-        this.transaction_tracker
-            .add_oracle_response(OracleResponse::Http(response.clone()));
-        Ok(response)
+        this.execution_state_sender
+            .send_request(|callback| ExecutionRequest::PerformHttpRequest {
+                request,
+                http_responses_are_oracle_responses:
+                    Self::LIMIT_HTTP_RESPONSE_SIZE_TO_ORACLE_RESPONSE_SIZE,
+                callback,
+            })?
+            .recv_response()
     }
 
     fn assert_before(&mut self, timestamp: Timestamp) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
-        if !this
-            .transaction_tracker
-            .replay_oracle_response(OracleResponse::Assert)?
-        {
-            // There are no recorded oracle responses, so we check the local time.
-            let local_time = this.transaction_tracker.local_time();
-            ensure!(
-                local_time < timestamp,
-                ExecutionError::AssertBefore {
-                    timestamp,
-                    local_time,
-                }
-            );
-        }
-        Ok(())
+        let this = self.inner();
+        this.execution_state_sender
+            .send_request(|callback| ExecutionRequest::AssertBefore {
+                timestamp,
+                callback,
+            })?
+            .recv_response()?
     }
 
-    fn read_data_blob(&mut self, hash: &CryptoHash) -> Result<Vec<u8>, ExecutionError> {
-        let mut this = self.inner();
-        let blob_id = BlobId::new(*hash, BlobType::Data);
-        let (blob_content, is_new) = this
+    fn read_data_blob(&mut self, hash: DataBlobHash) -> Result<Vec<u8>, ExecutionError> {
+        let this = self.inner();
+        let blob_id = hash.into();
+        let content = this
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::ReadBlobContent { blob_id, callback })?
             .recv_response()?;
-        if is_new {
-            this.transaction_tracker
-                .replay_oracle_response(OracleResponse::Blob(blob_id))?;
-        }
-        Ok(blob_content.into_bytes().into_vec())
+        Ok(content.into_vec_or_clone())
     }
 
-    fn assert_data_blob_exists(&mut self, hash: &CryptoHash) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
-        let blob_id = BlobId::new(*hash, BlobType::Data);
-        let is_new = this
-            .execution_state_sender
+    fn assert_data_blob_exists(&mut self, hash: DataBlobHash) -> Result<(), ExecutionError> {
+        let this = self.inner();
+        let blob_id = hash.into();
+        this.execution_state_sender
             .send_request(|callback| ExecutionRequest::AssertBlobExists { blob_id, callback })?
-            .recv_response()?;
-        if is_new {
-            this.transaction_tracker
-                .replay_oracle_response(OracleResponse::Blob(blob_id))?;
-        }
-        Ok(())
+            .recv_response()
     }
 }
 
@@ -999,14 +931,12 @@ impl ContractSyncRuntime {
         refund_grant_to: Option<Account>,
         resource_controller: ResourceController,
         action: &UserAction,
-        txn_tracker: TransactionTracker,
     ) -> Self {
         SyncRuntime(Some(ContractSyncRuntimeHandle::from(
             SyncRuntimeInternal::new(
                 chain_id,
                 action.height(),
                 action.round(),
-                action.signer(),
                 if let UserAction::Message(context, _) = action {
                     Some(context.into())
                 } else {
@@ -1016,7 +946,6 @@ impl ContractSyncRuntime {
                 None,
                 refund_grant_to,
                 resource_controller,
-                txn_tracker,
                 action.timestamp(),
             ),
         )))
@@ -1052,18 +981,15 @@ impl ContractSyncRuntime {
         application_id: ApplicationId,
         chain_id: ChainId,
         action: UserAction,
-    ) -> Result<(Option<Vec<u8>>, ResourceController, TransactionTracker), ExecutionError> {
+    ) -> Result<(Option<Vec<u8>>, ResourceController), ExecutionError> {
         let result = self
             .deref_mut()
             .run_action(application_id, chain_id, action)?;
         let runtime = self
             .into_inner()
             .expect("Runtime clones should have been freed by now");
-        Ok((
-            result,
-            runtime.resource_controller,
-            runtime.transaction_tracker,
-        ))
+
+        Ok((result, runtime.resource_controller))
     }
 }
 
@@ -1083,7 +1009,6 @@ impl ContractSyncRuntimeHandle {
 
         {
             let runtime = self.inner();
-            assert_eq!(runtime.authenticated_signer, action.signer());
             assert_eq!(runtime.chain_id, chain_id);
             assert_eq!(runtime.height, action.height());
         }
@@ -1169,11 +1094,8 @@ impl ContractSyncRuntimeHandle {
 
 impl ContractRuntime for ContractSyncRuntimeHandle {
     fn authenticated_signer(&mut self) -> Result<Option<AccountOwner>, ExecutionError> {
-        Ok(self.inner().authenticated_signer)
-    }
-
-    fn message_id(&mut self) -> Result<Option<MessageId>, ExecutionError> {
-        Ok(self.inner().executing_message.map(|metadata| metadata.id))
+        let this = self.inner();
+        Ok(this.current_application().signer)
     }
 
     fn message_is_bouncing(&mut self) -> Result<Option<bool>, ExecutionError> {
@@ -1181,6 +1103,13 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             .inner()
             .executing_message
             .map(|metadata| metadata.is_bouncing))
+    }
+
+    fn message_origin_chain_id(&mut self) -> Result<Option<ChainId>, ExecutionError> {
+        Ok(self
+            .inner()
+            .executing_message
+            .map(|metadata| metadata.origin))
     }
 
     fn authenticated_caller_id(&mut self) -> Result<Option<ApplicationId>, ExecutionError> {
@@ -1239,18 +1168,22 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             MessageKind::Simple
         };
 
-        this.transaction_tracker
-            .add_outgoing_message(OutgoingMessage {
-                destination: message.destination,
-                authenticated_signer,
-                refund_grant_to,
-                grant,
-                kind,
-                message: Message::User {
-                    application_id,
-                    bytes: message.message,
+        this.execution_state_sender
+            .send_request(|callback| ExecutionRequest::AddOutgoingMessage {
+                message: OutgoingMessage {
+                    destination: message.destination,
+                    authenticated_signer,
+                    refund_grant_to,
+                    grant,
+                    kind,
+                    message: Message::User {
+                        application_id,
+                        bytes: message.message,
+                    },
                 },
-            })?;
+                callback,
+            })?
+            .recv_response()?;
 
         Ok(())
     }
@@ -1261,13 +1194,12 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         destination: Account,
         amount: Amount,
     ) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
+        let this = self.inner();
         let current_application = this.current_application();
         let application_id = current_application.id;
         let signer = current_application.signer;
 
-        let maybe_message = this
-            .execution_state_sender
+        this.execution_state_sender
             .send_request(|callback| ExecutionRequest::Transfer {
                 source,
                 destination,
@@ -1277,9 +1209,6 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
                 callback,
             })?
             .recv_response()?;
-
-        this.transaction_tracker
-            .add_outgoing_messages(maybe_message)?;
         Ok(())
     }
 
@@ -1289,13 +1218,12 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         destination: Account,
         amount: Amount,
     ) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
+        let this = self.inner();
         let current_application = this.current_application();
         let application_id = current_application.id;
         let signer = current_application.signer;
 
-        let message = this
-            .execution_state_sender
+        this.execution_state_sender
             .send_request(|callback| ExecutionRequest::Claim {
                 source,
                 destination,
@@ -1305,7 +1233,6 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
                 callback,
             })?
             .recv_response()?;
-        this.transaction_tracker.add_outgoing_message(message)?;
         Ok(())
     }
 
@@ -1324,7 +1251,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             .expect("Applications should not have reentrant calls")
             .execute_operation(argument)?;
 
-        self.inner().finish_call()?;
+        self.inner().finish_call();
 
         Ok(value)
     }
@@ -1340,17 +1267,17 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             stream_name,
             application_id,
         };
+        let value_len = value.len() as u64;
         let index = this
             .execution_state_sender
-            .send_request(|callback| ExecutionRequest::NextEventIndex {
-                stream_id: stream_id.clone(),
+            .send_request(|callback| ExecutionRequest::Emit {
+                stream_id,
+                value,
                 callback,
             })?
             .recv_response()?;
         // TODO(#365): Consider separate event fee categories.
-        this.resource_controller
-            .track_bytes_written(value.len() as u64)?;
-        this.transaction_tracker.add_event(stream_id, index, value);
+        this.resource_controller.track_bytes_written(value_len)?;
         Ok(index)
     }
 
@@ -1377,16 +1304,11 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         };
         let event = this
             .execution_state_sender
-            .send_request(|callback| ExecutionRequest::ReadEvent {
-                event_id: event_id.clone(),
-                callback,
-            })?
+            .send_request(|callback| ExecutionRequest::ReadEvent { event_id, callback })?
             .recv_response()?;
         // TODO(#365): Consider separate event fee categories.
         this.resource_controller
             .track_bytes_read(event.len() as u64)?;
-        this.transaction_tracker
-            .replay_oracle_response(OracleResponse::Event(event_id, event.clone()))?;
         Ok(event)
     }
 
@@ -1396,7 +1318,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         application_id: ApplicationId,
         stream_name: StreamName,
     ) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
+        let this = self.inner();
         ensure!(
             stream_name.0.len() <= MAX_STREAM_NAME_LEN,
             ExecutionError::StreamNameTooLong
@@ -1406,22 +1328,14 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             application_id: application_id.into(),
         };
         let subscriber_app_id = this.current_application().id;
-        let next_index = this
-            .execution_state_sender
+        this.execution_state_sender
             .send_request(|callback| ExecutionRequest::SubscribeToEvents {
                 chain_id,
-                stream_id: stream_id.clone(),
+                stream_id,
                 subscriber_app_id,
                 callback,
             })?
             .recv_response()?;
-        this.transaction_tracker.add_stream_to_process(
-            subscriber_app_id,
-            chain_id,
-            stream_id,
-            0,
-            next_index,
-        );
         Ok(())
     }
 
@@ -1431,7 +1345,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         application_id: ApplicationId,
         stream_name: StreamName,
     ) -> Result<(), ExecutionError> {
-        let mut this = self.inner();
+        let this = self.inner();
         ensure!(
             stream_name.0.len() <= MAX_STREAM_NAME_LEN,
             ExecutionError::StreamNameTooLong
@@ -1444,13 +1358,11 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         this.execution_state_sender
             .send_request(|callback| ExecutionRequest::UnsubscribeFromEvents {
                 chain_id,
-                stream_id: stream_id.clone(),
+                stream_id,
                 subscriber_app_id,
                 callback,
             })?
             .recv_response()?;
-        this.transaction_tracker
-            .remove_stream_to_process(application_id, chain_id, stream_id);
         Ok(())
     }
 
@@ -1473,20 +1385,8 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         );
 
         this.resource_controller.track_service_oracle_call()?;
-        let response =
-            if let Some(response) = this.transaction_tracker.next_replayed_oracle_response()? {
-                match response {
-                    OracleResponse::Service(bytes) => bytes,
-                    _ => return Err(ExecutionError::OracleResponseMismatch),
-                }
-            } else {
-                this.run_service_oracle_query(application_id, query)?
-            };
 
-        this.transaction_tracker
-            .add_oracle_response(OracleResponse::Service(response.clone()));
-
-        Ok(response)
+        this.run_service_oracle_query(application_id, query)
     }
 
     fn open_chain(
@@ -1498,10 +1398,9 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         let parent_id = self.inner().chain_id;
         let block_height = self.block_height()?;
 
-        let txn_tracker_moved = mem::take(&mut self.inner().transaction_tracker);
         let timestamp = self.inner().user_context;
 
-        let (chain_id, txn_tracker_moved) = self
+        let chain_id = self
             .inner()
             .execution_state_sender
             .send_request(|callback| ExecutionRequest::OpenChain {
@@ -1512,11 +1411,8 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
                 timestamp,
                 application_permissions,
                 callback,
-                txn_tracker: txn_tracker_moved,
             })?
             .recv_response()?;
-
-        self.inner().transaction_tracker = txn_tracker_moved;
 
         Ok(chain_id)
     }
@@ -1557,12 +1453,7 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
         let chain_id = self.inner().chain_id;
         let block_height = self.block_height()?;
 
-        let txn_tracker_moved = mem::take(&mut self.inner().transaction_tracker);
-
-        let CreateApplicationResult {
-            app_id,
-            txn_tracker: txn_tracker_moved,
-        } = self
+        let CreateApplicationResult { app_id } = self
             .inner()
             .execution_state_sender
             .send_request(move |callback| ExecutionRequest::CreateApplication {
@@ -1572,11 +1463,8 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
                 parameters,
                 required_application_ids,
                 callback,
-                txn_tracker: txn_tracker_moved,
             })?
-            .recv_response()??;
-
-        self.inner().transaction_tracker = txn_tracker_moved;
+            .recv_response()?;
 
         let contract = self.inner().prepare_for_call(self.clone(), true, app_id)?;
 
@@ -1585,25 +1473,44 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
             .expect("Applications should not have reentrant calls")
             .instantiate(argument)?;
 
-        self.inner().finish_call()?;
+        self.inner().finish_call();
 
         Ok(app_id)
     }
 
+    fn create_data_blob(&mut self, bytes: Vec<u8>) -> Result<DataBlobHash, ExecutionError> {
+        let blob = Blob::new_data(bytes);
+        let blob_id = blob.id();
+        let this = self.inner();
+        this.execution_state_sender
+            .send_request(|callback| ExecutionRequest::AddCreatedBlob { blob, callback })?
+            .recv_response()?;
+        Ok(DataBlobHash(blob_id.hash))
+    }
+
+    fn publish_module(
+        &mut self,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> Result<ModuleId, ExecutionError> {
+        let (blobs, module_id) =
+            crate::runtime::create_bytecode_blobs_sync(contract, service, vm_runtime);
+        let this = self.inner();
+        for blob in blobs {
+            this.execution_state_sender
+                .send_request(|callback| ExecutionRequest::AddCreatedBlob { blob, callback })?
+                .recv_response()?;
+        }
+        Ok(module_id)
+    }
+
     fn validation_round(&mut self) -> Result<Option<u32>, ExecutionError> {
-        let mut this = self.inner();
-        let round =
-            if let Some(response) = this.transaction_tracker.next_replayed_oracle_response()? {
-                match response {
-                    OracleResponse::Round(round) => round,
-                    _ => return Err(ExecutionError::OracleResponseMismatch),
-                }
-            } else {
-                this.round
-            };
-        this.transaction_tracker
-            .add_oracle_response(OracleResponse::Round(round));
-        Ok(round)
+        let this = self.inner();
+        let round = this.round;
+        this.execution_state_sender
+            .send_request(|callback| ExecutionRequest::ValidationRound { round, callback })?
+            .recv_response()
     }
 
     fn write_batch(&mut self, batch: Batch) -> Result<(), ExecutionError> {
@@ -1633,17 +1540,14 @@ impl ContractRuntime for ContractSyncRuntimeHandle {
 impl ServiceSyncRuntime {
     /// Creates a new [`ServiceSyncRuntime`] ready to execute using a provided [`QueryContext`].
     pub fn new(execution_state_sender: ExecutionStateSender, context: QueryContext) -> Self {
-        let mut txn_tracker = TransactionTracker::default();
-        txn_tracker.set_local_time(context.local_time);
-        Self::new_with_txn_tracker(execution_state_sender, context, None, txn_tracker)
+        Self::new_with_deadline(execution_state_sender, context, None)
     }
 
     /// Creates a new [`ServiceSyncRuntime`] ready to execute using a provided [`QueryContext`].
-    pub fn new_with_txn_tracker(
+    pub fn new_with_deadline(
         execution_state_sender: ExecutionStateSender,
         context: QueryContext,
         deadline: Option<Instant>,
-        txn_tracker: TransactionTracker,
     ) -> Self {
         let runtime = SyncRuntime(Some(
             SyncRuntimeInternal::new(
@@ -1651,12 +1555,10 @@ impl ServiceSyncRuntime {
                 context.next_block_height,
                 None,
                 None,
-                None,
                 execution_state_sender,
                 deadline,
                 None,
                 ResourceController::default(),
-                txn_tracker,
                 (),
             )
             .into(),
@@ -1704,14 +1606,21 @@ impl ServiceSyncRuntime {
                 callback,
             } = request;
 
-            self.prepare_for_query(context);
+            let result = self
+                .prepare_for_query(context)
+                .and_then(|()| self.run_query(application_id, query));
 
-            let _ = callback.send(self.run_query(application_id, query));
+            if let Err(err) = callback.send(result) {
+                tracing::debug!(%err, "Receiver for query result has been dropped");
+            }
         }
     }
 
     /// Prepares the runtime to query an application.
-    pub(crate) fn prepare_for_query(&mut self, new_context: QueryContext) {
+    pub(crate) fn prepare_for_query(
+        &mut self,
+        new_context: QueryContext,
+    ) -> Result<(), ExecutionError> {
         let expected_context = QueryContext {
             local_time: new_context.local_time,
             ..self.current_context
@@ -1723,9 +1632,14 @@ impl ServiceSyncRuntime {
         } else {
             self.handle_mut()
                 .inner()
-                .transaction_tracker
-                .set_local_time(new_context.local_time);
+                .execution_state_sender
+                .send_request(|callback| ExecutionRequest::SetLocalTime {
+                    local_time: new_context.local_time,
+                    callback,
+                })?
+                .recv_response()?;
         }
+        Ok(())
     }
 
     /// Queries an application specified by its [`ApplicationId`].
@@ -1816,15 +1730,44 @@ pub enum ServiceRuntimeRequest {
 /// The origin of the execution.
 #[derive(Clone, Copy, Debug)]
 struct ExecutingMessage {
-    id: MessageId,
     is_bouncing: bool,
+    origin: ChainId,
 }
 
 impl From<&MessageContext> for ExecutingMessage {
     fn from(context: &MessageContext) -> Self {
         ExecutingMessage {
-            id: context.message_id,
             is_bouncing: context.is_bouncing,
+            origin: context.origin,
+        }
+    }
+}
+
+/// Creates a compressed contract and service bytecode synchronously.
+pub fn create_bytecode_blobs_sync(
+    contract: Bytecode,
+    service: Bytecode,
+    vm_runtime: VmRuntime,
+) -> (Vec<Blob>, ModuleId) {
+    match vm_runtime {
+        VmRuntime::Wasm => {
+            let compressed_contract = contract.compress();
+            let compressed_service = service.compress();
+            let contract_blob = Blob::new_contract_bytecode(compressed_contract);
+            let service_blob = Blob::new_service_bytecode(compressed_service);
+            let module_id =
+                ModuleId::new(contract_blob.id().hash, service_blob.id().hash, vm_runtime);
+            (vec![contract_blob, service_blob], module_id)
+        }
+        VmRuntime::Evm => {
+            let compressed_contract = contract.compress();
+            let evm_contract_blob = Blob::new_evm_bytecode(compressed_contract);
+            let module_id = ModuleId::new(
+                evm_contract_blob.id().hash,
+                evm_contract_blob.id().hash,
+                vm_runtime,
+            );
+            (vec![evm_contract_blob], module_id)
         }
     }
 }

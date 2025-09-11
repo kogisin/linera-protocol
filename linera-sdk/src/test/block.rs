@@ -8,20 +8,18 @@
 use linera_base::{
     abi::ContractAbi,
     data_types::{Amount, ApplicationPermissions, Blob, Epoch, Round, Timestamp},
-    identifiers::{AccountOwner, ApplicationId, ChainId},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId},
     ownership::TimeoutConfig,
 };
 use linera_chain::{
     data_types::{
         IncomingBundle, LiteValue, LiteVote, MessageAction, ProposedBlock, SignatureAggregator,
+        Transaction,
     },
     types::{ConfirmedBlock, ConfirmedBlockCertificate},
 };
 use linera_core::worker::WorkerError;
-use linera_execution::{
-    system::{Recipient, SystemOperation},
-    Operation,
-};
+use linera_execution::{system::SystemOperation, Operation};
 
 use super::TestValidator;
 
@@ -66,8 +64,7 @@ impl BlockBuilder {
             block: ProposedBlock {
                 epoch,
                 chain_id,
-                incoming_bundles: vec![],
-                operations: vec![],
+                transactions: vec![],
                 previous_block_hash,
                 height,
                 authenticated_signer: Some(owner),
@@ -87,7 +84,7 @@ impl BlockBuilder {
     pub fn with_native_token_transfer(
         &mut self,
         sender: AccountOwner,
-        recipient: Recipient,
+        recipient: Account,
         amount: Amount,
     ) -> &mut Self {
         self.with_system_operation(SystemOperation::Transfer {
@@ -99,7 +96,9 @@ impl BlockBuilder {
 
     /// Adds a [`SystemOperation`] to this block.
     pub(crate) fn with_system_operation(&mut self, operation: SystemOperation) -> &mut Self {
-        self.block.operations.push(operation.into());
+        self.block
+            .transactions
+            .push(Transaction::ExecuteOperation(operation.into()));
         self
     }
 
@@ -152,10 +151,12 @@ impl BlockBuilder {
         application_id: ApplicationId,
         operation: impl Into<Vec<u8>>,
     ) -> &mut Self {
-        self.block.operations.push(Operation::User {
-            application_id,
-            bytes: operation.into(),
-        });
+        self.block
+            .transactions
+            .push(Transaction::ExecuteOperation(Operation::User {
+                application_id,
+                bytes: operation.into(),
+            }));
         self
     }
 
@@ -167,7 +168,9 @@ impl BlockBuilder {
         &mut self,
         bundles: impl IntoIterator<Item = IncomingBundle>,
     ) -> &mut Self {
-        self.block.incoming_bundles.extend(bundles);
+        self.block
+            .transactions
+            .extend(bundles.into_iter().map(Transaction::ReceiveMessages));
         self
     }
 
@@ -225,9 +228,10 @@ impl BlockBuilder {
             self.validator.key_pair(),
         );
         let committee = self.validator.committee().await;
+        let public_key = self.validator.key_pair().public();
         let mut builder = SignatureAggregator::new(value, Round::Fast, &committee);
         let certificate = builder
-            .append(vote.public_key, vote.signature)
+            .append(public_key, vote.signature)
             .expect("Failed to sign block")
             .expect("Committee has more than one test validator");
 

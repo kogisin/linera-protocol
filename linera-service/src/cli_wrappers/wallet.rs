@@ -8,6 +8,7 @@ use std::{
     marker::PhantomData,
     mem,
     path::{Path, PathBuf},
+    process::Stdio,
     str::FromStr,
     sync,
     time::Duration,
@@ -33,23 +34,19 @@ use linera_core::worker::Notification;
 use linera_execution::committee::Committee;
 use linera_faucet_client::Faucet;
 use serde::{de::DeserializeOwned, ser::Serialize};
+use serde_command_opts::to_args;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::process::{Child, Command};
-use tracing::{error, info, warn};
-#[cfg(feature = "benchmark")]
-use {
-    crate::cli::command::BenchmarkCommand,
-    serde_command_opts::to_args,
-    std::process::Stdio,
-    tokio::{
-        io::{AsyncBufReadExt, BufReader},
-        sync::oneshot,
-        task::JoinHandle,
-    },
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::{Child, Command},
+    sync::oneshot,
+    task::JoinHandle,
 };
+use tracing::{error, info, warn};
 
 use crate::{
+    cli::command::BenchmarkCommand,
     cli_wrappers::{
         local_net::{PathProvider, ProcessInbox},
         Network,
@@ -214,7 +211,6 @@ impl ClientWrapper {
             .await
     }
 
-    #[cfg(feature = "benchmark")]
     async fn command_with_arguments(
         &self,
         arguments: impl IntoIterator<Item = Cow<'_, str>>,
@@ -676,9 +672,13 @@ impl ClientWrapper {
         Ok(())
     }
 
-    #[cfg(feature = "benchmark")]
     fn benchmark_command_internal(command: &mut Command, args: BenchmarkCommand) -> Result<()> {
-        let formatted_args = to_args(&args)?
+        let mut formatted_args = to_args(&args)?;
+        let subcommand = formatted_args.remove(0);
+        // The subcommand is followed by the flattened options, which are preceded by "options".
+        // So remove that as well.
+        formatted_args.remove(0);
+        let options = formatted_args
             .chunks_exact(2)
             .flat_map(|pair| {
                 let option = format!("--{}", pair[0]);
@@ -690,17 +690,16 @@ impl ClientWrapper {
             })
             .collect::<Vec<_>>();
         command
-            // For benchmarks, we need to enforce a large enough max pending message bundles.
             .args([
                 "--max-pending-message-bundles",
-                &args.transactions_per_block.to_string(),
+                &args.transactions_per_block().to_string(),
             ])
             .arg("benchmark")
-            .args(formatted_args);
+            .arg(subcommand)
+            .args(options);
         Ok(())
     }
 
-    #[cfg(feature = "benchmark")]
     async fn benchmark_command_with_envs(
         &self,
         args: BenchmarkCommand,
@@ -713,7 +712,6 @@ impl ClientWrapper {
         Ok(command)
     }
 
-    #[cfg(feature = "benchmark")]
     async fn benchmark_command(&self, args: BenchmarkCommand) -> Result<Command> {
         let mut command = self
             .command_with_arguments(self.required_command_arguments())
@@ -723,7 +721,6 @@ impl ClientWrapper {
     }
 
     /// Runs `linera benchmark`.
-    #[cfg(feature = "benchmark")]
     pub async fn benchmark(&self, args: BenchmarkCommand) -> Result<()> {
         let mut command = self.benchmark_command(args).await?;
         command.spawn_and_wait_for_stdout().await?;
@@ -732,7 +729,6 @@ impl ClientWrapper {
 
     /// Runs `linera benchmark`, but detached: don't wait for the command to finish, just spawn it
     /// and return the child process, and the handles to the stdout and stderr.
-    #[cfg(feature = "benchmark")]
     pub async fn benchmark_detached(
         &self,
         args: BenchmarkCommand,
@@ -774,12 +770,12 @@ impl ClientWrapper {
         Ok((child, stdout_handle, stderr_handle))
     }
 
-    /// Runs `linera open-chain`.
-    pub async fn open_chain(
+    async fn open_chain_internal(
         &self,
         from: ChainId,
         owner: Option<AccountOwner>,
         initial_balance: Amount,
+        super_owner: bool,
     ) -> Result<(ChainId, AccountOwner)> {
         let mut command = self.command().await?;
         command
@@ -791,6 +787,10 @@ impl ClientWrapper {
             command.args(["--owner", &owner.to_string()]);
         }
 
+        if super_owner {
+            command.arg("--super-owner");
+        }
+
         let stdout = command.spawn_and_wait_for_stdout().await?;
         let mut split = stdout.split('\n');
         let chain_id = ChainId::from_str(split.next().context("no chain ID in output")?)?;
@@ -799,6 +799,28 @@ impl ClientWrapper {
             assert_eq!(owner, new_owner);
         }
         Ok((chain_id, new_owner))
+    }
+
+    /// Runs `linera open-chain --super-owner`.
+    pub async fn open_chain_super_owner(
+        &self,
+        from: ChainId,
+        owner: Option<AccountOwner>,
+        initial_balance: Amount,
+    ) -> Result<(ChainId, AccountOwner)> {
+        self.open_chain_internal(from, owner, initial_balance, true)
+            .await
+    }
+
+    /// Runs `linera open-chain`.
+    pub async fn open_chain(
+        &self,
+        from: ChainId,
+        owner: Option<AccountOwner>,
+        initial_balance: Amount,
+    ) -> Result<(ChainId, AccountOwner)> {
+        self.open_chain_internal(from, owner, initial_balance, false)
+            .await
     }
 
     /// Runs `linera open-chain` then `linera assign`.
@@ -969,7 +991,7 @@ impl ClientWrapper {
         wallet.get(chain_id)?.owner
     }
 
-    pub async fn is_chain_present_in_wallet(&self, chain: ChainId) -> bool {
+    pub fn is_chain_present_in_wallet(&self, chain: ChainId) -> bool {
         self.load_wallet()
             .ok()
             .is_some_and(|wallet| wallet.get(chain).is_some())
@@ -1228,6 +1250,28 @@ impl NodeService {
         Ok(serde_json::from_value(data["processInbox"].take())?)
     }
 
+    pub async fn transfer(
+        &self,
+        chain_id: ChainId,
+        owner: AccountOwner,
+        recipient: Account,
+        amount: Amount,
+    ) -> Result<CryptoHash> {
+        let json_owner = owner.to_value();
+        let json_recipient = recipient.to_value();
+        let query = format!(
+            "mutation {{ transfer(\
+                 chainId: \"{chain_id}\", \
+                 owner: {json_owner}, \
+                 recipient: {json_recipient}, \
+                 amount: \"{amount}\") \
+             }}"
+        );
+        let data = self.query_node(query).await?;
+        serde_json::from_value(data["transfer"].clone())
+            .context("missing transfer field in response")
+    }
+
     pub async fn balance(&self, account: &Account) -> Result<Amount> {
         let chain = account.chain_id;
         let owner = account.owner;
@@ -1259,7 +1303,7 @@ impl NodeService {
         }
     }
 
-    pub async fn make_application<A: ContractAbi>(
+    pub fn make_application<A: ContractAbi>(
         &self,
         chain_id: &ChainId,
         application_id: &ApplicationId<A>,
@@ -1294,8 +1338,8 @@ impl NodeService {
         service: PathBuf,
         vm_runtime: VmRuntime,
     ) -> Result<ModuleId<Abi, Parameters, InstantiationArgument>> {
-        let contract_code = Bytecode::load_from_file(&contract).await?;
-        let service_code = Bytecode::load_from_file(&service).await?;
+        let contract_code = Bytecode::load_from_file(&contract)?;
+        let service_code = Bytecode::load_from_file(&service)?;
         let query = format!(
             "mutation {{ publishModule(chainId: {}, contract: {}, service: {}, vmRuntime: {}) }}",
             chain_id.to_value(),
@@ -1365,7 +1409,7 @@ impl NodeService {
                     truncate_query_output(query)
                 )
             })?;
-            anyhow::ensure!(
+            ensure!(
                 response.status().is_success(),
                 "Query \"{}\" failed: {}",
                 truncate_query_output(query),
@@ -1565,7 +1609,7 @@ impl<A> ApplicationWrapper<A> {
                         .with_context(|| format!("run_json_query: failed to post query={query}"));
                 }
             };
-            anyhow::ensure!(
+            ensure!(
                 response.status().is_success(),
                 "Query \"{}\" failed: {}",
                 truncate_query_output_serialize(&query),
@@ -1607,6 +1651,15 @@ impl<A> ApplicationWrapper<A> {
         let mutation = mutation.as_ref();
         self.run_graphql_query(&format!("mutation {{ {mutation} }}"))
             .await
+    }
+
+    pub async fn multiple_mutate(&self, mutations: &[String]) -> Result<Value> {
+        let mut out = String::from("mutation {\n");
+        for (index, mutation) in mutations.iter().enumerate() {
+            out = format!("{}  u{}: {}\n", out, index, mutation);
+        }
+        out.push_str("}\n");
+        self.run_graphql_query(&out).await
     }
 }
 

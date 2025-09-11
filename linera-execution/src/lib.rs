@@ -4,12 +4,10 @@
 //! This module manages the execution of the system application and the user applications in a
 //! Linera chain.
 
-#![deny(clippy::large_futures)]
-
 pub mod committee;
 pub mod evm;
 mod execution;
-mod execution_state_actor;
+pub mod execution_state_actor;
 #[cfg(with_graphql)]
 mod graphql;
 mod policy;
@@ -27,7 +25,6 @@ use std::{any::Any, collections::BTreeMap, fmt, ops::RangeInclusive, str::FromSt
 use async_graphql::SimpleObject;
 use async_trait::async_trait;
 use custom_debug_derive::Debug;
-use dashmap::DashMap;
 use derive_more::Display;
 #[cfg(web)]
 use js_sys::wasm_bindgen::JsValue;
@@ -36,12 +33,13 @@ use linera_base::{
     crypto::{BcsHashable, CryptoHash},
     data_types::{
         Amount, ApplicationDescription, ApplicationPermissions, ArithmeticError, Blob, BlockHeight,
-        DecompressionError, Epoch, NetworkDescription, SendMessageRequest, StreamUpdate, Timestamp,
+        Bytecode, DecompressionError, Epoch, NetworkDescription, SendMessageRequest, StreamUpdate,
+        Timestamp,
     },
     doc_scalar, hex_debug, http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, EventId,
-        GenericApplicationId, MessageId, ModuleId, StreamName,
+        Account, AccountOwner, ApplicationId, BlobId, BlobType, ChainId, DataBlobHash, EventId,
+        GenericApplicationId, ModuleId, StreamName,
     },
     ownership::ChainOwnership,
     task,
@@ -54,7 +52,6 @@ use thiserror::Error;
 
 #[cfg(with_revm)]
 use crate::evm::EvmExecutionError;
-use crate::runtime::ContractSyncRuntime;
 #[cfg(with_testing)]
 use crate::test_utils::dummy_chain_description;
 #[cfg(all(with_testing, with_wasm_runtime))]
@@ -67,7 +64,7 @@ pub use crate::wasm::{
 pub use crate::{
     committee::Committee,
     execution::{ExecutionStateView, ServiceRuntimeEndpoint},
-    execution_state_actor::ExecutionRequest,
+    execution_state_actor::{ExecutionRequest, ExecutionStateActor},
     policy::ResourceControlPolicy,
     resources::{BalanceHolder, ResourceController, ResourceTracker},
     runtime::{
@@ -220,8 +217,6 @@ pub enum ExecutionError {
         caller_id: Box<ApplicationId>,
         callee_id: Box<ApplicationId>,
     },
-    #[error("Attempt to write to storage from a contract")]
-    ServiceWriteAttempt,
     #[error("Failed to load bytecode from storage {0:?}")]
     ApplicationBytecodeNotFound(Box<ApplicationDescription>),
     // TODO(#2927): support dynamic loading of modules on the Web
@@ -244,8 +239,6 @@ pub enum ExecutionError {
     HttpResponseSizeLimitExceeded { limit: u64, size: u64 },
     #[error("Runtime failed to respond to application")]
     MissingRuntimeResponse,
-    #[error("Module ID {0:?} is invalid")]
-    InvalidModuleId(ModuleId),
     #[error("Application is not authorized to perform system operations on this chain: {0:}")]
     UnauthorizedApplication(ApplicationId),
     #[error("Failed to make network reqwest: {0}")]
@@ -260,6 +253,8 @@ pub enum ExecutionError {
     BcsError(#[from] bcs::Error),
     #[error("Recorded response for oracle query has the wrong type")]
     OracleResponseMismatch,
+    #[error("Service oracle query tried to create operations: {0:?}")]
+    ServiceOracleQueryOperations(Vec<Operation>),
     #[error("Assertion failed: local time {local_time} is not earlier than {timestamp}")]
     AssertBefore {
         timestamp: Timestamp,
@@ -294,8 +289,6 @@ pub enum ExecutionError {
 
     #[error("No NetworkDescription found in storage")]
     NoNetworkDescriptionFound,
-    #[error("Invalid committees")]
-    InvalidCommittees,
     #[error("{epoch:?} is not recognized by chain {chain_id:}")]
     InvalidEpoch { chain_id: ChainId, epoch: Epoch },
     #[error("Transfer must have positive amount")]
@@ -319,24 +312,12 @@ pub enum ExecutionError {
     InvalidCommitteeEpoch { expected: Epoch, provided: Epoch },
     #[error("Failed to remove committee")]
     InvalidCommitteeRemoval,
-    #[error("Amount overflow")]
-    AmountOverflow,
-    #[error("Amount underflow")]
-    AmountUnderflow,
-    #[error("Chain balance overflow")]
-    BalanceOverflow,
-    #[error("Chain balance underflow")]
-    BalanceUnderflow,
-    #[error("Application {0:?} is not registered by the chain")]
-    UnknownApplicationId(Box<ApplicationId>),
     #[error("No recorded response for oracle query")]
     MissingOracleResponse,
     #[error("process_streams was not called for all stream updates")]
     UnprocessedStreams,
     #[error("Internal error: {0}")]
     InternalError(&'static str),
-    #[error("UpdateStreams contains an unknown event")]
-    EventNotFound(EventId),
     #[error("UpdateStreams is outdated")]
     OutdatedUpdateStreams,
 }
@@ -378,18 +359,20 @@ pub trait ExecutionRuntimeContext {
 
     fn execution_runtime_config(&self) -> ExecutionRuntimeConfig;
 
-    fn user_contracts(&self) -> &Arc<DashMap<ApplicationId, UserContractCode>>;
+    fn user_contracts(&self) -> &Arc<papaya::HashMap<ApplicationId, UserContractCode>>;
 
-    fn user_services(&self) -> &Arc<DashMap<ApplicationId, UserServiceCode>>;
+    fn user_services(&self) -> &Arc<papaya::HashMap<ApplicationId, UserServiceCode>>;
 
     async fn get_user_contract(
         &self,
         description: &ApplicationDescription,
+        txn_tracker: &TransactionTracker,
     ) -> Result<UserContractCode, ExecutionError>;
 
     async fn get_user_service(
         &self,
         description: &ApplicationDescription,
+        txn_tracker: &TransactionTracker,
     ) -> Result<UserServiceCode, ExecutionError>;
 
     async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, ViewError>;
@@ -427,10 +410,6 @@ pub struct OperationContext {
     /// The authenticated signer of the operation, if any.
     #[debug(skip_if = Option::is_none)]
     pub authenticated_signer: Option<AccountOwner>,
-    /// `None` if this is the transaction entrypoint or the caller doesn't want this particular
-    /// call to be authenticated (e.g. for safety reasons).
-    #[debug(skip_if = Option::is_none)]
-    pub authenticated_caller_id: Option<ApplicationId>,
     /// The current block height.
     pub height: BlockHeight,
     /// The consensus round number, if this is a block that gets validated in a multi-leader round.
@@ -443,6 +422,8 @@ pub struct OperationContext {
 pub struct MessageContext {
     /// The current chain ID.
     pub chain_id: ChainId,
+    /// The chain ID where the message originated from.
+    pub origin: ChainId,
     /// Whether the message was rejected by the original receiver and is now bouncing back.
     pub is_bouncing: bool,
     /// The authenticated signer of the operation that created the message, if any.
@@ -457,9 +438,6 @@ pub struct MessageContext {
     pub round: Option<u32>,
     /// The timestamp of the block executing the message.
     pub timestamp: Timestamp,
-    /// The ID of the message (based on the operation height and index in the remote
-    /// certificate).
-    pub message_id: MessageId,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -684,10 +662,10 @@ pub trait BaseRuntime {
     fn assert_before(&mut self, timestamp: Timestamp) -> Result<(), ExecutionError>;
 
     /// Reads a data blob specified by a given hash.
-    fn read_data_blob(&mut self, hash: &CryptoHash) -> Result<Vec<u8>, ExecutionError>;
+    fn read_data_blob(&mut self, hash: DataBlobHash) -> Result<Vec<u8>, ExecutionError>;
 
     /// Asserts the existence of a data blob with the given hash.
-    fn assert_data_blob_exists(&mut self, hash: &CryptoHash) -> Result<(), ExecutionError>;
+    fn assert_data_blob_exists(&mut self, hash: DataBlobHash) -> Result<(), ExecutionError>;
 }
 
 pub trait ServiceRuntime: BaseRuntime {
@@ -709,12 +687,12 @@ pub trait ContractRuntime: BaseRuntime {
     /// The authenticated signer for this execution, if there is one.
     fn authenticated_signer(&mut self) -> Result<Option<AccountOwner>, ExecutionError>;
 
-    /// The current message ID, if there is one.
-    fn message_id(&mut self) -> Result<Option<MessageId>, ExecutionError>;
-
     /// If the current message (if there is one) was rejected by its destination and is now
     /// bouncing back.
     fn message_is_bouncing(&mut self) -> Result<Option<bool>, ExecutionError>;
+
+    /// The chain ID where the current message originated from, if there is one.
+    fn message_origin_chain_id(&mut self) -> Result<Option<ChainId>, ExecutionError>;
 
     /// The optional authenticated caller application ID, if it was provided and if there is one
     /// based on the execution context.
@@ -818,6 +796,17 @@ pub trait ContractRuntime: BaseRuntime {
         argument: Vec<u8>,
         required_application_ids: Vec<ApplicationId>,
     ) -> Result<ApplicationId, ExecutionError>;
+
+    /// Creates a new data blob and returns its hash.
+    fn create_data_blob(&mut self, bytes: Vec<u8>) -> Result<DataBlobHash, ExecutionError>;
+
+    /// Publishes a module with contract and service bytecode and returns the module ID.
+    fn publish_module(
+        &mut self,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> Result<ModuleId, ExecutionError>;
 
     /// Returns the round in which this block was validated.
     fn validation_round(&mut self) -> Result<Option<u32>, ExecutionError>;
@@ -933,6 +922,17 @@ pub enum MessageKind {
     Bouncing,
 }
 
+impl Display for MessageKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MessageKind::Simple => write!(f, "Simple"),
+            MessageKind::Protected => write!(f, "Protected"),
+            MessageKind::Tracked => write!(f, "Tracked"),
+            MessageKind::Bouncing => write!(f, "Bouncing"),
+        }
+    }
+}
+
 /// A posted message together with routing information.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
 pub struct OutgoingMessage {
@@ -997,10 +997,10 @@ impl OperationContext {
 pub struct TestExecutionRuntimeContext {
     chain_id: ChainId,
     execution_runtime_config: ExecutionRuntimeConfig,
-    user_contracts: Arc<DashMap<ApplicationId, UserContractCode>>,
-    user_services: Arc<DashMap<ApplicationId, UserServiceCode>>,
-    blobs: Arc<DashMap<BlobId, Blob>>,
-    events: Arc<DashMap<EventId, Vec<u8>>>,
+    user_contracts: Arc<papaya::HashMap<ApplicationId, UserContractCode>>,
+    user_services: Arc<papaya::HashMap<ApplicationId, UserServiceCode>>,
+    blobs: Arc<papaya::HashMap<BlobId, Blob>>,
+    events: Arc<papaya::HashMap<EventId, Vec<u8>>>,
 }
 
 #[cfg(with_testing)]
@@ -1029,21 +1029,22 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
         self.execution_runtime_config
     }
 
-    fn user_contracts(&self) -> &Arc<DashMap<ApplicationId, UserContractCode>> {
+    fn user_contracts(&self) -> &Arc<papaya::HashMap<ApplicationId, UserContractCode>> {
         &self.user_contracts
     }
 
-    fn user_services(&self) -> &Arc<DashMap<ApplicationId, UserServiceCode>> {
+    fn user_services(&self) -> &Arc<papaya::HashMap<ApplicationId, UserServiceCode>> {
         &self.user_services
     }
 
     async fn get_user_contract(
         &self,
         description: &ApplicationDescription,
+        _txn_tracker: &TransactionTracker,
     ) -> Result<UserContractCode, ExecutionError> {
-        let application_id = description.into();
-        Ok(self
-            .user_contracts()
+        let application_id: ApplicationId = description.into();
+        let pinned = self.user_contracts().pin();
+        Ok(pinned
             .get(&application_id)
             .ok_or_else(|| {
                 ExecutionError::ApplicationBytecodeNotFound(Box::new(description.clone()))
@@ -1054,10 +1055,11 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
     async fn get_user_service(
         &self,
         description: &ApplicationDescription,
+        _txn_tracker: &TransactionTracker,
     ) -> Result<UserServiceCode, ExecutionError> {
-        let application_id = description.into();
-        Ok(self
-            .user_services()
+        let application_id: ApplicationId = description.into();
+        let pinned = self.user_services().pin();
+        Ok(pinned
             .get(&application_id)
             .ok_or_else(|| {
                 ExecutionError::ApplicationBytecodeNotFound(Box::new(description.clone()))
@@ -1066,17 +1068,11 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
     }
 
     async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, ViewError> {
-        match self.blobs.get(&blob_id) {
-            None => Ok(None),
-            Some(blob) => Ok(Some(blob.clone())),
-        }
+        Ok(self.blobs.pin().get(&blob_id).cloned())
     }
 
     async fn get_event(&self, event_id: EventId) -> Result<Option<Vec<u8>>, ViewError> {
-        match self.events.get(&event_id) {
-            None => Ok(None),
-            Some(event) => Ok(Some(event.clone())),
-        }
+        Ok(self.events.pin().get(&event_id).cloned())
     }
 
     async fn get_network_description(&self) -> Result<Option<NetworkDescription>, ViewError> {
@@ -1093,12 +1089,11 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
         &self,
         epoch_range: RangeInclusive<Epoch>,
     ) -> Result<BTreeMap<Epoch, Committee>, ViewError> {
-        let committee_blob_bytes = self
-            .blobs
-            .iter()
-            .find(|item| item.key().blob_type == BlobType::Committee)
+        let pinned = self.blobs.pin();
+        let committee_blob_bytes = pinned
+            .values()
+            .find(|blob| blob.content().blob_type() == BlobType::Committee)
             .ok_or_else(|| ViewError::NotFound("committee not found".to_owned()))?
-            .value()
             .bytes()
             .to_vec();
         let committee: Committee = bcs::from_bytes(&committee_blob_bytes)?;
@@ -1111,11 +1106,11 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
     }
 
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError> {
-        Ok(self.blobs.contains_key(&blob_id))
+        Ok(self.blobs.pin().contains_key(&blob_id))
     }
 
     async fn contains_event(&self, event_id: EventId) -> Result<bool, ViewError> {
-        Ok(self.events.contains_key(&event_id))
+        Ok(self.events.pin().contains_key(&event_id))
     }
 
     #[cfg(with_testing)]
@@ -1123,8 +1118,9 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
         &self,
         blobs: impl IntoIterator<Item = Blob> + Send,
     ) -> Result<(), ViewError> {
+        let pinned = self.blobs.pin();
         for blob in blobs {
-            self.blobs.insert(blob.id(), blob);
+            pinned.insert(blob.id(), blob);
         }
 
         Ok(())
@@ -1135,8 +1131,9 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
         &self,
         events: impl IntoIterator<Item = (EventId, Vec<u8>)> + Send,
     ) -> Result<(), ViewError> {
+        let pinned = self.events.pin();
         for (event_id, bytes) in events {
-            self.events.insert(event_id, bytes);
+            pinned.insert(event_id, bytes);
         }
 
         Ok(())

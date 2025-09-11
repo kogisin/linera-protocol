@@ -6,9 +6,11 @@
 use linera_base::{
     crypto::CryptoHash,
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, TimeDelta,
+        Amount, ApplicationPermissions, Bytecode, Resources, SendMessageRequest, TimeDelta,
     },
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId, StreamName},
+    identifiers::{
+        Account, AccountOwner, ApplicationId, ChainId, DataBlobHash, ModuleId, StreamName,
+    },
     ownership::{ChainOwnership, TimeoutConfig},
     vm::VmRuntime,
 };
@@ -25,6 +27,14 @@ impl From<CryptoHash> for wit_contract_api::CryptoHash {
             part2: parts[1],
             part3: parts[2],
             part4: parts[3],
+        }
+    }
+}
+
+impl From<DataBlobHash> for wit_contract_api::DataBlobHash {
+    fn from(hash_value: DataBlobHash) -> Self {
+        wit_contract_api::DataBlobHash {
+            inner0: hash_value.0.into(),
         }
     }
 }
@@ -84,14 +94,6 @@ impl From<ChainId> for wit_contract_api::ChainId {
     }
 }
 
-impl From<BlockHeight> for wit_contract_api::BlockHeight {
-    fn from(block_height: BlockHeight) -> Self {
-        wit_contract_api::BlockHeight {
-            inner0: block_height.0,
-        }
-    }
-}
-
 impl From<ModuleId> for wit_contract_api::ModuleId {
     fn from(module_id: ModuleId) -> Self {
         wit_contract_api::ModuleId {
@@ -107,16 +109,6 @@ impl From<VmRuntime> for wit_contract_api::VmRuntime {
         match vm_runtime {
             VmRuntime::Wasm => wit_contract_api::VmRuntime::Wasm,
             VmRuntime::Evm => wit_contract_api::VmRuntime::Evm,
-        }
-    }
-}
-
-impl From<MessageId> for wit_contract_api::MessageId {
-    fn from(message_id: MessageId) -> Self {
-        wit_contract_api::MessageId {
-            chain_id: message_id.chain_id.into(),
-            height: message_id.height.into(),
-            index: message_id.index,
         }
     }
 }
@@ -256,6 +248,14 @@ impl From<WriteOperation> for wit_contract_api::WriteOperation {
             WriteOperation::Put { key, value } => {
                 wit_contract_api::WriteOperation::Put((key, value))
             }
+        }
+    }
+}
+
+impl From<Bytecode> for wit_contract_api::Bytecode {
+    fn from(bytecode: Bytecode) -> Self {
+        wit_contract_api::Bytecode {
+            bytes: bytecode.bytes,
         }
     }
 }

@@ -2,8 +2,6 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(clippy::large_futures)]
-
 use std::{
     borrow::Cow,
     num::NonZeroU16,
@@ -21,6 +19,8 @@ use linera_base::{
 use linera_client::config::{CommitteeConfig, ValidatorConfig, ValidatorServerConfig};
 use linera_core::{worker::WorkerState, JoinSetExt as _};
 use linera_execution::{WasmRuntime, WithWasmDefault};
+#[cfg(with_metrics)]
+use linera_metrics::prometheus_server;
 use linera_persistent::{self as persistent, Persist};
 use linera_rpc::{
     config::{
@@ -31,8 +31,6 @@ use linera_rpc::{
     grpc, simple,
 };
 use linera_sdk::linera_base_types::{AccountSecretKey, ValidatorKeypair};
-#[cfg(with_metrics)]
-use linera_service::prometheus_server;
 use linera_service::{
     storage::{CommonStorageOptions, Runnable, StorageConfig},
     util,
@@ -49,6 +47,7 @@ struct ServerContext {
     notification_config: NotificationConfig,
     shard: Option<usize>,
     grace_period: Duration,
+    chain_worker_ttl: Duration,
 }
 
 impl ServerContext {
@@ -74,7 +73,8 @@ impl ServerContext {
         )
         .with_allow_inactive_chains(false)
         .with_allow_messages_from_deprecated_epochs(false)
-        .with_grace_period(self.grace_period);
+        .with_grace_period(self.grace_period)
+        .with_chain_worker_ttl(self.chain_worker_ttl);
         (state, shard_id, shard.clone())
     }
 
@@ -181,7 +181,7 @@ impl ServerContext {
         prometheus_server::start_metrics((host.to_owned(), port), shutdown_signal);
     }
 
-    fn get_listen_address(&self) -> String {
+    fn get_listen_address() -> String {
         // Allow local IP address to be different from the public one.
         "0.0.0.0".to_string()
     }
@@ -196,7 +196,7 @@ impl Runnable for ServerContext {
         S: Storage + Clone + Send + Sync + 'static,
     {
         let shutdown_notifier = CancellationToken::new();
-        let listen_address = self.get_listen_address();
+        let listen_address = Self::get_listen_address();
 
         tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
 
@@ -351,6 +351,14 @@ enum ServerCommand {
         /// The WebAssembly runtime to use.
         #[arg(long)]
         wasm_runtime: Option<WasmRuntime>,
+
+        /// The duration in milliseconds after which an idle chain worker will free its memory.
+        #[arg(
+            long = "chain-worker-ttl-ms",
+            default_value = "30000",
+            value_parser = util::parse_millis
+        )]
+        chain_worker_ttl: Duration,
     },
 
     /// Act as a trusted third-party and generate all server configurations
@@ -462,6 +470,7 @@ async fn run(options: ServerOptions) {
             shard,
             grace_period,
             wasm_runtime,
+            chain_worker_ttl,
         } => {
             linera_version::VERSION_INFO.log();
 
@@ -474,11 +483,11 @@ async fn run(options: ServerOptions) {
                 notification_config,
                 shard,
                 grace_period,
+                chain_worker_ttl,
             };
             let wasm_runtime = wasm_runtime.with_wasm_default();
             let store_config = storage_config
                 .add_common_storage_options(&common_storage_options)
-                .await
                 .unwrap();
             store_config
                 .run_with_storage(wasm_runtime, job)
@@ -608,7 +617,6 @@ mod test {
             host = "proxy"
             public_port = 20100
             private_port = 20200
-            metrics_host = "proxy"
             metrics_port = 21100
 
             [[shards]]

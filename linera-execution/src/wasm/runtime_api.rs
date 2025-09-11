@@ -4,10 +4,11 @@
 use std::{any::Any, collections::HashMap, marker::PhantomData};
 
 use linera_base::{
-    crypto::CryptoHash,
-    data_types::{Amount, ApplicationPermissions, BlockHeight, SendMessageRequest, Timestamp},
+    data_types::{
+        Amount, ApplicationPermissions, BlockHeight, Bytecode, SendMessageRequest, Timestamp,
+    },
     http,
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, StreamName},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, StreamName},
     ownership::{ChainOwnership, ChangeApplicationPermissionsError, CloseChainError},
     vm::VmRuntime,
 };
@@ -16,7 +17,7 @@ use linera_witty::{wit_export, Instance, RuntimeError};
 use tracing::log;
 
 use super::WasmExecutionError;
-use crate::{BaseRuntime, ContractRuntime, ExecutionError, ModuleId, ServiceRuntime};
+use crate::{BaseRuntime, ContractRuntime, DataBlobHash, ExecutionError, ModuleId, ServiceRuntime};
 
 /// Common host data used as the `UserData` of the system API implementations.
 pub struct RuntimeApiData<Runtime> {
@@ -42,7 +43,7 @@ impl<Runtime> RuntimeApiData<Runtime> {
 
     /// Registers a `promise` internally, returning an ID that is unique for the lifetime of this
     /// [`RuntimeApiData`].
-    fn register_promise<Promise>(&mut self, promise: Promise) -> Result<u32, RuntimeError>
+    fn register_promise<Promise>(&mut self, promise: Promise) -> u32
     where
         Promise: Send + Sync + 'static,
     {
@@ -51,7 +52,7 @@ impl<Runtime> RuntimeApiData<Runtime> {
         self.active_promises.insert(id, Box::new(promise));
         self.promise_counter += 1;
 
-        Ok(id)
+        id
     }
 
     /// Returns a `Promise` registered to the provided `promise_id`.
@@ -210,25 +211,28 @@ where
     }
 
     /// Reads a data blob from storage.
-    fn read_data_blob(caller: &mut Caller, hash: CryptoHash) -> Result<Vec<u8>, RuntimeError> {
+    fn read_data_blob(caller: &mut Caller, hash: DataBlobHash) -> Result<Vec<u8>, RuntimeError> {
         caller
             .user_data_mut()
             .runtime
-            .read_data_blob(&hash)
+            .read_data_blob(hash)
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
     /// Asserts the existence of a data blob with the given hash.
-    fn assert_data_blob_exists(caller: &mut Caller, hash: CryptoHash) -> Result<(), RuntimeError> {
+    fn assert_data_blob_exists(
+        caller: &mut Caller,
+        hash: DataBlobHash,
+    ) -> Result<(), RuntimeError> {
         caller
             .user_data_mut()
             .runtime
-            .assert_data_blob_exists(&hash)
+            .assert_data_blob_exists(hash)
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
     /// Logs a `message` with the provided information `level`.
-    fn log(_caller: &mut Caller, message: String, level: log::Level) -> Result<(), RuntimeError> {
+    fn log(_caller: &mut Caller, message: String, level: log::Level) {
         match level {
             log::Level::Trace => tracing::trace!("{message}"),
             log::Level::Debug => tracing::debug!("{message}"),
@@ -236,7 +240,6 @@ where
             log::Level::Warn => tracing::warn!("{message}"),
             log::Level::Error => tracing::error!("{message}"),
         }
-        Ok(())
     }
 
     /// Creates a new promise to check if the `key` is in storage.
@@ -247,7 +250,7 @@ where
             .contains_key_new(key)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to check if the `key` is in storage.
@@ -268,7 +271,7 @@ where
             .contains_keys_new(keys)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to check if the `keys` are in storage.
@@ -292,7 +295,7 @@ where
             .read_multi_values_bytes_new(keys)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to read multiple entries from storage.
@@ -316,7 +319,7 @@ where
             .read_value_bytes_new(key)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to read a single entry from storage.
@@ -340,7 +343,7 @@ where
             .find_keys_by_prefix_new(key_prefix)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to search for keys that start with the `key_prefix`.
@@ -361,7 +364,7 @@ where
             .find_key_values_by_prefix_new(key_prefix)
             .map_err(|error| RuntimeError::Custom(error.into()))?;
 
-        data.register_promise(promise)
+        Ok(data.register_promise(promise))
     }
 
     /// Waits for the promise to search for entries whose keys that start with the `key_prefix`.
@@ -398,16 +401,6 @@ where
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
-    /// Returns the ID of the incoming message that is being handled, or [`None`] if not executing
-    /// an incoming message.
-    fn get_message_id(caller: &mut Caller) -> Result<Option<MessageId>, RuntimeError> {
-        caller
-            .user_data_mut()
-            .runtime
-            .message_id()
-            .map_err(|error| RuntimeError::Custom(error.into()))
-    }
-
     /// Returns `Some(true)` if the incoming message was rejected from the original destination and
     /// is now bouncing back, `Some(false)` if the message is being currently being delivered to
     /// its original destination, or [`None`] if not executing an incoming message.
@@ -416,6 +409,16 @@ where
             .user_data_mut()
             .runtime
             .message_is_bouncing()
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Returns the chain ID where the current message originated from, or [`None`] if not executing
+    /// an incoming message.
+    fn message_origin_chain_id(caller: &mut Caller) -> Result<Option<ChainId>, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .message_origin_chain_id()
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 
@@ -528,6 +531,29 @@ where
             .user_data_mut()
             .runtime
             .create_application(module_id, parameters, argument, required_application_ids)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Creates a new data blob and returns its hash.
+    fn create_data_blob(caller: &mut Caller, bytes: Vec<u8>) -> Result<DataBlobHash, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .create_data_blob(bytes)
+            .map_err(|error| RuntimeError::Custom(error.into()))
+    }
+
+    /// Publishes a module with contract and service bytecode and returns the module ID.
+    fn publish_module(
+        caller: &mut Caller,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> Result<ModuleId, RuntimeError> {
+        caller
+            .user_data_mut()
+            .runtime
+            .publish_module(contract, service, vm_runtime)
             .map_err(|error| RuntimeError::Custom(error.into()))
     }
 

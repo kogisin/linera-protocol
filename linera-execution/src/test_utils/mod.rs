@@ -1,10 +1,6 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Some of these items are only used by some tests, but Rust will complain about unused
-// items for the tests where they aren't used
-#![allow(unused_imports)]
-
 mod mock_application;
 #[cfg(with_revm)]
 pub mod solidity;
@@ -13,28 +9,26 @@ mod system_execution_state;
 use std::{collections::BTreeMap, sync::Arc, thread, vec};
 
 use linera_base::{
-    crypto::{AccountPublicKey, BcsSignable, CryptoHash, ValidatorPublicKey},
+    crypto::{AccountPublicKey, ValidatorPublicKey},
     data_types::{
         Amount, Blob, BlockHeight, ChainDescription, ChainOrigin, CompressedBytecode, Epoch,
         InitialChainConfig, OracleResponse, Timestamp,
     },
-    identifiers::{AccountOwner, ApplicationId, BlobId, BlobType, ChainId, MessageId, ModuleId},
+    identifiers::{AccountOwner, ApplicationId, BlobId, ChainId, ModuleId},
     ownership::ChainOwnership,
     vm::VmRuntime,
 };
-use linera_views::{context::Context, views::View, ViewError};
+use linera_views::{context::Context, views::View};
 use proptest::{prelude::any, strategy::Strategy};
-use serde::{Deserialize, Serialize};
 
 pub use self::{
     mock_application::{ExpectedCall, MockApplication, MockApplicationInstance},
     system_execution_state::SystemExecutionState,
 };
 use crate::{
-    committee::Committee, ApplicationDescription, ExecutionRequest, ExecutionRuntimeContext,
-    ExecutionStateView, MessageContext, OperationContext, QueryContext, ServiceRuntimeEndpoint,
-    ServiceRuntimeRequest, ServiceSyncRuntime, SystemExecutionStateView,
-    TestExecutionRuntimeContext,
+    committee::Committee, ApplicationDescription, ExecutionRuntimeContext, ExecutionStateView,
+    MessageContext, OperationContext, QueryContext, ServiceRuntimeEndpoint, ServiceSyncRuntime,
+    SystemExecutionStateView,
 };
 
 pub fn dummy_committee() -> Committee {
@@ -90,10 +84,10 @@ pub fn create_dummy_user_application_description(
     contract_bytes.push(index as u8);
     service_bytes.push(index as u8);
     let contract_blob = Blob::new_contract_bytecode(CompressedBytecode {
-        compressed_bytes: contract_bytes,
+        compressed_bytes: Arc::new(contract_bytes.into_boxed_slice()),
     });
     let service_blob = Blob::new_service_bytecode(CompressedBytecode {
-        compressed_bytes: service_bytes,
+        compressed_bytes: Arc::new(service_bytes.into_boxed_slice()),
     });
 
     let vm_runtime = VmRuntime::Wasm;
@@ -118,7 +112,6 @@ pub fn create_dummy_operation_context(chain_id: ChainId) -> OperationContext {
         height: BlockHeight(0),
         round: Some(0),
         authenticated_signer: None,
-        authenticated_caller_id: None,
         timestamp: Default::default(),
     }
 }
@@ -130,16 +123,12 @@ pub fn create_dummy_message_context(
 ) -> MessageContext {
     MessageContext {
         chain_id,
+        origin: chain_id,
         is_bouncing: false,
         authenticated_signer,
         refund_grant_to: None,
         height: BlockHeight(0),
         round: Some(0),
-        message_id: MessageId {
-            chain_id,
-            height: BlockHeight(0),
-            index: 0,
-        },
         timestamp: Default::default(),
     }
 }
@@ -236,9 +225,11 @@ where
 
         extra
             .user_contracts()
+            .pin()
             .insert(id, mock_application.clone().into());
         extra
             .user_services()
+            .pin()
             .insert(id, mock_application.clone().into());
         extra
             .add_blobs([
@@ -252,7 +243,7 @@ where
     }
 }
 
-pub async fn create_dummy_user_application_registrations(
+pub fn create_dummy_user_application_registrations(
     count: u32,
 ) -> anyhow::Result<Vec<(ApplicationId, ApplicationDescription, Blob, Blob)>> {
     let mut ids = Vec::with_capacity(count as usize);
@@ -298,7 +289,7 @@ pub fn test_accounts_strategy() -> impl Strategy<Value = BTreeMap<AccountOwner, 
     )
 }
 
-/// Creates a vector of ['OracleResponse`]s for the supplied [`BlobId`]s.
+/// Creates a vector of [`OracleResponse`]s for the supplied [`BlobId`]s.
 pub fn blob_oracle_responses<'a>(blobs: impl Iterator<Item = &'a BlobId>) -> Vec<OracleResponse> {
     blobs
         .into_iter()

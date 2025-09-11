@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "amm",
     "call-evm-counter",
+    "contract-call",
     "counter",
     "counter-no-graphql",
+    "create-and-call",
     "crowd-funding",
     "ethereum-tracker",
     "fungible",
@@ -16,8 +18,10 @@ members = [
     "meta-counter",
     "native-fungible",
     "non-fungible",
+    "publish-read-data-blob",
     "rfq",
     "social",
+    "track-instantiation",
 ]
 
 [workspace.dependencies]
@@ -38,7 +42,6 @@ getrandom = { version = "0.2.12", default-features = false, features = [
 ] }
 hex = "0.4.3"
 linera-sdk = { path = "../linera-sdk" }
-linera-views = { path = "../linera-views", default-features = false }
 log = "0.4.20"
 num-bigint = "0.4.3"
 num-traits = "0.2.16"
@@ -56,6 +59,7 @@ tokio = { version = "1.25.0", features = ["macros", "rt-multi-thread"] }
 
 amm = { path = "./amm" }
 counter = { path = "./counter" }
+create-and-call = { path = "./create-and-call" }
 crowd-funding = { path = "./crowd-funding" }
 ethereum-tracker = { path = "./ethereum-tracker", features = ["ethereum"] }
 fungible = { path = "./fungible" }

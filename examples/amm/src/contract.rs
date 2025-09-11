@@ -6,9 +6,9 @@
 mod state;
 
 use amm::{AmmAbi, Message, Operation, Parameters};
-use fungible::{Account, FungibleTokenAbi};
 use linera_sdk::{
-    linera_base_types::{AccountOwner, Amount, ApplicationId, ChainId, WithContractAbi},
+    abis::fungible::{FungibleOperation, FungibleResponse, FungibleTokenAbi},
+    linera_base_types::{Account, AccountOwner, Amount, ApplicationId, ChainId, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -443,16 +443,12 @@ impl AmmContract {
         }
     }
 
-    fn get_message_creation_chain_id(&mut self) -> ChainId {
-        self.runtime
-            .message_id()
-            .expect("Getting message id should not fail")
-            .chain_id
-    }
-
     fn get_message_origin_account(&mut self, owner: AccountOwner) -> Account {
         Account {
-            chain_id: self.get_message_creation_chain_id(),
+            chain_id: self
+                .runtime
+                .message_origin_chain_id()
+                .expect("Getting message origin chain ID should not fail"),
             owner,
         }
     }
@@ -673,7 +669,7 @@ impl AmmContract {
         token_idx: u32,
     ) {
         let token = self.fungible_id(token_idx);
-        let operation = fungible::Operation::Transfer {
+        let operation = FungibleOperation::Transfer {
             owner: source_owner,
             amount,
             target_account,
@@ -683,10 +679,10 @@ impl AmmContract {
     }
 
     fn balance(&mut self, owner: &AccountOwner, token_idx: u32) -> Amount {
-        let balance = fungible::Operation::Balance { owner: *owner };
+        let balance = FungibleOperation::Balance { owner: *owner };
         let token = self.fungible_id(token_idx);
         match self.runtime.call_application(true, token, &balance) {
-            fungible::FungibleResponse::Balance(balance) => balance,
+            FungibleResponse::Balance(balance) => balance,
             response => panic!("Unexpected response from fungible token application: {response:?}"),
         }
     }

@@ -11,17 +11,28 @@ use std::{
 use linera_base::{
     abi::{ContractAbi, ServiceAbi},
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, Timestamp,
+        Amount, ApplicationPermissions, BlockHeight, Bytecode, Resources, SendMessageRequest,
+        Timestamp,
     },
     ensure, http,
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId, StreamName},
+    identifiers::{
+        Account, AccountOwner, ApplicationId, BlobId, ChainId, DataBlobHash, ModuleId, StreamName,
+    },
     ownership::{
         AccountPermissionError, ChainOwnership, ChangeApplicationPermissionsError, CloseChainError,
     },
+    vm::VmRuntime,
 };
 use serde::Serialize;
 
-use crate::{Contract, DataBlobHash, KeyValueStore, ViewStorageContext};
+use crate::{Contract, KeyValueStore, ViewStorageContext};
+
+struct ExpectedPublishModuleCall {
+    contract: Bytecode,
+    service: Bytecode,
+    vm_runtime: VmRuntime,
+    module_id: ModuleId,
+}
 
 struct ExpectedCreateApplicationCall {
     module_id: ModuleId,
@@ -29,6 +40,11 @@ struct ExpectedCreateApplicationCall {
     argument: Vec<u8>,
     required_application_ids: Vec<ApplicationId>,
     application_id: ApplicationId,
+}
+
+struct ExpectedCreateDataBlobCall {
+    bytes: Vec<u8>,
+    blob_id: BlobId,
 }
 
 /// A mock of the common runtime to interface with the host executing the contract.
@@ -43,8 +59,8 @@ where
     authenticated_signer: Option<Option<AccountOwner>>,
     block_height: Option<BlockHeight>,
     round: Option<u32>,
-    message_id: Option<Option<MessageId>>,
     message_is_bouncing: Option<Option<bool>>,
+    message_origin_chain_id: Option<Option<ChainId>>,
     authenticated_caller_id: Option<Option<ApplicationId>>,
     timestamp: Option<Timestamp>,
     chain_balance: Option<Amount>,
@@ -63,7 +79,9 @@ where
     expected_read_data_blob_requests: VecDeque<(DataBlobHash, Vec<u8>)>,
     expected_assert_data_blob_exists_requests: VecDeque<(DataBlobHash, Option<()>)>,
     expected_open_chain_calls: VecDeque<(ChainOwnership, ApplicationPermissions, Amount, ChainId)>,
+    expected_publish_module_calls: VecDeque<ExpectedPublishModuleCall>,
     expected_create_application_calls: VecDeque<ExpectedCreateApplicationCall>,
+    expected_create_data_blob_calls: VecDeque<ExpectedCreateDataBlobCall>,
     key_value_store: KeyValueStore,
 }
 
@@ -90,8 +108,8 @@ where
             authenticated_signer: None,
             block_height: None,
             round: None,
-            message_id: None,
             message_is_bouncing: None,
+            message_origin_chain_id: None,
             authenticated_caller_id: None,
             timestamp: None,
             chain_balance: None,
@@ -110,7 +128,9 @@ where
             expected_read_data_blob_requests: VecDeque::new(),
             expected_assert_data_blob_exists_requests: VecDeque::new(),
             expected_open_chain_calls: VecDeque::new(),
+            expected_publish_module_calls: VecDeque::new(),
             expected_create_application_calls: VecDeque::new(),
+            expected_create_data_blob_calls: VecDeque::new(),
             key_value_store: KeyValueStore::mock().to_mut(),
         }
     }
@@ -272,27 +292,6 @@ where
         )
     }
 
-    /// Configures the message ID to return during the test.
-    pub fn with_message_id(mut self, message_id: impl Into<Option<MessageId>>) -> Self {
-        self.message_id = Some(message_id.into());
-        self
-    }
-
-    /// Configures the message ID to return during the test.
-    pub fn set_message_id(&mut self, message_id: impl Into<Option<MessageId>>) -> &mut Self {
-        self.message_id = Some(message_id.into());
-        self
-    }
-
-    /// Returns the ID of the incoming message that is being handled, or [`None`] if not executing
-    /// an incoming message.
-    pub fn message_id(&mut self) -> Option<MessageId> {
-        self.message_id.expect(
-            "Message ID has not been mocked, \
-            please call `MockContractRuntime::set_message_id` first",
-        )
-    }
-
     /// Configures the `message_is_bouncing` flag to return during the test.
     pub fn with_message_is_bouncing(
         mut self,
@@ -317,6 +316,24 @@ where
         self.message_is_bouncing.expect(
             "`message_is_bouncing` flag has not been mocked, \
             please call `MockContractRuntime::set_message_is_bouncing` first",
+        )
+    }
+
+    /// Configures the `message_origin_chain_id` to return during the test.
+    pub fn set_message_origin_chain_id(
+        &mut self,
+        message_origin_chain_id: impl Into<Option<ChainId>>,
+    ) -> &mut Self {
+        self.message_origin_chain_id = Some(message_origin_chain_id.into());
+        self
+    }
+
+    /// Returns the chain ID where the incoming message originated from, or [`None`] if not
+    /// executing an incoming message.
+    pub fn message_origin_chain_id(&mut self) -> Option<ChainId> {
+        self.message_origin_chain_id.expect(
+            "`message_origin_chain_id` has not been mocked, \
+            please call `MockContractRuntime::set_message_origin_chain_id` first",
         )
     }
 
@@ -644,7 +661,7 @@ where
         }
     }
 
-    /// Adds an expected call to `open_chain`, and the message ID that should be returned.
+    /// Adds an expected call to `open_chain`, and the child chain ID that should be returned.
     pub fn add_expected_open_chain_call(
         &mut self,
         ownership: ChainOwnership,
@@ -678,6 +695,23 @@ where
         chain_id
     }
 
+    /// Adds a new expected call to `publish_module`.
+    pub fn add_expected_publish_module_call(
+        &mut self,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+        module_id: ModuleId,
+    ) {
+        self.expected_publish_module_calls
+            .push_back(ExpectedPublishModuleCall {
+                contract,
+                service,
+                vm_runtime,
+                module_id,
+            });
+    }
+
     /// Adds a new expected call to `create_application`.
     pub fn add_expected_create_application_call<Parameters, InstantiationArgument>(
         &mut self,
@@ -705,7 +739,35 @@ where
             });
     }
 
-    /// Creates a new on-chain application, based on the supplied bytecode and parameters.
+    /// Adds a new expected call to `create_data_blob`.
+    pub fn add_expected_create_data_blob_call(&mut self, bytes: Vec<u8>, blob_id: BlobId) {
+        self.expected_create_data_blob_calls
+            .push_back(ExpectedCreateDataBlobCall { bytes, blob_id });
+    }
+
+    /// Creates a new module-id on-chain application, based on the supplied bytecode and parameters.
+    pub fn publish_module(
+        &mut self,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> ModuleId {
+        let ExpectedPublishModuleCall {
+            contract: expected_contract,
+            service: expected_service,
+            vm_runtime: expected_vm_runtime,
+            module_id,
+        } = self
+            .expected_publish_module_calls
+            .pop_front()
+            .expect("Unexpected publish_module call");
+        assert_eq!(contract, expected_contract);
+        assert_eq!(service, expected_service);
+        assert_eq!(vm_runtime, expected_vm_runtime);
+        module_id
+    }
+
+    /// Creates a new on-chain application, based on the supplied module and parameters.
     pub fn create_application<Abi, Parameters, InstantiationArgument>(
         &mut self,
         module_id: ModuleId,
@@ -738,6 +800,19 @@ where
         assert_eq!(argument, expected_argument);
         assert_eq!(required_application_ids, expected_required_app_ids);
         application_id.with_abi::<Abi>()
+    }
+
+    /// Creates a new data blob and returns its hash.
+    pub fn create_data_blob(&mut self, bytes: Vec<u8>) -> DataBlobHash {
+        let ExpectedCreateDataBlobCall {
+            bytes: expected_bytes,
+            blob_id,
+        } = self
+            .expected_create_data_blob_calls
+            .pop_front()
+            .expect("Unexpected create_data_blob call");
+        assert_eq!(bytes, expected_bytes);
+        DataBlobHash(blob_id.hash)
     }
 
     /// Configures the handler for cross-application calls made during the test.
@@ -906,10 +981,10 @@ where
     }
 
     /// Reads a data blob with the given hash from storage.
-    pub fn read_data_blob(&mut self, hash: &DataBlobHash) -> Vec<u8> {
+    pub fn read_data_blob(&mut self, hash: DataBlobHash) -> Vec<u8> {
         let maybe_request = self.expected_read_data_blob_requests.pop_front();
         let (expected_hash, response) = maybe_request.expect("Unexpected read_data_blob request");
-        assert_eq!(*hash, expected_hash);
+        assert_eq!(hash, expected_hash);
         response
     }
 

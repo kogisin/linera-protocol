@@ -11,8 +11,10 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[lints]
+workspace = true
+
 [features]
-benchmark = ["linera-base/test"]
 metrics = ["prometheus", "linera-views/metrics", "linera-execution/metrics"]
 test = [
     "dep:anyhow",

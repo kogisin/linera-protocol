@@ -9,7 +9,7 @@ use linera_persistent as persistent;
 use linera_version::VersionInfo;
 use thiserror_context::Context;
 
-#[cfg(feature = "benchmark")]
+#[cfg(not(web))]
 use crate::benchmark::BenchmarkError;
 use crate::util;
 
@@ -33,14 +33,14 @@ pub(crate) enum Inner {
     #[error("no keypair found for chain: {0:?}")]
     NonexistentKeypair(linera_base::identifiers::ChainId),
     #[error("error on the local node: {0}")]
-    LocalNode(#[from] linera_core::local_node::LocalNodeError),
+    LocalNode(#[from] linera_core::LocalNodeError),
     #[error("remote node operation failed: {0}")]
     RemoteNode(#[from] linera_core::node::NodeError),
     #[error("arithmetic error: {0}")]
     Arithmetic(#[from] linera_base::data_types::ArithmeticError),
     #[error("incorrect chain ownership")]
     ChainOwnership,
-    #[cfg(feature = "benchmark")]
+    #[cfg(not(web))]
     #[error("Benchmark error: {0}")]
     Benchmark(#[from] BenchmarkError),
     #[error("Validator version {remote} is not compatible with local version {local}.")]

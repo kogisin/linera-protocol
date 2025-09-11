@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{BlobContent, NetworkDescription, Timestamp},
+    data_types::{BlobContent, BlockHeight, Epoch, NetworkDescription, Timestamp},
     identifiers::{AccountOwner, BlobId, ChainId},
 };
 use linera_chain::{
@@ -33,7 +33,7 @@ use linera_sdk::linera_base_types::ValidatorPublicKey;
 use linera_service::node_service::NodeService;
 use linera_storage::DbStorage;
 use linera_version::VersionInfo;
-use linera_views::memory::MemoryStore;
+use linera_views::memory::MemoryDatabase;
 
 #[derive(Clone)]
 struct DummyValidatorNode;
@@ -131,7 +131,22 @@ impl ValidatorNode for DummyValidatorNode {
         Err(NodeError::UnexpectedMessage)
     }
 
+    async fn download_certificates_by_heights(
+        &self,
+        _: ChainId,
+        _: Vec<BlockHeight>,
+    ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError> {
+        Err(NodeError::UnexpectedMessage)
+    }
+
     async fn blob_last_used_by(&self, _: BlobId) -> Result<CryptoHash, NodeError> {
+        Err(NodeError::UnexpectedMessage)
+    }
+
+    async fn blob_last_used_by_certificate(
+        &self,
+        _blob_id: BlobId,
+    ) -> Result<ConfirmedBlockCertificate, NodeError> {
         Err(NodeError::UnexpectedMessage)
     }
 
@@ -169,7 +184,7 @@ struct DummyContext;
 
 impl ClientContext for DummyContext {
     type Environment = linera_core::environment::Impl<
-        DbStorage<MemoryStore>,
+        DbStorage<MemoryDatabase>,
         DummyValidatorNodeProvider,
         linera_base::crypto::InMemorySigner,
     >;
@@ -178,7 +193,7 @@ impl ClientContext for DummyContext {
         unimplemented!()
     }
 
-    fn storage(&self) -> &DbStorage<MemoryStore> {
+    fn storage(&self) -> &DbStorage<MemoryDatabase> {
         unimplemented!()
     }
 
@@ -186,11 +201,18 @@ impl ClientContext for DummyContext {
         unimplemented!()
     }
 
+    fn timing_sender(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<(u64, linera_core::client::TimingType)>> {
+        None
+    }
+
     async fn update_wallet_for_new_chain(
         &mut self,
         _: ChainId,
         _: Option<AccountOwner>,
         _: Timestamp,
+        _: Epoch,
     ) -> Result<(), Error> {
         Ok(())
     }
@@ -208,8 +230,7 @@ async fn main() -> std::io::Result<()> {
         std::num::NonZeroU16::new(8080).unwrap(),
         None,
         DummyContext,
-    )
-    .await;
+    );
     let schema = service.schema().sdl();
     print!("{}", schema);
     Ok(())

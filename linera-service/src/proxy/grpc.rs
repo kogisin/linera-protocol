@@ -17,7 +17,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt as _};
 use linera_base::identifiers::ChainId;
-use linera_core::{notifier::ChannelNotifier, JoinSetExt as _};
+use linera_core::{
+    data_types::{CertificatesByHeightRequest, ChainInfo, ChainInfoQuery},
+    notifier::ChannelNotifier,
+    JoinSetExt as _,
+};
+#[cfg(with_metrics)]
+use linera_metrics::prometheus_server;
 use linera_rpc::{
     config::{ProxyConfig, ShardConfig, TlsConfig, ValidatorInternalNetworkConfig},
     grpc::{
@@ -27,9 +33,10 @@ use linera_rpc::{
             validator_node_server::{ValidatorNode, ValidatorNodeServer},
             validator_worker_client::ValidatorWorkerClient,
             BlobContent, BlobId, BlobIds, BlockProposal, Certificate, CertificatesBatchRequest,
-            CertificatesBatchResponse, ChainInfoQuery, ChainInfoResult, CryptoHash,
-            HandlePendingBlobRequest, LiteCertificate, NetworkDescription, Notification,
-            PendingBlobRequest, PendingBlobResult, SubscriptionRequest, VersionInfo,
+            CertificatesBatchResponse, ChainInfoResult, CryptoHash, HandlePendingBlobRequest,
+            LiteCertificate, NetworkDescription, Notification, PendingBlobRequest,
+            PendingBlobResult, RawCertificate, RawCertificatesBatch, SubscriptionRequest,
+            VersionInfo,
         },
         pool::GrpcConnectionPool,
         GrpcProtoConversionError, GrpcProxyable, GRPC_CHUNKED_MESSAGE_FILL_LIMIT,
@@ -46,11 +53,9 @@ use tonic::{
     transport::{Channel, Identity, Server, ServerTlsConfig},
     Request, Response, Status,
 };
+use tonic_web::GrpcWebLayer;
 use tower::{builder::ServiceBuilder, Layer, Service};
 use tracing::{debug, info, instrument, Instrument as _, Level};
-
-#[cfg(with_metrics)]
-use crate::prometheus_server;
 
 #[cfg(with_metrics)]
 mod metrics {
@@ -245,7 +250,7 @@ where
         #[cfg(with_metrics)]
         prometheus_server::start_metrics(self.metrics_address(), shutdown_signal.clone());
 
-        let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
         health_reporter
             .set_serving::<ValidatorNodeServer<GrpcProxy<S>>>()
             .await;
@@ -260,15 +265,19 @@ where
             .build_v1()?;
         let public_server = join_set.spawn_task(
             self.public_server()?
+                .max_concurrent_streams(Some(u32::MAX - 1)) // we subtract one to make sure
+                // that the value is not
+                // interpreted as "not set"
                 .layer(
                     ServiceBuilder::new()
                         .layer(PrometheusMetricsMiddlewareLayer)
                         .into_inner(),
                 )
+                .layer(GrpcWebLayer::new())
                 .accept_http1(true)
                 .add_service(health_service)
-                .add_service(tonic_web::enable(self.as_validator_node()))
-                .add_service(tonic_web::enable(reflection_service))
+                .add_service(self.as_validator_node())
+                .add_service(reflection_service)
                 .serve_with_shutdown(self.public_address(), shutdown_signal.cancelled_owned())
                 .in_current_span(),
         );
@@ -294,7 +303,7 @@ where
         }
     }
 
-    async fn worker_client<R>(
+    fn worker_client<R>(
         &self,
         request: Request<R>,
     ) -> Result<(ValidatorWorkerClient<Channel>, R), Status>
@@ -370,7 +379,7 @@ where
         &self,
         request: Request<BlockProposal>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request).await?;
+        let (mut client, inner) = self.worker_client(request)?;
         Self::log_and_return_proxy_request_outcome(
             client.handle_block_proposal(inner).await,
             "handle_block_proposal",
@@ -382,7 +391,7 @@ where
         &self,
         request: Request<LiteCertificate>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request).await?;
+        let (mut client, inner) = self.worker_client(request)?;
         Self::log_and_return_proxy_request_outcome(
             client.handle_lite_certificate(inner).await,
             "handle_lite_certificate",
@@ -394,7 +403,7 @@ where
         &self,
         request: Request<api::HandleConfirmedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request).await?;
+        let (mut client, inner) = self.worker_client(request)?;
         Self::log_and_return_proxy_request_outcome(
             client.handle_confirmed_certificate(inner).await,
             "handle_confirmed_certificate",
@@ -406,7 +415,7 @@ where
         &self,
         request: Request<api::HandleValidatedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request).await?;
+        let (mut client, inner) = self.worker_client(request)?;
         Self::log_and_return_proxy_request_outcome(
             client.handle_validated_certificate(inner).await,
             "handle_validated_certificate",
@@ -418,7 +427,7 @@ where
         &self,
         request: Request<api::HandleTimeoutCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request).await?;
+        let (mut client, inner) = self.worker_client(request)?;
         Self::log_and_return_proxy_request_outcome(
             client.handle_timeout_certificate(inner).await,
             "handle_timeout_certificate",
@@ -428,9 +437,9 @@ where
     #[instrument(skip_all, err(Display))]
     async fn handle_chain_info_query(
         &self,
-        request: Request<ChainInfoQuery>,
+        request: Request<api::ChainInfoQuery>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request).await?;
+        let (mut client, inner) = self.worker_client(request)?;
         Self::log_and_return_proxy_request_outcome(
             client.handle_chain_info_query(inner).await,
             "handle_chain_info_query",
@@ -515,7 +524,7 @@ where
         &self,
         request: Request<PendingBlobRequest>,
     ) -> Result<Response<PendingBlobResult>, Status> {
-        let (mut client, inner) = self.worker_client(request).await?;
+        let (mut client, inner) = self.worker_client(request)?;
         #[cfg_attr(not(with_metrics), expect(clippy::needless_match))]
         match client.download_pending_blob(inner).await {
             Ok(blob_result) => {
@@ -540,7 +549,7 @@ where
         &self,
         request: Request<HandlePendingBlobRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let (mut client, inner) = self.worker_client(request).await?;
+        let (mut client, inner) = self.worker_client(request)?;
         #[cfg_attr(not(with_metrics), expect(clippy::needless_match))]
         match client.handle_pending_blob(inner).await {
             Ok(blob_result) => {
@@ -623,6 +632,121 @@ where
         )?))
     }
 
+    #[instrument(skip_all, err(Display))]
+    async fn download_certificates_by_heights(
+        &self,
+        request: Request<api::DownloadCertificatesByHeightsRequest>,
+    ) -> Result<Response<CertificatesBatchResponse>, Status> {
+        let original_request: CertificatesByHeightRequest = request.into_inner().try_into()?;
+        let chain_info_request = ChainInfoQuery::new(original_request.chain_id)
+            .with_sent_certificate_hashes_by_heights(original_request.heights);
+
+        // Use handle_chain_info_query to get the certificate hashes
+        let chain_info_response = self
+            .handle_chain_info_query(Request::new(chain_info_request.try_into()?))
+            .await?;
+
+        // Extract the ChainInfoResult from the response
+        let chain_info_result = chain_info_response.into_inner();
+
+        // Extract the certificate hashes from the ChainInfo
+        let hashes = match chain_info_result.inner {
+            Some(api::chain_info_result::Inner::ChainInfoResponse(response)) => {
+                let chain_info: ChainInfo =
+                    bincode::deserialize(&response.chain_info).map_err(|e| {
+                        Status::internal(format!("Failed to deserialize ChainInfo: {}", e))
+                    })?;
+                chain_info.requested_sent_certificate_hashes
+            }
+            Some(api::chain_info_result::Inner::Error(error)) => {
+                return Err(Status::internal(format!(
+                    "Chain info query failed: {:?}",
+                    error
+                )));
+            }
+            None => {
+                return Err(Status::internal("Empty chain info result"));
+            }
+        };
+
+        // Use download_certificates to get the actual certificates
+        let certificates_request = CertificatesBatchRequest {
+            hashes: hashes.into_iter().map(|h| h.into()).collect(),
+        };
+
+        self.download_certificates(Request::new(certificates_request))
+            .await
+    }
+
+    #[instrument(skip_all, err(Display))]
+    async fn download_raw_certificates_by_heights(
+        &self,
+        request: Request<api::DownloadCertificatesByHeightsRequest>,
+    ) -> Result<Response<api::RawCertificatesBatch>, Status> {
+        let original_request: CertificatesByHeightRequest = request.into_inner().try_into()?;
+        let chain_info_request = ChainInfoQuery::new(original_request.chain_id)
+            .with_sent_certificate_hashes_by_heights(original_request.heights);
+        // Use handle_chain_info_query to get the certificate hashes
+        let chain_info_response = self
+            .handle_chain_info_query(Request::new(chain_info_request.try_into()?))
+            .await?;
+        // Extract the ChainInfoResult from the response
+        let chain_info_result = chain_info_response.into_inner();
+        // Extract the certificate hashes from the ChainInfo
+        let hashes = match chain_info_result.inner {
+            Some(api::chain_info_result::Inner::ChainInfoResponse(response)) => {
+                let chain_info: ChainInfo =
+                    bincode::deserialize(&response.chain_info).map_err(|e| {
+                        Status::internal(format!("Failed to deserialize ChainInfo: {}", e))
+                    })?;
+                chain_info.requested_sent_certificate_hashes
+            }
+            Some(api::chain_info_result::Inner::Error(error)) => {
+                return Err(Status::internal(format!(
+                    "Chain info query failed: {:?}",
+                    error
+                )));
+            }
+            None => {
+                return Err(Status::internal("Empty chain info result"));
+            }
+        };
+
+        // Use 70% of the max message size as a buffer capacity.
+        // Leave 30% as overhead.
+        let mut grpc_message_limiter: GrpcMessageLimiter<linera_chain::types::Certificate> =
+            GrpcMessageLimiter::new(GRPC_CHUNKED_MESSAGE_FILL_LIMIT);
+
+        let mut returned_certificates = vec![];
+
+        'outer: for batch in hashes.chunks(100) {
+            let certificates: Vec<(Vec<u8>, Vec<u8>)> = self
+                .0
+                .storage
+                .read_certificates_raw(batch.to_vec())
+                .await
+                .map_err(Self::view_error_to_status)?
+                .into_iter()
+                .collect();
+            for (lite_cert_bytes, confirmed_block_bytes) in certificates {
+                if grpc_message_limiter
+                    .fits_raw(lite_cert_bytes.len() + confirmed_block_bytes.len())
+                {
+                    returned_certificates.push(RawCertificate {
+                        lite_certificate: lite_cert_bytes,
+                        confirmed_block: confirmed_block_bytes,
+                    });
+                } else {
+                    break 'outer;
+                }
+            }
+        }
+
+        Ok(Response::new(RawCertificatesBatch {
+            certificates: returned_certificates,
+        }))
+    }
+
     #[instrument(skip_all, err(level = Level::WARN))]
     async fn blob_last_used_by(
         &self,
@@ -641,6 +765,16 @@ where
             .last_used_by
             .ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
         Ok(Response::new(last_used_by.into()))
+    }
+
+    #[instrument(skip_all, err(level = Level::WARN))]
+    async fn blob_last_used_by_certificate(
+        &self,
+        request: Request<BlobId>,
+    ) -> Result<Response<Certificate>, Status> {
+        let cert_hash = self.blob_last_used_by(request).await?;
+        let request = Request::new(cert_hash.into_inner());
+        self.download_certificate(request).await
     }
 
     #[instrument(skip_all, err(level = Level::WARN))]
@@ -702,11 +836,18 @@ impl<T> GrpcMessageLimiter<T> {
         U: TryFrom<T, Error = GrpcProtoConversionError> + Message,
     {
         let required = U::try_from(el).map(|proto| proto.encoded_len())?;
-        if required > self.remaining {
-            return Ok(false);
+        Ok(self.fits_raw(required))
+    }
+
+    /// Adds the given number of bytes to the remaining capacity.
+    ///
+    /// Returns whether we managed to fit the element.
+    fn fits_raw(&mut self, bytes_len: usize) -> bool {
+        if self.remaining < bytes_len {
+            return false;
         }
-        self.remaining -= required;
-        Ok(true)
+        self.remaining = self.remaining.saturating_sub(bytes_len);
+        true
     }
 }
 

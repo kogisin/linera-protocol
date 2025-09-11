@@ -2,8 +2,8 @@ package linera:app;
 
 interface contract-runtime-api {
     authenticated-signer: func() -> option<account-owner>;
-    get-message-id: func() -> option<message-id>;
     message-is-bouncing: func() -> option<bool>;
+    message-origin-chain-id: func() -> option<chain-id>;
     authenticated-caller-id: func() -> option<application-id>;
     send-message: func(message: send-message-request);
     transfer: func(source: account-owner, destination: account, amount: amount);
@@ -12,6 +12,8 @@ interface contract-runtime-api {
     close-chain: func() -> result<tuple<>, close-chain-error>;
     change-application-permissions: func(application-permissions: application-permissions) -> result<tuple<>, change-application-permissions-error>;
     create-application: func(module-id: module-id, parameters: list<u8>, argument: list<u8>, required-application-ids: list<application-id>) -> application-id;
+    create-data-blob: func(bytes: list<u8>) -> data-blob-hash;
+    publish-module: func(contract: bytecode, service: bytecode, vm-runtime: vm-runtime) -> module-id;
     try-call-application: func(authenticated: bool, callee-id: application-id, argument: list<u8>) -> list<u8>;
     emit: func(name: stream-name, value: list<u8>) -> u32;
     read-event: func(chain-id: chain-id, name: stream-name, index: u32) -> list<u8>;
@@ -56,8 +58,8 @@ interface contract-runtime-api {
         part3: u64,
     }
 
-    record block-height {
-        inner0: u64,
+    record bytecode {
+        bytes: list<u8>,
     }
 
     record chain-id {
@@ -87,10 +89,8 @@ interface contract-runtime-api {
         part4: u64,
     }
 
-    record message-id {
-        chain-id: chain-id,
-        height: block-height,
-        index: u32,
+    record data-blob-hash {
+        inner0: crypto-hash,
     }
 
     record module-id {

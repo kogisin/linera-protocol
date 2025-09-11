@@ -12,7 +12,6 @@ use linera_base::{
     identifiers::{Account, AccountOwner},
     time::{Duration, Instant},
 };
-use linera_execution::system::Recipient;
 use linera_sdk::test::{ActiveChain, TestValidator};
 use tokio::runtime::Runtime;
 
@@ -29,11 +28,11 @@ fn cross_chain_native_token_transfers(criterion: &mut Criterion) {
                 let mut total_time = Duration::ZERO;
 
                 for _ in 0..iterations {
-                    let chains = setup_native_token_balances(
+                    let chains = Box::pin(setup_native_token_balances(
                         chain_count,
                         accounts_per_chain,
                         transfers_per_account,
-                    )
+                    ))
                     .await;
 
                     let transfers = prepare_transfers(chains, transfers_per_account);
@@ -78,10 +77,10 @@ async fn setup_native_token_balances(
     let admin_chain = validator.get_chain(&validator.admin_chain_id());
 
     for chain in &chains {
-        let recipient = Recipient::Account(Account {
+        let recipient = Account {
             chain_id: chain.id(),
             owner: AccountOwner::from(chain.public_key()),
-        });
+        };
 
         // TODO: Support benchmarking chains with multiple owner accounts
         assert_eq!(accounts_per_chain, 1);
@@ -128,7 +127,6 @@ fn prepare_transfers(
                 .cycle()
                 .skip(index)
                 .take(transfers_per_account)
-                .map(Recipient::Account)
                 .map(move |recipient| (sender, recipient))
                 .collect::<Vec<_>>();
 

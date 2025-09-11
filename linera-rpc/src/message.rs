@@ -4,7 +4,7 @@
 
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{BlobContent, NetworkDescription},
+    data_types::{BlobContent, BlockHeight, NetworkDescription},
     identifiers::{BlobId, ChainId},
 };
 use linera_chain::{
@@ -39,6 +39,7 @@ pub enum RpcMessage {
     HandlePendingBlob(Box<(ChainId, BlobContent)>),
     DownloadConfirmedBlock(Box<CryptoHash>),
     DownloadCertificates(Vec<CryptoHash>),
+    DownloadCertificatesByHeights(ChainId, Vec<BlockHeight>),
     BlobLastUsedBy(Box<BlobId>),
     MissingBlobIds(Vec<BlobId>),
     VersionInfoQuery,
@@ -55,11 +56,15 @@ pub enum RpcMessage {
     DownloadPendingBlobResponse(Box<BlobContent>),
     DownloadConfirmedBlockResponse(Box<ConfirmedBlock>),
     DownloadCertificatesResponse(Vec<ConfirmedBlockCertificate>),
+    DownloadCertificatesByHeightsResponse(Vec<ConfirmedBlockCertificate>),
     BlobLastUsedByResponse(Box<CryptoHash>),
     MissingBlobIdsResponse(Vec<BlobId>),
 
     // Internal to a validator
     CrossChainRequest(Box<CrossChainRequest>),
+
+    BlobLastUsedByCertificate(Box<BlobId>),
+    BlobLastUsedByCertificateResponse(Box<ConfirmedBlockCertificate>),
 }
 
 impl RpcMessage {
@@ -78,6 +83,7 @@ impl RpcMessage {
             ChainInfoQuery(query) => query.chain_id,
             CrossChainRequest(request) => request.target_chain_id(),
             DownloadPendingBlob(request) => request.0,
+            DownloadCertificatesByHeights(chain_id, _) => *chain_id,
             HandlePendingBlob(request) => request.0,
             Vote(_)
             | Error(_)
@@ -93,9 +99,12 @@ impl RpcMessage {
             | DownloadPendingBlobResponse(_)
             | DownloadConfirmedBlock(_)
             | DownloadConfirmedBlockResponse(_)
+            | DownloadCertificatesByHeightsResponse(_)
             | DownloadCertificates(_)
             | BlobLastUsedBy(_)
             | BlobLastUsedByResponse(_)
+            | BlobLastUsedByCertificate(_)
+            | BlobLastUsedByCertificateResponse(_)
             | MissingBlobIds(_)
             | MissingBlobIdsResponse(_)
             | DownloadCertificatesResponse(_) => {
@@ -118,8 +127,10 @@ impl RpcMessage {
             | DownloadBlob(_)
             | DownloadConfirmedBlock(_)
             | BlobLastUsedBy(_)
+            | BlobLastUsedByCertificate(_)
             | MissingBlobIds(_)
-            | DownloadCertificates(_) => true,
+            | DownloadCertificates(_)
+            | DownloadCertificatesByHeights(_, _) => true,
             BlockProposal(_)
             | LiteCertificate(_)
             | TimeoutCertificate(_)
@@ -139,8 +150,10 @@ impl RpcMessage {
             | DownloadBlobResponse(_)
             | DownloadConfirmedBlockResponse(_)
             | BlobLastUsedByResponse(_)
+            | BlobLastUsedByCertificateResponse(_)
             | MissingBlobIdsResponse(_)
-            | DownloadCertificatesResponse(_) => false,
+            | DownloadCertificatesResponse(_)
+            | DownloadCertificatesByHeightsResponse(_) => false,
         }
     }
 }
@@ -190,11 +203,23 @@ impl TryFrom<RpcMessage> for ConfirmedBlock {
     }
 }
 
+impl TryFrom<RpcMessage> for ConfirmedBlockCertificate {
+    type Error = NodeError;
+    fn try_from(message: RpcMessage) -> Result<Self, Self::Error> {
+        match message {
+            RpcMessage::BlobLastUsedByCertificateResponse(certificate) => Ok(*certificate),
+            RpcMessage::Error(error) => Err(*error),
+            _ => Err(NodeError::UnexpectedMessage),
+        }
+    }
+}
+
 impl TryFrom<RpcMessage> for Vec<ConfirmedBlockCertificate> {
     type Error = NodeError;
     fn try_from(message: RpcMessage) -> Result<Self, Self::Error> {
         match message {
             RpcMessage::DownloadCertificatesResponse(certificates) => Ok(certificates),
+            RpcMessage::DownloadCertificatesByHeightsResponse(certificates) => Ok(certificates),
             RpcMessage::Error(error) => Err(*error),
             _ => Err(NodeError::UnexpectedMessage),
         }

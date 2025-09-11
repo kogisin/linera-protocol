@@ -6,18 +6,22 @@
 use linera_base::{
     abi::{ContractAbi, ServiceAbi},
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Resources, SendMessageRequest, Timestamp,
+        Amount, ApplicationPermissions, BlockHeight, Bytecode, Resources, SendMessageRequest,
+        Timestamp,
     },
     ensure, http,
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId, MessageId, ModuleId, StreamName},
+    identifiers::{
+        Account, AccountOwner, ApplicationId, ChainId, DataBlobHash, ModuleId, StreamName,
+    },
     ownership::{
         AccountPermissionError, ChainOwnership, ChangeApplicationPermissionsError, CloseChainError,
     },
+    vm::VmRuntime,
 };
 use serde::Serialize;
 
 use super::wit::{base_runtime_api as base_wit, contract_runtime_api as contract_wit};
-use crate::{Contract, DataBlobHash, KeyValueStore, ViewStorageContext};
+use crate::{Contract, KeyValueStore, ViewStorageContext};
 
 /// The common runtime to interface with the host executing the contract.
 ///
@@ -31,11 +35,9 @@ where
     application_id: Option<ApplicationId<Application::Abi>>,
     application_creator_chain_id: Option<ChainId>,
     chain_id: Option<ChainId>,
-    authenticated_signer: Option<Option<AccountOwner>>,
     block_height: Option<BlockHeight>,
     message_is_bouncing: Option<Option<bool>>,
-    message_id: Option<Option<MessageId>>,
-    authenticated_caller_id: Option<Option<ApplicationId>>,
+    message_origin_chain_id: Option<Option<ChainId>>,
     timestamp: Option<Timestamp>,
 }
 
@@ -50,11 +52,9 @@ where
             application_id: None,
             application_creator_chain_id: None,
             chain_id: None,
-            authenticated_signer: None,
             block_height: None,
             message_is_bouncing: None,
-            message_id: None,
-            authenticated_caller_id: None,
+            message_origin_chain_id: None,
             timestamp: None,
         }
     }
@@ -157,12 +157,12 @@ where
 
     /// Reads a data blob with the given hash from storage.
     pub fn read_data_blob(&mut self, hash: DataBlobHash) -> Vec<u8> {
-        base_wit::read_data_blob(hash.0.into())
+        base_wit::read_data_blob(hash.into())
     }
 
     /// Asserts that a data blob with the given hash exists in storage.
     pub fn assert_data_blob_exists(&mut self, hash: DataBlobHash) {
-        base_wit::assert_data_blob_exists(hash.0.into())
+        base_wit::assert_data_blob_exists(hash.into())
     }
 }
 
@@ -172,17 +172,7 @@ where
 {
     /// Returns the authenticated signer for this execution, if there is one.
     pub fn authenticated_signer(&mut self) -> Option<AccountOwner> {
-        *self
-            .authenticated_signer
-            .get_or_insert_with(|| contract_wit::authenticated_signer().map(AccountOwner::from))
-    }
-
-    /// Returns the ID of the incoming message that is being handled, or [`None`] if not executing
-    /// an incoming message.
-    pub fn message_id(&mut self) -> Option<MessageId> {
-        *self
-            .message_id
-            .get_or_insert_with(|| contract_wit::get_message_id().map(MessageId::from))
+        contract_wit::authenticated_signer().map(AccountOwner::from)
     }
 
     /// Returns [`true`] if the incoming message was rejected from the original destination and is
@@ -193,12 +183,18 @@ where
             .get_or_insert_with(contract_wit::message_is_bouncing)
     }
 
+    /// Returns the chain ID where the incoming message originated from, or [`None`] if not executing
+    /// an incoming message.
+    pub fn message_origin_chain_id(&mut self) -> Option<ChainId> {
+        *self
+            .message_origin_chain_id
+            .get_or_insert_with(|| contract_wit::message_origin_chain_id().map(ChainId::from))
+    }
+
     /// Returns the authenticated caller ID, if the caller configured it and if the current context
     /// is executing a cross-application call.
     pub fn authenticated_caller_id(&mut self) -> Option<ApplicationId> {
-        *self
-            .authenticated_caller_id
-            .get_or_insert_with(|| contract_wit::authenticated_caller_id().map(ApplicationId::from))
+        contract_wit::authenticated_caller_id().map(ApplicationId::from)
     }
 
     /// Verifies that the current execution context authorizes operations on a given account.
@@ -376,6 +372,22 @@ where
             &converted_application_ids,
         );
         ApplicationId::from(application_id).with_abi::<Abi>()
+    }
+
+    /// Creates a new data blob and returns its hash.
+    pub fn create_data_blob(&mut self, bytes: Vec<u8>) -> DataBlobHash {
+        let hash = contract_wit::create_data_blob(&bytes);
+        hash.into()
+    }
+
+    /// Publishes a module with contract and service bytecode and returns the module ID.
+    pub fn publish_module(
+        &mut self,
+        contract: Bytecode,
+        service: Bytecode,
+        vm_runtime: VmRuntime,
+    ) -> ModuleId {
+        contract_wit::publish_module(&contract.into(), &service.into(), vm_runtime.into()).into()
     }
 
     /// Returns the round in which this block was validated.

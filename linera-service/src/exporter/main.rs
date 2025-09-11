@@ -9,9 +9,11 @@ use common::{ExporterCancellationSignal, ExporterError};
 use exporter_service::ExporterService;
 use futures::FutureExt;
 use linera_base::listen_for_shutdown_signals;
-use linera_client::config::BlockExporterConfig;
+#[cfg(with_metrics)]
+use linera_metrics::prometheus_server;
 use linera_rpc::NodeOptions;
 use linera_service::{
+    config::BlockExporterConfig,
     storage::{CommonStorageOptions, Runnable, StorageConfig},
     util,
 };
@@ -21,12 +23,21 @@ use tokio_util::sync::CancellationToken;
 
 mod common;
 mod exporter_service;
+#[cfg(with_metrics)]
+mod metrics;
 mod runloops;
 mod state;
 mod storage;
 
 #[cfg(test)]
 mod test_utils;
+#[cfg(test)]
+mod tests;
+
+#[cfg(not(feature = "metrics"))]
+const IS_WITH_METRICS: bool = false;
+#[cfg(feature = "metrics")]
+const IS_WITH_METRICS: bool = true;
 
 /// Options for running the linera block exporter.
 #[derive(clap::Parser, Debug, Clone)]
@@ -70,6 +81,10 @@ struct ExporterOptions {
     /// Number of times to retry connecting to a destination.
     #[arg(long, default_value = "10")]
     pub max_retries: u32,
+
+    /// Port for the metrics server.
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
 }
 
 struct ExporterContext {
@@ -88,6 +103,9 @@ impl Runnable for ExporterContext {
         let shutdown_notifier = CancellationToken::new();
         tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
 
+        #[cfg(with_metrics)]
+        prometheus_server::start_metrics(self.config.metrics_address(), shutdown_notifier.clone());
+
         let (sender, handle) = start_block_processor_task(
             storage,
             ExporterCancellationSignal::new(shutdown_notifier.clone()),
@@ -95,7 +113,7 @@ impl Runnable for ExporterContext {
             self.node_options,
             self.config.id,
             self.config.destination_config,
-        )?;
+        );
 
         let service = ExporterService::new(sender);
         service
@@ -124,7 +142,7 @@ impl ExporterOptions {
     fn run(&self) -> anyhow::Result<()> {
         let config_string = fs_err::read_to_string(&self.config_path)
             .expect("Unable to read the configuration file");
-        let config: BlockExporterConfig =
+        let mut config: BlockExporterConfig =
             toml::from_str(&config_string).expect("Invalid configuration file format");
 
         let node_options = NodeOptions {
@@ -133,6 +151,17 @@ impl ExporterOptions {
             retry_delay: self.retry_delay,
             max_retries: self.max_retries,
         };
+
+        if let Some(port) = self.metrics_port {
+            if IS_WITH_METRICS {
+                tracing::info!("overriding metrics port to {}", port);
+                config.metrics_port = port;
+            } else {
+                tracing::warn!(
+                    "Metrics are not enabled in this build, ignoring metrics port configuration."
+                );
+            }
+        }
 
         let context = ExporterContext::new(node_options, config);
 
@@ -146,7 +175,6 @@ impl ExporterOptions {
             let store_config = self
                 .storage_config
                 .add_common_storage_options(&self.common_storage_options)
-                .await
                 .unwrap();
             store_config.run_with_storage(None, context).boxed().await
         };

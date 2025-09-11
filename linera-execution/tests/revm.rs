@@ -17,9 +17,9 @@ use linera_execution::{
         solidity::{load_solidity_example, read_evm_u64_entry},
         SystemExecutionState,
     },
-    ExecutionRuntimeConfig, ExecutionRuntimeContext, Operation, OperationContext, Query,
-    QueryContext, QueryResponse, ResourceControlPolicy, ResourceController, ResourceTracker,
-    TransactionTracker,
+    ExecutionRuntimeConfig, ExecutionRuntimeContext, ExecutionStateActor, Operation,
+    OperationContext, Query, QueryContext, QueryResponse, ResourceControlPolicy,
+    ResourceController, ResourceTracker, TransactionTracker,
 };
 use linera_views::{context::Context as _, views::View};
 
@@ -60,16 +60,16 @@ async fn test_fuel_for_counter_revm_application() -> anyhow::Result<()> {
     let contract = EvmContractModule::Revm {
         module: module.clone(),
     };
-    view.context()
-        .extra()
-        .user_contracts()
-        .insert(app_id, contract.clone().into());
+    {
+        let pinned = view.context().extra().user_contracts().pin();
+        pinned.insert(app_id, contract.clone().into());
+    }
 
     let service = EvmServiceModule::Revm { module };
-    view.context()
-        .extra()
-        .user_services()
-        .insert(app_id, service.into());
+    {
+        let pinned = view.context().extra().user_services().pin();
+        pinned.insert(app_id, service.into());
+    }
 
     view.simulate_instantiation(
         contract.into(),
@@ -86,7 +86,6 @@ async fn test_fuel_for_counter_revm_application() -> anyhow::Result<()> {
         height: BlockHeight(0),
         round: Some(0),
         authenticated_signer: None,
-        authenticated_caller_id: None,
         timestamp: Default::default(),
     };
 
@@ -118,13 +117,9 @@ async fn test_fuel_for_counter_revm_application() -> anyhow::Result<()> {
             application_id: app_id,
             bytes,
         };
-        view.execute_operation(
-            operation_context,
-            operation,
-            &mut txn_tracker,
-            &mut controller,
-        )
-        .await?;
+        ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+            .execute_operation(operation_context, operation)
+            .await?;
 
         let query = get_valueCall {};
         let query = query.abi_encode();
@@ -184,16 +179,16 @@ async fn test_terminate_execute_operation_by_lack_of_fuel() -> anyhow::Result<()
     let contract = EvmContractModule::Revm {
         module: module.clone(),
     };
-    view.context()
-        .extra()
-        .user_contracts()
-        .insert(app_id, contract.clone().into());
+    {
+        let pinned = view.context().extra().user_contracts().pin();
+        pinned.insert(app_id, contract.clone().into());
+    }
 
     let service = EvmServiceModule::Revm { module };
-    view.context()
-        .extra()
-        .user_services()
-        .insert(app_id, service.into());
+    {
+        let pinned = view.context().extra().user_services().pin();
+        pinned.insert(app_id, service.into());
+    }
 
     view.simulate_instantiation(
         contract.into(),
@@ -210,7 +205,6 @@ async fn test_terminate_execute_operation_by_lack_of_fuel() -> anyhow::Result<()
         height: BlockHeight(0),
         round: Some(0),
         authenticated_signer: None,
-        authenticated_caller_id: None,
         timestamp: Default::default(),
     };
 
@@ -237,13 +231,8 @@ async fn test_terminate_execute_operation_by_lack_of_fuel() -> anyhow::Result<()
         application_id: app_id,
         bytes,
     };
-    let result = view
-        .execute_operation(
-            operation_context,
-            operation,
-            &mut txn_tracker,
-            &mut controller,
-        )
+    let result = ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(operation_context, operation)
         .await;
 
     assert!(result.is_err());
@@ -282,16 +271,16 @@ async fn test_terminate_query_by_lack_of_fuel() -> anyhow::Result<()> {
     let contract = EvmContractModule::Revm {
         module: module.clone(),
     };
-    view.context()
-        .extra()
-        .user_contracts()
-        .insert(app_id, contract.clone().into());
+    {
+        let pinned = view.context().extra().user_contracts().pin();
+        pinned.insert(app_id, contract.clone().into());
+    }
 
     let service = EvmServiceModule::Revm { module };
-    view.context()
-        .extra()
-        .user_services()
-        .insert(app_id, service.into());
+    {
+        let pinned = view.context().extra().user_services().pin();
+        pinned.insert(app_id, service.into());
+    }
 
     view.simulate_instantiation(
         contract.into(),
@@ -336,7 +325,7 @@ async fn test_basic_evm_features() -> anyhow::Result<()> {
     sol! {
         function failing_function();
         function test_precompile_sha256();
-    function check_contract_address(address evm_address);
+        function check_contract_address(address evm_address);
     }
 
     let constructor_argument = Vec::<u8>::new();
@@ -361,16 +350,16 @@ async fn test_basic_evm_features() -> anyhow::Result<()> {
     let contract = EvmContractModule::Revm {
         module: module.clone(),
     };
-    view.context()
-        .extra()
-        .user_contracts()
-        .insert(app_id, contract.clone().into());
+    {
+        let pinned = view.context().extra().user_contracts().pin();
+        pinned.insert(app_id, contract.clone().into());
+    }
 
     let service = EvmServiceModule::Revm { module };
-    view.context()
-        .extra()
-        .user_services()
-        .insert(app_id, service.into());
+    {
+        let pinned = view.context().extra().user_services().pin();
+        pinned.insert(app_id, service.into());
+    }
 
     view.simulate_instantiation(
         contract.into(),
@@ -387,7 +376,6 @@ async fn test_basic_evm_features() -> anyhow::Result<()> {
         height: BlockHeight(0),
         round: Some(0),
         authenticated_signer: None,
-        authenticated_caller_id: None,
         timestamp: Default::default(),
     };
 
@@ -416,13 +404,8 @@ async fn test_basic_evm_features() -> anyhow::Result<()> {
         application_id: app_id,
         bytes,
     };
-    let result = view
-        .execute_operation(
-            operation_context,
-            operation,
-            &mut txn_tracker,
-            &mut controller,
-        )
+    let result = ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(operation_context, operation)
         .await;
     assert!(result.is_err());
 

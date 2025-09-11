@@ -1,22 +1,21 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::field_reassign_with_default)]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     vec,
 };
 
 use assert_matches::assert_matches;
 use linera_base::{
-    crypto::CryptoHash,
+    crypto::{AccountPublicKey, CryptoHash},
     data_types::{
-        Amount, ApplicationDescription, ApplicationPermissions, Blob, BlockHeight,
+        Amount, ApplicationDescription, ApplicationPermissions, Blob, BlockHeight, Bytecode,
         CompressedBytecode, OracleResponse,
     },
     http,
-    identifiers::{Account, AccountOwner, ApplicationId, ModuleId},
+    identifiers::{Account, AccountOwner, ApplicationId, DataBlobHash, ModuleId},
     ownership::ChainOwnership,
     vm::VmRuntime,
 };
@@ -26,9 +25,9 @@ use linera_execution::{
         dummy_chain_description_with_ownership_and_balance, test_accounts_strategy, ExpectedCall,
         RegisterMockApplication, SystemExecutionState,
     },
-    BaseRuntime, ContractRuntime, ExecutionError, Message, MessageContext, Operation,
-    OperationContext, ResourceController, SystemExecutionStateView, TestExecutionRuntimeContext,
-    TransactionOutcome, TransactionTracker,
+    BaseRuntime, ContractRuntime, ExecutionError, ExecutionStateActor, Message, MessageContext,
+    Operation, OperationContext, ResourceController, SystemExecutionStateView,
+    TestExecutionRuntimeContext, TransactionOutcome, TransactionTracker,
 };
 use linera_views::context::MemoryContext;
 use test_case::{test_case, test_matrix};
@@ -92,28 +91,27 @@ async fn test_transfer_system_api(
         contract_blob_id,
         service_blob_id,
     ]);
-    view.execute_operation(context, operation, &mut tracker, &mut controller)
+    ExecutionStateActor::new(&mut view, &mut tracker, &mut controller)
+        .execute_operation(context, operation)
         .await?;
 
     let TransactionOutcome {
         outgoing_messages,
         oracle_responses,
-        next_message_index,
         ..
     } = tracker.into_outcome()?;
     assert_eq!(outgoing_messages.len(), 1);
     assert_eq!(oracle_responses.len(), 3);
-    assert_eq!(next_message_index, 1);
     assert!(matches!(outgoing_messages[0].message, Message::System(_)));
 
-    view.execute_message(
-        create_dummy_message_context(chain_id, None),
-        outgoing_messages[0].message.clone(),
-        None,
-        &mut TransactionTracker::new_replaying(Vec::new()),
-        &mut controller,
-    )
-    .await?;
+    let mut txn_tracker = TransactionTracker::new_replaying(Vec::new());
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_message(
+            create_dummy_message_context(chain_id, None),
+            outgoing_messages[0].message.clone(),
+            None,
+        )
+        .await?;
 
     recipient.verify_recipient(&view.system, amount).await?;
 
@@ -173,17 +171,13 @@ async fn test_unauthorized_transfer_system_api(
         application_id,
         bytes: vec![],
     };
-    let result = view
-        .execute_operation(
-            context,
-            operation,
-            &mut TransactionTracker::new_replaying_blobs([
-                app_desc_blob_id,
-                contract_blob_id,
-                service_blob_id,
-            ]),
-            &mut controller,
-        )
+    let mut txn_tracker = TransactionTracker::new_replaying_blobs([
+        app_desc_blob_id,
+        contract_blob_id,
+        service_blob_id,
+    ]);
+    let result = ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, operation)
         .await;
 
     assert_matches!(result, Err(ExecutionError::UnauthenticatedTransferOwner));
@@ -267,29 +261,25 @@ async fn test_claim_system_api(
         contract_blob_id,
         service_blob_id,
     ]);
-    claimer_view
-        .execute_operation(context, operation, &mut tracker, &mut controller)
+    ExecutionStateActor::new(&mut claimer_view, &mut tracker, &mut controller)
+        .execute_operation(context, operation)
         .await?;
 
     let TransactionOutcome {
         outgoing_messages,
         oracle_responses,
-        next_message_index,
         ..
     } = tracker.into_outcome()?;
     assert_eq!(outgoing_messages.len(), 1);
     assert_eq!(oracle_responses.len(), 3);
-    assert_eq!(next_message_index, 1);
     assert!(matches!(outgoing_messages[0].message, Message::System(_)));
 
     let mut tracker = TransactionTracker::new_replaying(Vec::new());
-    source_view
+    ExecutionStateActor::new(&mut source_view, &mut tracker, &mut controller)
         .execute_message(
             create_dummy_message_context(source_chain_id, None),
             outgoing_messages[0].message.clone(),
             None,
-            &mut tracker,
-            &mut controller,
         )
         .await?;
 
@@ -308,12 +298,10 @@ async fn test_claim_system_api(
     let TransactionOutcome {
         outgoing_messages,
         oracle_responses,
-        next_message_index,
         ..
     } = tracker.into_outcome()?;
     assert_eq!(outgoing_messages.len(), 1);
     assert!(oracle_responses.is_empty());
-    assert_eq!(next_message_index, 1);
     assert!(matches!(outgoing_messages[0].message, Message::System(_)));
 
     let mut tracker = TransactionTracker::new_replaying(Vec::new());
@@ -321,14 +309,8 @@ async fn test_claim_system_api(
         chain_id: claimer_chain_id,
         ..create_dummy_message_context(claimer_chain_id, None)
     };
-    claimer_view
-        .execute_message(
-            context,
-            outgoing_messages[0].message.clone(),
-            None,
-            &mut tracker,
-            &mut controller,
-        )
+    ExecutionStateActor::new(&mut claimer_view, &mut tracker, &mut controller)
+        .execute_message(context, outgoing_messages[0].message.clone(), None)
         .await?;
 
     recipient
@@ -407,8 +389,8 @@ async fn test_unauthorized_claims(
         contract_blob_id,
         service_blob_id,
     ]);
-    let result = claimer_view
-        .execute_operation(context, operation, &mut tracker, &mut controller)
+    let result = ExecutionStateActor::new(&mut claimer_view, &mut tracker, &mut controller)
+        .execute_operation(context, operation)
         .await;
 
     assert_matches!(result, Err(ExecutionError::UnauthenticatedClaimOwner));
@@ -457,18 +439,15 @@ async fn test_read_chain_balance_system_api(chain_balance: Amount) {
         bytes: vec![],
     };
 
-    view.execute_operation(
-        context,
-        operation,
-        &mut TransactionTracker::new_replaying_blobs([
-            app_desc_blob_id,
-            contract_blob_id,
-            service_blob_id,
-        ]),
-        &mut controller,
-    )
-    .await
-    .unwrap();
+    let mut txn_tracker = TransactionTracker::new_replaying_blobs([
+        app_desc_blob_id,
+        contract_blob_id,
+        service_blob_id,
+    ]);
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await
+        .unwrap();
 }
 
 /// Tests the contract system API to read a single account balance.
@@ -504,14 +483,11 @@ async fn test_read_owner_balance_system_api(
         bytes: vec![],
     };
 
-    view.execute_operation(
-        context,
-        operation,
-        &mut TransactionTracker::new_replaying_blobs(blobs),
-        &mut controller,
-    )
-    .await
-    .unwrap();
+    let mut txn_tracker = TransactionTracker::new_replaying_blobs(blobs);
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await
+        .unwrap();
 }
 
 /// Tests if reading the balance of a missing account returns zero.
@@ -541,14 +517,11 @@ async fn test_read_owner_balance_returns_zero_for_missing_accounts(missing_accou
         bytes: vec![],
     };
 
-    view.execute_operation(
-        context,
-        operation,
-        &mut TransactionTracker::new_replaying_blobs(blobs),
-        &mut controller,
-    )
-    .await
-    .unwrap();
+    let mut txn_tracker = TransactionTracker::new_replaying_blobs(blobs);
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await
+        .unwrap();
 }
 
 /// Tests the contract system API to read all account balances.
@@ -585,14 +558,11 @@ async fn test_read_owner_balances_system_api(
         bytes: vec![],
     };
 
-    view.execute_operation(
-        context,
-        operation,
-        &mut TransactionTracker::new_replaying_blobs(blobs),
-        &mut controller,
-    )
-    .await
-    .unwrap();
+    let mut txn_tracker = TransactionTracker::new_replaying_blobs(blobs);
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await
+        .unwrap();
 }
 
 /// Tests the contract system API to read all account owners.
@@ -629,14 +599,11 @@ async fn test_read_balance_owners_system_api(
         bytes: vec![],
     };
 
-    view.execute_operation(
-        context,
-        operation,
-        &mut TransactionTracker::new_replaying_blobs(blobs),
-        &mut controller,
-    )
-    .await
-    .unwrap();
+    let mut txn_tracker = TransactionTracker::new_replaying_blobs(blobs);
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await
+        .unwrap();
 }
 
 /// A test helper representing a transfer endpoint.
@@ -678,7 +645,7 @@ impl TransferTestEndpoint {
     /// sender as an application.
     fn sender_application_contract_blob() -> Blob {
         Blob::new_contract_bytecode(CompressedBytecode {
-            compressed_bytes: b"sender contract".to_vec(),
+            compressed_bytes: Arc::new(b"sender contract".to_vec().into_boxed_slice()),
         })
     }
 
@@ -686,7 +653,7 @@ impl TransferTestEndpoint {
     /// as an application.
     fn sender_application_service_blob() -> Blob {
         Blob::new_service_bytecode(CompressedBytecode {
-            compressed_bytes: b"sender service".to_vec(),
+            compressed_bytes: Arc::new(b"sender service".to_vec().into_boxed_slice()),
         })
     }
 
@@ -863,18 +830,15 @@ async fn test_query_service(authorized_apps: Option<Vec<()>>) -> Result<(), Exec
         bytes: vec![],
     };
 
-    view.execute_operation(
-        context,
-        operation,
-        &mut TransactionTracker::new_replaying(vec![
-            OracleResponse::Blob(app_desc_blob_id),
-            OracleResponse::Blob(contract_blob_id),
-            OracleResponse::Blob(service_blob_id),
-            OracleResponse::Service(vec![]),
-        ]),
-        &mut controller,
-    )
-    .await?;
+    let mut txn_tracker = TransactionTracker::new_replaying(vec![
+        OracleResponse::Blob(app_desc_blob_id),
+        OracleResponse::Blob(contract_blob_id),
+        OracleResponse::Blob(service_blob_id),
+        OracleResponse::Service(vec![]),
+    ]);
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await?;
 
     Ok(())
 }
@@ -935,18 +899,195 @@ async fn test_perform_http_request(authorized_apps: Option<Vec<()>>) -> Result<(
         bytes: vec![],
     };
 
-    view.execute_operation(
-        context,
-        operation,
-        &mut TransactionTracker::new_replaying(vec![
-            OracleResponse::Blob(app_desc_blob_id),
-            OracleResponse::Blob(contract_blob_id),
-            OracleResponse::Blob(service_blob_id),
-            OracleResponse::Http(http::Response::ok(vec![])),
-        ]),
-        &mut controller,
-    )
-    .await?;
+    let mut txn_tracker = TransactionTracker::new_replaying(vec![
+        OracleResponse::Blob(app_desc_blob_id),
+        OracleResponse::Blob(contract_blob_id),
+        OracleResponse::Blob(service_blob_id),
+        OracleResponse::Http(http::Response::ok(vec![])),
+    ]);
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await?;
 
+    Ok(())
+}
+
+/// Tests creating multiple data blobs in a single transaction.
+#[test_log::test(tokio::test)]
+async fn test_create_multiple_data_blobs() -> anyhow::Result<()> {
+    let description = dummy_chain_description(0);
+    let chain_id = description.id();
+    let mut view = SystemExecutionState::new(description).into_view().await;
+    let (application_id, application, blobs) = view.register_mock_application(0).await.unwrap();
+
+    let test_data1 = b"First blob data";
+    let test_data2 = &[];
+    let expected_blob1 = Blob::new_data(test_data1.to_vec());
+    let expected_blob2 = Blob::new_data(test_data2.to_vec());
+    let expected_blob_hash1 = DataBlobHash(expected_blob1.id().hash);
+    let expected_blob_hash2 = DataBlobHash(expected_blob2.id().hash);
+
+    application.expect_call(ExpectedCall::execute_operation(
+        move |runtime, _operation| {
+            let blob_hash1 = runtime.create_data_blob(test_data1.to_vec()).unwrap();
+            let blob_hash2 = runtime.create_data_blob(test_data2.to_vec()).unwrap();
+
+            assert_eq!(blob_hash1, expected_blob_hash1);
+            assert_eq!(blob_hash2, expected_blob_hash2);
+            assert_ne!(blob_hash1, blob_hash2); // Should be different blobs
+
+            Ok(vec![])
+        },
+    ));
+    application.expect_call(ExpectedCall::default_finalize());
+
+    let context = create_dummy_operation_context(chain_id);
+    let mut controller = ResourceController::default();
+    let operation = Operation::User {
+        application_id,
+        bytes: vec![],
+    };
+
+    let mut tracker = TransactionTracker::new_replaying_blobs(blobs);
+    let result = ExecutionStateActor::new(&mut view, &mut tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await;
+
+    assert!(result.is_ok());
+
+    // Verify both blobs were created and tracked
+    let created_blobs = tracker.created_blobs();
+    assert!(created_blobs.contains_key(&expected_blob1.id()));
+    assert!(created_blobs.contains_key(&expected_blob2.id()));
+
+    let created_blob1 = created_blobs.get(&expected_blob1.id()).unwrap();
+    let created_blob2 = created_blobs.get(&expected_blob2.id()).unwrap();
+    assert_eq!(created_blob1.bytes(), test_data1);
+    assert_eq!(created_blob2.bytes(), test_data2);
+
+    Ok(())
+}
+
+/// Tests that publish_module with different bytecode creates different modules.
+#[test_log::test(tokio::test)]
+async fn test_publish_module_different_bytecode() -> anyhow::Result<()> {
+    let description = dummy_chain_description(0);
+    let chain_id = description.id();
+    let mut view = SystemExecutionState::new(description).into_view().await;
+    let (application_id, application, blobs) = view.register_mock_application(0).await.unwrap();
+
+    let contract_bytes1 = b"contract bytecode 1".to_vec();
+    let service_bytes1 = b"service bytecode 1".to_vec();
+    let contract_bytes2 = b"contract bytecode 2".to_vec();
+    let service_bytes2 = b"service bytecode 2".to_vec();
+
+    let contract_bytecode1 = Bytecode::new(contract_bytes1);
+    let service_bytecode1 = Bytecode::new(service_bytes1);
+    let contract_bytecode2 = Bytecode::new(contract_bytes2);
+    let service_bytecode2 = Bytecode::new(service_bytes2);
+    let vm_runtime = VmRuntime::Wasm;
+
+    application.expect_call(ExpectedCall::execute_operation(
+        move |runtime, _operation| {
+            let module_id1 = runtime
+                .publish_module(contract_bytecode1, service_bytecode1, vm_runtime)
+                .unwrap();
+            let module_id2 = runtime
+                .publish_module(contract_bytecode2, service_bytecode2, vm_runtime)
+                .unwrap();
+
+            // Different bytecode should produce different module IDs
+            assert_ne!(module_id1, module_id2);
+            Ok(vec![])
+        },
+    ));
+    application.expect_call(ExpectedCall::default_finalize());
+
+    let context = create_dummy_operation_context(chain_id);
+    let mut controller = ResourceController::default();
+    let operation = Operation::User {
+        application_id,
+        bytes: vec![],
+    };
+
+    let mut tracker = TransactionTracker::new_replaying_blobs(blobs);
+    let result = ExecutionStateActor::new(&mut view, &mut tracker, &mut controller)
+        .execute_operation(context, operation)
+        .await;
+
+    assert!(result.is_ok());
+
+    // Should have created 4 blobs total (2 contract + 2 service for WASM)
+    let created_blobs = tracker.created_blobs();
+    assert_eq!(created_blobs.len(), 4);
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test)]
+async fn test_callee_api_calls() -> anyhow::Result<()> {
+    let (state, chain_id) = SystemExecutionState::dummy_chain_state(0);
+    let mut view = state.into_view().await;
+
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
+
+    let owner = AccountOwner::from(AccountPublicKey::test_key(0));
+    let dummy_operation = vec![1];
+
+    caller_application.expect_call({
+        let dummy_operation = dummy_operation.clone();
+        ExpectedCall::execute_operation(move |runtime, operation| {
+            assert_eq!(operation, dummy_operation);
+
+            // Call the target application with authentication.
+            let response =
+                runtime.try_call_application(/* authenticated */ true, target_id, vec![])?;
+            assert!(response.is_empty());
+
+            // Call the target application without authentication.
+            let response =
+                runtime.try_call_application(/* authenticated */ false, target_id, vec![])?;
+            assert!(response.is_empty());
+
+            Ok(vec![])
+        })
+    });
+
+    target_application.expect_call(ExpectedCall::execute_operation(move |runtime, argument| {
+        assert!(argument.is_empty());
+        assert_eq!(runtime.authenticated_signer().unwrap(), Some(owner));
+        assert_eq!(runtime.authenticated_caller_id().unwrap(), Some(caller_id));
+        Ok(vec![])
+    }));
+    target_application.expect_call(ExpectedCall::execute_operation(move |runtime, argument| {
+        assert!(argument.is_empty());
+        assert_eq!(runtime.authenticated_signer().unwrap(), None);
+        assert_eq!(runtime.authenticated_caller_id().unwrap(), None);
+        Ok(vec![])
+    }));
+
+    target_application.expect_call(ExpectedCall::default_finalize());
+    caller_application.expect_call(ExpectedCall::default_finalize());
+
+    let context = OperationContext {
+        authenticated_signer: Some(owner),
+        ..create_dummy_operation_context(chain_id)
+    };
+    let mut controller = ResourceController::default();
+    let mut txn_tracker =
+        TransactionTracker::new_replaying_blobs(caller_blobs.iter().chain(&target_blobs));
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(
+            context,
+            Operation::User {
+                application_id: caller_id,
+                bytes: dummy_operation.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let txn_outcome = txn_tracker.into_outcome().unwrap();
+    assert!(txn_outcome.outgoing_messages.is_empty());
     Ok(())
 }

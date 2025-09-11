@@ -3,14 +3,11 @@
 
 //! This module defines the storage abstractions for individual chains and certificates.
 
-#![deny(clippy::large_futures)]
-
 mod db_storage;
 
 use std::{collections::BTreeMap, ops::RangeInclusive, sync::Arc};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use itertools::Itertools;
 use linera_base::{
     crypto::CryptoHash,
@@ -27,8 +24,8 @@ use linera_chain::{
 };
 use linera_execution::{
     committee::Committee, system::EPOCH_STREAM_NAME, BlobState, ExecutionError,
-    ExecutionRuntimeConfig, ExecutionRuntimeContext, UserContractCode, UserServiceCode,
-    WasmRuntime,
+    ExecutionRuntimeConfig, ExecutionRuntimeContext, TransactionTracker, UserContractCode,
+    UserServiceCode, WasmRuntime,
 };
 #[cfg(with_revm)]
 use linera_execution::{
@@ -141,6 +138,17 @@ pub trait Storage: Sized {
         &self,
         hashes: I,
     ) -> Result<Vec<Option<ConfirmedBlockCertificate>>, ViewError>;
+
+    /// Reads certificates by hashes.
+    ///
+    /// Returns a vector of tuples where the first element is a lite certificate
+    /// and the second element is confirmed block.
+    ///
+    /// It does not check if all hashes all returned.
+    async fn read_certificates_raw<I: IntoIterator<Item = CryptoHash> + Send>(
+        &self,
+        hashes: I,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ViewError>;
 
     /// Reads the event with the given ID.
     async fn read_event(&self, id: EventId) -> Result<Option<Vec<u8>>, ViewError>;
@@ -262,13 +270,21 @@ pub trait Storage: Sized {
     async fn load_contract(
         &self,
         application_description: &ApplicationDescription,
+        txn_tracker: &TransactionTracker,
     ) -> Result<UserContractCode, ExecutionError> {
         let contract_bytecode_blob_id = application_description.contract_bytecode_blob_id();
-        let contract_blob = self.read_blob(contract_bytecode_blob_id).await?.ok_or(
-            ExecutionError::BlobsNotFound(vec![contract_bytecode_blob_id]),
-        )?;
+        let content = match txn_tracker.get_blob_content(&contract_bytecode_blob_id) {
+            Some(content) => content.clone(),
+            None => self
+                .read_blob(contract_bytecode_blob_id)
+                .await?
+                .ok_or(ExecutionError::BlobsNotFound(vec![
+                    contract_bytecode_blob_id,
+                ]))?
+                .into_content(),
+        };
         let compressed_contract_bytecode = CompressedBytecode {
-            compressed_bytes: contract_blob.into_bytes().to_vec(),
+            compressed_bytes: content.into_arc_bytes(),
         };
         #[cfg_attr(not(any(with_wasm_runtime, with_revm)), allow(unused_variables))]
         let contract_bytecode =
@@ -301,8 +317,7 @@ pub trait Storage: Sized {
                 cfg_if::cfg_if! {
                     if #[cfg(with_revm)] {
                         let evm_runtime = EvmRuntime::Revm;
-                        Ok(EvmContractModule::new(contract_bytecode, evm_runtime)
-                           .await?
+                        Ok(EvmContractModule::new(contract_bytecode, evm_runtime)?
                            .into())
                     } else {
                         panic!(
@@ -321,13 +336,21 @@ pub trait Storage: Sized {
     async fn load_service(
         &self,
         application_description: &ApplicationDescription,
+        txn_tracker: &TransactionTracker,
     ) -> Result<UserServiceCode, ExecutionError> {
         let service_bytecode_blob_id = application_description.service_bytecode_blob_id();
-        let service_blob = self.read_blob(service_bytecode_blob_id).await?.ok_or(
-            ExecutionError::BlobsNotFound(vec![service_bytecode_blob_id]),
-        )?;
+        let content = match txn_tracker.get_blob_content(&service_bytecode_blob_id) {
+            Some(content) => content.clone(),
+            None => self
+                .read_blob(service_bytecode_blob_id)
+                .await?
+                .ok_or(ExecutionError::BlobsNotFound(vec![
+                    service_bytecode_blob_id,
+                ]))?
+                .into_content(),
+        };
         let compressed_service_bytecode = CompressedBytecode {
-            compressed_bytes: service_blob.into_bytes().to_vec(),
+            compressed_bytes: content.into_arc_bytes(),
         };
         #[cfg_attr(not(any(with_wasm_runtime, with_revm)), allow(unused_variables))]
         let service_bytecode = linera_base::task::Blocking::<linera_base::task::NoInput, _>::spawn(
@@ -359,8 +382,7 @@ pub trait Storage: Sized {
                 cfg_if::cfg_if! {
                     if #[cfg(with_revm)] {
                         let evm_runtime = EvmRuntime::Revm;
-                        Ok(EvmServiceModule::new(service_bytecode, evm_runtime)
-                           .await?
+                        Ok(EvmServiceModule::new(service_bytecode, evm_runtime)?
                            .into())
                     } else {
                         panic!(
@@ -413,8 +435,8 @@ pub struct ChainRuntimeContext<S> {
     storage: S,
     chain_id: ChainId,
     execution_runtime_config: ExecutionRuntimeConfig,
-    user_contracts: Arc<DashMap<ApplicationId, UserContractCode>>,
-    user_services: Arc<DashMap<ApplicationId, UserServiceCode>>,
+    user_contracts: Arc<papaya::HashMap<ApplicationId, UserContractCode>>,
+    user_services: Arc<papaya::HashMap<ApplicationId, UserServiceCode>>,
 }
 
 #[cfg_attr(not(web), async_trait)]
@@ -431,37 +453,41 @@ where
         self.execution_runtime_config
     }
 
-    fn user_contracts(&self) -> &Arc<DashMap<ApplicationId, UserContractCode>> {
+    fn user_contracts(&self) -> &Arc<papaya::HashMap<ApplicationId, UserContractCode>> {
         &self.user_contracts
     }
 
-    fn user_services(&self) -> &Arc<DashMap<ApplicationId, UserServiceCode>> {
+    fn user_services(&self) -> &Arc<papaya::HashMap<ApplicationId, UserServiceCode>> {
         &self.user_services
     }
 
     async fn get_user_contract(
         &self,
         description: &ApplicationDescription,
+        txn_tracker: &TransactionTracker,
     ) -> Result<UserContractCode, ExecutionError> {
         let application_id = description.into();
-        if let Some(contract) = self.user_contracts.get(&application_id) {
+        let pinned = self.user_contracts.pin_owned();
+        if let Some(contract) = pinned.get(&application_id) {
             return Ok(contract.clone());
         }
-        let contract = self.storage.load_contract(description).await?;
-        self.user_contracts.insert(application_id, contract.clone());
+        let contract = self.storage.load_contract(description, txn_tracker).await?;
+        pinned.insert(application_id, contract.clone());
         Ok(contract)
     }
 
     async fn get_user_service(
         &self,
         description: &ApplicationDescription,
+        txn_tracker: &TransactionTracker,
     ) -> Result<UserServiceCode, ExecutionError> {
         let application_id = description.into();
-        if let Some(service) = self.user_services.get(&application_id) {
+        let pinned = self.user_services.pin_owned();
+        if let Some(service) = pinned.get(&application_id) {
             return Ok(service.clone());
         }
-        let service = self.storage.load_service(description).await?;
-        self.user_services.insert(application_id, service.clone());
+        let service = self.storage.load_service(description, txn_tracker).await?;
+        pinned.insert(application_id, service.clone());
         Ok(service)
     }
 
