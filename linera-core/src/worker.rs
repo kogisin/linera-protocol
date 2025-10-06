@@ -36,11 +36,14 @@ use tokio::sync::{mpsc, oneshot, OwnedRwLockReadGuard};
 use tracing::{error, instrument, trace, warn};
 
 use crate::{
-    chain_worker::{ChainWorkerActor, ChainWorkerConfig, ChainWorkerRequest, DeliveryNotifier},
+    chain_worker::{
+        BlockOutcome, ChainWorkerActor, ChainWorkerConfig, ChainWorkerRequest, DeliveryNotifier,
+    },
     data_types::{ChainInfoQuery, ChainInfoResponse, CrossChainRequest},
     join_set_ext::{JoinSet, JoinSetExt},
     notifier::Notifier,
     value_cache::ValueCache,
+    CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES,
 };
 
 #[cfg(test)]
@@ -170,18 +173,19 @@ pub enum WorkerError {
     #[error("Block was not signed by an authorized owner")]
     InvalidOwner,
 
-    #[error("Operations in the block are not authenticated by the proper signer: {0}")]
+    #[error("Operations in the block are not authenticated by the proper owner: {0}")]
     InvalidSigner(AccountOwner),
 
     // Chaining
     #[error(
-        "Was expecting block height {expected_block_height} but found {found_block_height} instead"
+        "Chain is expecting a next block at height {expected_block_height} but the given block \
+        is at height {found_block_height} instead"
     )]
     UnexpectedBlockHeight {
         expected_block_height: BlockHeight,
         found_block_height: BlockHeight,
     },
-    #[error("Unexpected epoch {epoch:}: chain {chain_id:} is at {chain_epoch:}")]
+    #[error("Unexpected epoch {epoch}: chain {chain_id} is at {chain_epoch}")]
     InvalidEpoch {
         chain_id: ChainId,
         chain_epoch: Epoch,
@@ -340,13 +344,15 @@ where
         nickname: String,
         key_pair: Option<ValidatorSecretKey>,
         storage: StorageClient,
+        block_cache_size: usize,
+        execution_state_cache_size: usize,
     ) -> Self {
         WorkerState {
             nickname,
             storage,
             chain_worker_config: ChainWorkerConfig::default().with_key_pair(key_pair),
-            block_cache: Arc::new(ValueCache::default()),
-            execution_state_cache: Arc::new(ValueCache::default()),
+            block_cache: Arc::new(ValueCache::new(block_cache_size)),
+            execution_state_cache: Arc::new(ValueCache::new(execution_state_cache_size)),
             tracked_chains: None,
             delivery_notifiers: Arc::default(),
             chain_worker_tasks: Arc::default(),
@@ -359,13 +365,15 @@ where
         nickname: String,
         storage: StorageClient,
         tracked_chains: Arc<RwLock<HashSet<ChainId>>>,
+        block_cache_size: usize,
+        execution_state_cache_size: usize,
     ) -> Self {
         WorkerState {
             nickname,
             storage,
             chain_worker_config: ChainWorkerConfig::default(),
-            block_cache: Arc::new(ValueCache::default()),
-            execution_state_cache: Arc::new(ValueCache::default()),
+            block_cache: Arc::new(ValueCache::new(block_cache_size)),
+            execution_state_cache: Arc::new(ValueCache::new(execution_state_cache_size)),
             tracked_chains: Some(tracked_chains),
             delivery_notifiers: Arc::default(),
             chain_worker_tasks: Arc::default(),
@@ -408,6 +416,35 @@ where
     #[instrument(level = "trace", skip(self))]
     pub fn with_chain_worker_ttl(mut self, chain_worker_ttl: Duration) -> Self {
         self.chain_worker_config.ttl = chain_worker_ttl;
+        self
+    }
+
+    /// Returns an instance with the specified sender chain worker TTL.
+    ///
+    /// Idle sender chain workers free their memory after that duration without requests.
+    #[instrument(level = "trace", skip(self))]
+    pub fn with_sender_chain_worker_ttl(mut self, sender_chain_worker_ttl: Duration) -> Self {
+        self.chain_worker_config.sender_chain_ttl = sender_chain_worker_ttl;
+        self
+    }
+
+    /// Returns an instance with the specified maximum size for received_log entries.
+    ///
+    /// Sizes below `CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES` should be avoided.
+    #[instrument(level = "trace", skip(self))]
+    pub fn with_chain_info_max_received_log_entries(
+        mut self,
+        chain_info_max_received_log_entries: usize,
+    ) -> Self {
+        if chain_info_max_received_log_entries < CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES {
+            warn!(
+                "The value set for the maximum size of received_log entries \
+                   may not be compatible with the latest clients: {} instead of {}",
+                chain_info_max_received_log_entries, CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES
+            );
+        }
+        self.chain_worker_config.chain_info_max_received_log_entries =
+            chain_info_max_received_log_entries;
         self
     }
 
@@ -458,7 +495,7 @@ where
                         .ok_or(WorkerError::InvalidLiteCertificate)?,
                 ))
             }
-            _ => return Err(WorkerError::InvalidLiteCertificate),
+            _ => Err(WorkerError::InvalidLiteCertificate),
         }
     }
 }
@@ -551,7 +588,11 @@ where
     }
 
     /// Executes a [`Query`] for an application's state on a specific chain.
-    #[instrument(level = "trace", skip(self, chain_id, query))]
+    #[instrument(
+        level = "trace",
+        target = "telemetry_only",
+        skip(self, chain_id, query)
+    )]
     pub async fn query_application(
         &self,
         chain_id: ChainId,
@@ -563,7 +604,11 @@ where
         .await
     }
 
-    #[instrument(level = "trace", skip(self, chain_id, application_id))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self, chain_id, application_id), fields(
+        nickname = %self.nickname,
+        chain_id = %chain_id,
+        application_id = %application_id
+    ))]
     pub async fn describe_application(
         &self,
         chain_id: ChainId,
@@ -581,13 +626,19 @@ where
     /// Processes a confirmed block (aka a commit).
     #[instrument(
         level = "trace",
-        skip(self, certificate, notify_when_messages_are_delivered)
+        target = "telemetry_only",
+        skip(self, certificate, notify_when_messages_are_delivered),
+        fields(
+            nickname = %self.nickname,
+            chain_id = %certificate.block().header.chain_id,
+            block_height = %certificate.block().header.height
+        )
     )]
     async fn process_confirmed_block(
         &self,
         certificate: ConfirmedBlockCertificate,
         notify_when_messages_are_delivered: Option<oneshot::Sender<()>>,
-    ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
+    ) -> Result<(ChainInfoResponse, NetworkActions, BlockOutcome), WorkerError> {
         let chain_id = certificate.block().header.chain_id;
         self.query_chain_worker(chain_id, move |callback| {
             ChainWorkerRequest::ProcessConfirmedBlock {
@@ -600,11 +651,15 @@ where
     }
 
     /// Processes a validated block issued from a multi-owner chain.
-    #[instrument(level = "trace", skip(self, certificate))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self, certificate), fields(
+        nickname = %self.nickname,
+        chain_id = %certificate.block().header.chain_id,
+        block_height = %certificate.block().header.height
+    ))]
     async fn process_validated_block(
         &self,
         certificate: ValidatedBlockCertificate,
-    ) -> Result<(ChainInfoResponse, NetworkActions, bool), WorkerError> {
+    ) -> Result<(ChainInfoResponse, NetworkActions, BlockOutcome), WorkerError> {
         let chain_id = certificate.block().header.chain_id;
         self.query_chain_worker(chain_id, move |callback| {
             ChainWorkerRequest::ProcessValidatedBlock {
@@ -616,7 +671,11 @@ where
     }
 
     /// Processes a leader timeout issued from a multi-owner chain.
-    #[instrument(level = "trace", skip(self, certificate))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self, certificate), fields(
+        nickname = %self.nickname,
+        chain_id = %certificate.value().chain_id(),
+        height = %certificate.value().height()
+    ))]
     async fn process_timeout(
         &self,
         certificate: TimeoutCertificate,
@@ -631,7 +690,12 @@ where
         .await
     }
 
-    #[instrument(level = "trace", skip(self, origin, recipient, bundles))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self, origin, recipient, bundles), fields(
+        nickname = %self.nickname,
+        origin = %origin,
+        recipient = %recipient,
+        num_bundles = %bundles.len()
+    ))]
     async fn process_cross_chain_update(
         &self,
         origin: ChainId,
@@ -649,7 +713,11 @@ where
     }
 
     /// Returns a stored [`ConfirmedBlockCertificate`] for a chain's block.
-    #[instrument(level = "trace", skip(self, chain_id, height))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self, chain_id, height), fields(
+        nickname = %self.nickname,
+        chain_id = %chain_id,
+        height = %height
+    ))]
     #[cfg(with_testing)]
     pub async fn read_certificate(
         &self,
@@ -667,7 +735,10 @@ where
     ///
     /// The returned view holds a lock on the chain state, which prevents the worker from changing
     /// the state of that chain.
-    #[instrument(level = "trace", skip(self))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self), fields(
+        nickname = %self.nickname,
+        chain_id = %chain_id
+    ))]
     pub async fn chain_state_view(
         &self,
         chain_id: ChainId,
@@ -678,7 +749,10 @@ where
         .await
     }
 
-    #[instrument(level = "trace", skip(self, request_builder))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self, request_builder), fields(
+        nickname = %self.nickname,
+        chain_id = %chain_id
+    ))]
     /// Sends a request to the [`ChainWorker`] for a [`ChainId`] and waits for the `Response`.
     async fn query_chain_worker<Response>(
         &self,
@@ -701,7 +775,10 @@ where
 
     /// Retrieves an endpoint to a [`ChainWorkerActor`] from the cache, creating one and adding it
     /// to the cache if needed.
-    #[instrument(level = "trace", skip(self))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self), fields(
+        nickname = %self.nickname,
+        chain_id = %chain_id
+    ))]
     async fn get_chain_worker_endpoint(
         &self,
         chain_id: ChainId,
@@ -726,6 +803,11 @@ where
                 .or_default()
                 .clone();
 
+            let is_tracked = self
+                .tracked_chains
+                .as_ref()
+                .is_some_and(|tracked_chains| tracked_chains.read().unwrap().contains(&chain_id));
+
             let actor_task = ChainWorkerActor::run(
                 self.chain_worker_config.clone(),
                 self.storage.clone(),
@@ -735,6 +817,7 @@ where
                 delivery_notifier,
                 chain_id,
                 receiver,
+                is_tracked,
             );
 
             self.chain_worker_tasks
@@ -750,7 +833,10 @@ where
     /// and add it to the cache if needed.
     ///
     /// Returns [`None`] if the cache is full and no candidate for eviction was found.
-    #[instrument(level = "trace", skip(self))]
+    #[instrument(level = "trace", target = "telemetry_only", skip(self), fields(
+        nickname = %self.nickname,
+        chain_id = %chain_id
+    ))]
     #[expect(clippy::type_complexity)]
     fn try_get_chain_worker_endpoint(
         &self,
@@ -834,37 +920,25 @@ where
     ) -> Result<(ChainInfoResponse, NetworkActions), WorkerError> {
         trace!("{} <-- {:?}", self.nickname, certificate);
         #[cfg(with_metrics)]
-        let metrics_data = if self
-            .chain_state_view(certificate.block().header.chain_id)
-            .await?
-            .tip_state
-            .get()
-            .next_block_height
-            == certificate.block().header.height
-        {
-            Some((
-                certificate.inner().to_log_str(),
-                certificate.round.type_name(),
-                certificate.round.number(),
-                certificate.block().body.transactions.len() as u64,
-                certificate
-                    .signatures()
-                    .iter()
-                    .map(|(validator_name, _)| validator_name.to_string())
-                    .collect::<Vec<_>>(),
-            ))
-        } else {
-            // Block already processed or will only be preprocessed, no metrics to report.
-            None
-        };
+        let metrics_data = (
+            certificate.inner().to_log_str(),
+            certificate.round.type_name(),
+            certificate.round.number(),
+            certificate.block().body.transactions.len() as u64,
+            certificate
+                .signatures()
+                .iter()
+                .map(|(validator_name, _)| validator_name.to_string())
+                .collect::<Vec<_>>(),
+        );
 
-        let result = self
+        let (info, actions, _outcome) = self
             .process_confirmed_block(certificate, notify_when_messages_are_delivered)
             .await?;
 
         #[cfg(with_metrics)]
         {
-            if let Some(metrics_data) = metrics_data {
+            if matches!(_outcome, BlockOutcome::Processed) {
                 let (
                     certificate_log_str,
                     round_type,
@@ -889,7 +963,7 @@ where
                 }
             }
         }
-        Ok(result)
+        Ok((info, actions))
     }
 
     /// Processes a validated block certificate.
@@ -909,10 +983,10 @@ where
         #[cfg(with_metrics)]
         let cert_str = certificate.inner().to_log_str();
 
-        let (info, actions, _duplicated) = self.process_validated_block(certificate).await?;
+        let (info, actions, _outcome) = self.process_validated_block(certificate).await?;
         #[cfg(with_metrics)]
         {
-            if !_duplicated {
+            if matches!(_outcome, BlockOutcome::Processed) {
                 metrics::NUM_ROUNDS_IN_CERTIFICATE
                     .with_label_values(&[cert_str, round.type_name()])
                     .observe(round.number() as f64);
@@ -1063,6 +1137,11 @@ where
     }
 
     /// Updates the received certificate trackers to at least the given values.
+    #[instrument(target = "telemetry_only", skip_all, fields(
+        nickname = %self.nickname,
+        chain_id = %chain_id,
+        num_trackers = %new_trackers.len()
+    ))]
     pub async fn update_received_certificate_trackers(
         &self,
         chain_id: ChainId,

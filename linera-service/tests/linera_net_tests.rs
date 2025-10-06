@@ -6,7 +6,6 @@
     feature = "dynamodb",
     feature = "scylladb",
     feature = "storage-service",
-    feature = "kubernetes",
     feature = "remote-net"
 ))]
 
@@ -29,6 +28,7 @@ use linera_base::{
     time::{Duration, Instant},
     vm::VmRuntime,
 };
+//use OnClientDrop::*;
 use linera_core::worker::{Notification, Reason};
 use linera_sdk::{
     abis::fungible::NativeFungibleTokenAbi,
@@ -40,19 +40,14 @@ use linera_sdk::{
     feature = "storage-service",
 ))]
 use linera_service::cli_wrappers::local_net::{Database, LocalNetConfig};
-#[cfg(feature = "remote-net")]
-use linera_service::cli_wrappers::remote_net::RemoteNetTestingConfig;
 #[cfg(any(
     feature = "dynamodb",
     feature = "scylladb",
     feature = "storage-service",
-    feature = "kubernetes",
 ))]
 use linera_service::cli_wrappers::Network;
-#[cfg(feature = "kubernetes")]
-use linera_service::cli_wrappers::{
-    docker::BuildArg, local_kubernetes_net::SharedLocalKubernetesNetTestingConfig,
-};
+#[cfg(feature = "remote-net")]
+use linera_service::cli_wrappers::{remote_net::RemoteNetTestingConfig, OnClientDrop::*};
 use linera_service::{
     cli_wrappers::{
         local_net::{get_node_port, ProcessInbox},
@@ -446,8 +441,7 @@ impl AmmApp {
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
     use alloy_sol_types::{sol, SolCall, SolValue};
@@ -527,8 +521,7 @@ async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()>
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> Result<()> {
     use alloy_primitives::U256;
@@ -637,8 +630,7 @@ async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_event(config: impl LineraNetConfig) -> Result<()> {
     use alloy_primitives::{Bytes, Log, U256};
@@ -750,8 +742,7 @@ async fn test_evm_event(config: impl LineraNetConfig) -> Result<()> {
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
     use alloy_sol_types::{sol, SolValue};
@@ -849,8 +840,7 @@ async fn test_wasm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
     use alloy_sol_types::{sol, SolCall, SolValue};
@@ -958,8 +948,7 @@ async fn test_evm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> R
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_call_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
     use alloy_sol_types::{sol, SolCall, SolValue};
@@ -1053,8 +1042,7 @@ async fn test_evm_call_wasm_end_to_end_counter(config: impl LineraNetConfig) -> 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
     use alloy_primitives::B256;
@@ -1145,7 +1133,16 @@ async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfi
     let mutation = EvmQuery::Mutation(mutation);
     application1.run_json_query(mutation).await?;
 
-    node_service2.process_inbox(&chain2).await?;
+    assert!(
+        eventually(|| async {
+            !node_service2
+                .process_inbox(&chain2)
+                .await
+                .unwrap()
+                .is_empty()
+        })
+        .await
+    );
 
     // Third: Checking the values after the move
 
@@ -1170,8 +1167,7 @@ async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfi
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_empty_instantiate(config: impl LineraNetConfig) -> Result<()> {
     use alloy_sol_types::{sol, SolCall};
@@ -1246,8 +1242,7 @@ async fn test_evm_empty_instantiate(config: impl LineraNetConfig) -> Result<()> 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConfig) -> Result<()> {
     use alloy_primitives::B256;
@@ -1345,7 +1340,16 @@ async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConf
 
     // Third: process the inbox on chain2
 
-    node_service2.process_inbox(&chain2).await?;
+    assert!(
+        eventually(|| async {
+            !node_service2
+                .process_inbox(&chain2)
+                .await
+                .unwrap()
+                .is_empty()
+        })
+        .await
+    );
 
     // Fourth: getting the value
 
@@ -1368,8 +1372,7 @@ async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConf
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_msg_sender(config: impl LineraNetConfig) -> Result<()> {
     use alloy_primitives::Address;
@@ -1462,8 +1465,7 @@ async fn test_evm_msg_sender(config: impl LineraNetConfig) -> Result<()> {
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
     use alloy_primitives::{B256, U256};
@@ -1486,7 +1488,7 @@ async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
         function test_read_data_blob(bytes32 hash, uint32 len);
         function test_assert_data_blob_exists(bytes32 hash);
         function test_chain_ownership();
-        function test_authenticated_signer_caller_id();
+        function test_authenticated_owner_caller_id();
         function test_chain_balance(uint256 expected_balance);
         function test_read_owners();
     }
@@ -1543,9 +1545,9 @@ async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
     let query = EvmQuery::Query(query.abi_encode());
     application.run_json_query(query).await?;
 
-    // Checking authenticated signer/caller_id
+    // Checking authenticated owner/caller_id
 
-    let mutation = test_authenticated_signer_caller_idCall {};
+    let mutation = test_authenticated_owner_caller_idCall {};
     let mutation = EvmQuery::Mutation(mutation.abi_encode());
     application.run_json_query(mutation).await?;
 
@@ -1577,8 +1579,7 @@ async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(all(feature = "rocksdb", feature = "scylladb"), test_case(LocalNetConfig::new_test(Database::DualRocksDbScyllaDb, Network::Grpc) ; "dualrocksdbscylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
     use counter::CounterAbi;
@@ -1618,7 +1619,7 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
     let balance2 = node_service.balance(&account_chain).await?;
     assert_eq!(balance1, balance2);
 
-    let mutation = format!("increment(field0: {increment})");
+    let mutation = format!("increment(value: {increment})");
     application.mutate(mutation).await?;
     let balance3 = node_service.balance(&account_chain).await?;
     assert!(balance3 < balance2);
@@ -1638,8 +1639,7 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
     use alloy_primitives::{B256, U256};
@@ -1648,6 +1648,7 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
     use linera_execution::test_utils::solidity::{get_evm_contract_path, read_evm_u256_entry};
     use linera_sdk::abis::evm::EvmAbi;
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    let num_operations = 500;
     tracing::info!("Starting test {}", test_name!());
 
     let (mut net, client1) = config.instantiate().await?;
@@ -1716,18 +1717,26 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
         to: address2,
         value: transfer1,
     };
-    let mutation = EvmQuery::Mutation(mutation.abi_encode());
-    application1.run_json_query(mutation).await?;
+    let mutations = vec![mutation.abi_encode(); num_operations];
+    let query = EvmQuery::Mutations(mutations);
+    let time_start = Instant::now();
+    application1.run_json_query(query).await?;
+    let average_time = (time_start.elapsed().as_millis() as f64) / (num_operations as f64);
+    tracing::info!("Average runtime for transfer={average_time}");
 
     let query = balanceOfCall { account: address1 };
     let query = EvmQuery::Query(query.abi_encode());
     let result = application1.run_json_query(query).await?;
-    assert_eq!(read_evm_u256_entry(result), the_supply - transfer1);
+    let mut repeated_transfer1 = U256::ZERO;
+    for _ in 0..num_operations {
+        repeated_transfer1 += transfer1;
+    }
+    assert_eq!(read_evm_u256_entry(result), the_supply - repeated_transfer1);
 
     let query = balanceOfCall { account: address2 };
     let query = EvmQuery::Query(query.abi_encode());
     let result = application1.run_json_query(query).await?;
-    assert_eq!(read_evm_u256_entry(result), transfer1);
+    assert_eq!(read_evm_u256_entry(result), repeated_transfer1);
 
     // Transferring to another chain and checking the balances.
 
@@ -1742,7 +1751,16 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
     let mutation = EvmQuery::Mutation(mutation.abi_encode());
     application1.run_json_query(mutation).await?;
 
-    node_service2.process_inbox(&chain2).await?;
+    assert!(
+        eventually(|| async {
+            !node_service2
+                .process_inbox(&chain2)
+                .await
+                .unwrap()
+                .is_empty()
+        })
+        .await
+    );
 
     // Checking the balances on both chains.
 
@@ -1751,7 +1769,7 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
     let result = application1.run_json_query(query.clone()).await?;
     assert_eq!(
         read_evm_u256_entry(result),
-        the_supply - transfer1 - transfer2
+        the_supply - repeated_transfer1 - transfer2
     );
 
     let query = balanceOfCall { account: address2 };
@@ -1772,8 +1790,7 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_counter_no_graphql(config: impl LineraNetConfig) -> Result<()> {
     use counter_no_graphql::{CounterNoGraphQlAbi, CounterRequest};
@@ -1830,8 +1847,7 @@ async fn test_wasm_end_to_end_counter_no_graphql(config: impl LineraNetConfig) -
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfig) -> Result<()> {
     use counter::CounterAbi;
@@ -1867,7 +1883,7 @@ async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfi
     let counter_value: u64 = application.query_json("value").await?;
     assert_eq!(counter_value, original_counter_value);
 
-    let mutation = format!("increment(field0: {increment})");
+    let mutation = format!("increment(value: {increment})");
     application.mutate(mutation).await?;
 
     let counter_value: u64 = application.query_json("value").await?;
@@ -1884,8 +1900,7 @@ async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfi
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig) -> Result<()> {
     use linera_base::time::Instant;
@@ -2010,8 +2025,7 @@ async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig)
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
@@ -2030,7 +2044,7 @@ async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) 
     let client3 = net.make_client().await;
     client3.wallet_init(None).await?;
 
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
     // Generate keys for all clients.
     let owner1 = client1.keygen().await?;
@@ -2098,19 +2112,21 @@ async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) 
     app2.assert_balances(expected_balances).await;
     app3.assert_balances(expected_balances).await;
 
-    // Approving a transfer
+    // Approving a transfer.
     app1.approve(&owner1, &owner2, Amount::from_tokens(93))
         .await;
 
     app1.assert_allowance(&owner1, &owner2, Amount::from_tokens(93))
         .await;
 
-    // Call process inbox in order to synchronize from validators
-    node_service2.process_inbox(&chain2).await?;
-    app2.assert_allowance(&owner1, &owner2, Amount::from_tokens(93))
-        .await;
+    assert!(
+        eventually(|| async {
+            app2.get_allowance(&owner1, &owner2).await == Amount::from_tokens(93)
+        })
+        .await
+    );
 
-    // Doing the transfer from
+    // Doing the transfer from owner 1.
     app2.transfer_from(
         &owner1,
         &owner2,
@@ -2190,10 +2206,8 @@ async fn publish_and_create_native_fungible(
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "native-fungible" ; "native_scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "fungible" ; "aws_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "native-fungible" ; "native_aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build), "fungible" ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build), "native-fungible" ; "native_kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None), "fungible" ; "remote_net_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None), "native-fungible" ; "native_remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains), "fungible" ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains), "native-fungible" ; "native_remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_fungible(
     config: impl LineraNetConfig,
@@ -2268,7 +2282,10 @@ async fn test_wasm_end_to_end_fungible(
     app1.assert_entries(expected_balances).await;
     app1.assert_keys([account_owner1, account_owner2]).await;
 
-    assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service2.process_inbox(&chain2).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Fungible didn't exist on chain2 initially but now it does and we can talk to it.
     let app2 = NativeFungibleApp(node_service2.make_application(&chain2, &application_id)?);
@@ -2297,8 +2314,14 @@ async fn test_wasm_end_to_end_fungible(
     .await;
 
     // Make sure that the cross-chain communication happens fast enough.
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
-    assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
+    assert!(
+        eventually(|| async { node_service2.process_inbox(&chain2).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Checking the final value
     let expected_balances = [
@@ -2334,10 +2357,8 @@ async fn test_wasm_end_to_end_fungible(
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "native-fungible" ; "native_scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "fungible" ; "aws_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "native-fungible" ; "native_aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build), "fungible" ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build), "native-fungible" ; "native_kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None), "fungible" ; "remote_net_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None), "native-fungible" ; "native_remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains), "fungible" ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains), "native-fungible" ; "native_remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_same_wallet_fungible(
     config: impl LineraNetConfig,
@@ -2356,7 +2377,7 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
     // Get a chain different than the default
     let chain2 = client1
         .load_wallet()?
-        .chain_ids()
+        .owned_chain_ids()
         .into_iter()
         .find(|chain_id| chain_id != &chain1)
         .expect("Failed to obtain a chain ID from the wallet");
@@ -2403,7 +2424,10 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
     )
     .await;
 
-    assert_eq!(node_service.process_inbox(&chain2).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service.process_inbox(&chain2).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Checking the final values on chain1 and chain2.
     let expected_balances = [
@@ -2432,8 +2456,7 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Result<()> {
     use non_fungible::{NftOutput, NonFungibleTokenAbi};
@@ -2523,7 +2546,10 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     )
     .await;
 
-    assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service2.process_inbox(&chain2).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Checking the NFT is removed from chain1
     assert!(app1.get_nft(&nft1_id).await.is_err());
@@ -2557,8 +2583,14 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     .await;
 
     // Make sure that the cross-chain communication happens fast enough.
-    assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service2.process_inbox(&chain2).await.unwrap().len() == 1 })
+            .await
+    );
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Checking the NFT is removed from chain2
     assert!(app2.get_nft(&nft1_id).await.is_err());
@@ -2584,7 +2616,10 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     .await;
 
     // The transfer is received by chain2 and needs to be processed.
-    assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service2.process_inbox(&chain2).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Checking the NFT is removed from chain1
     assert!(app1.get_nft(&nft1_id).await.is_err());
@@ -2652,7 +2687,10 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     .await;
 
     // The transfer from chain2 has to be received from chain1.
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Checking the NFT is removed from chain2
     assert!(app2.get_nft(&nft2_id).await.is_err());
@@ -2682,8 +2720,14 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
     .await;
 
     // Make sure that the cross-chain communication happens fast enough.
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
-    assert_eq!(node_service2.process_inbox(&chain2).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
+    assert!(
+        eventually(|| async { node_service2.process_inbox(&chain2).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Checking the final state
 
@@ -2711,8 +2755,7 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
@@ -2799,7 +2842,10 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
         .await;
 
     // Make sure that the transfer is received before we try to pledge.
-    node_service2.process_inbox(&chain2).await?;
+    assert!(
+        eventually(|| async { node_service2.process_inbox(&chain2).await.unwrap().len() == 1 })
+            .await
+    );
 
     let app_crowd2 = node_service2.make_application(&chain2, &application_id_crowd)?;
 
@@ -2812,7 +2858,10 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
     app_crowd2.mutate(mutation).await?;
 
     // Make sure that the pledge is processed fast enough by client1.
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
 
     // Ending the campaign.
     app_crowd1.mutate("collect").await?;
@@ -2834,8 +2883,7 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
@@ -3006,11 +3054,14 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
     // The orders are sent on chain_a / chain_b. First they are
     // rerouted to the admin chain for processing. This leads
     // to order being sent to chain_a / chain_b.
+    node_service_admin.sync(&chain_admin).await?;
     assert_eq!(
         node_service_admin.process_inbox(&chain_admin).await?.len(),
         1
     );
+    node_service_a.sync(&chain_a).await?;
     assert_eq!(node_service_a.process_inbox(&chain_a).await?.len(), 1);
+    node_service_b.sync(&chain_b).await?;
     assert_eq!(node_service_b.process_inbox(&chain_b).await?.len(), 1);
 
     // Now reading the order_ids
@@ -3038,12 +3089,15 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
             .await;
     }
 
+    node_service_admin.sync(&chain_admin).await?;
     // Same logic as for the insertion of orders.
     assert_eq!(
         node_service_admin.process_inbox(&chain_admin).await?.len(),
         1
     );
+    node_service_a.sync(&chain_a).await?;
     assert_eq!(node_service_a.process_inbox(&chain_a).await?.len(), 1);
+    node_service_b.sync(&chain_b).await?;
     assert_eq!(node_service_b.process_inbox(&chain_b).await?.len(), 1);
 
     // Check balances
@@ -3080,8 +3134,7 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(all(feature = "rocksdb", feature = "scylladb"), test_case(LocalNetConfig::new_test(Database::DualRocksDbScyllaDb, Network::Grpc) ; "dualrocksdbscylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
@@ -3213,8 +3266,14 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         )
         .await;
 
-    assert_eq!(node_service0.process_inbox(&chain0).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert!(
+        eventually(|| async { node_service0.process_inbox(&chain0).await.unwrap().len() == 1 })
+            .await
+    );
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
 
     let app_fungible0_0 = FungibleApp(node_service0.make_application(&chain0, &token0)?);
     let app_fungible1_0 = FungibleApp(node_service0.make_application(&chain0, &token1)?);
@@ -3310,7 +3369,17 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .add_liquidity(owner0, Amount::from_tokens(100), Amount::from_tokens(100))
         .await?;
 
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
+    assert!(
+        eventually(|| async {
+            node_service_amm
+                .process_inbox(&chain_amm)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
 
     // Ownership of the used owner_amm_chain's tokens should be with the AMM now
     app_fungible0_amm
@@ -3369,8 +3438,21 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .add_liquidity(owner1, Amount::from_tokens(120), Amount::from_tokens(100))
         .await?;
 
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert!(
+        eventually(|| async {
+            node_service_amm
+                .process_inbox(&chain_amm)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
 
     app_fungible0_amm
         .assert_balances([
@@ -3429,8 +3511,21 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .expect_err("Swapping from the AMM chain should fail");
 
     app_amm1.swap(owner1, 0, Amount::from_tokens(50)).await?;
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert!(
+        eventually(|| async {
+            node_service_amm
+                .process_inbox(&chain_amm)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
 
     app_fungible0_amm
         .assert_balances([
@@ -3498,8 +3593,17 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     app_amm1
         .remove_liquidity(owner1, 0, Amount::from_tokens(500))
         .await?;
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 0);
+    assert!(
+        eventually(|| async {
+            node_service_amm
+                .process_inbox(&chain_amm)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
 
     // Balances will be unaltered
     app_fungible0_amm
@@ -3554,8 +3658,21 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .await;
 
     app_amm1.swap(owner1, 1, Amount::from_tokens(40)).await?;
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert!(
+        eventually(|| async {
+            node_service_amm
+                .process_inbox(&chain_amm)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
 
     app_fungible0_amm
         .assert_balances([
@@ -3611,8 +3728,21 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
     app_amm1
         .remove_liquidity(owner1, 0, Amount::from_tokens(100))
         .await?;
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service1.process_inbox(&chain1).await?.len(), 1);
+    assert!(
+        eventually(|| async {
+            node_service_amm
+                .process_inbox(&chain_amm)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
+    assert!(
+        eventually(|| async { node_service1.process_inbox(&chain1).await.unwrap().len() == 1 })
+            .await
+    );
 
     app_fungible0_amm
         .assert_balances([
@@ -3666,8 +3796,21 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .await;
 
     app_amm0.swap(owner0, 1, Amount::from_tokens(25)).await?;
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service0.process_inbox(&chain0).await?.len(), 1);
+    assert!(
+        eventually(|| async {
+            node_service_amm
+                .process_inbox(&chain_amm)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
+    assert!(
+        eventually(|| async { node_service0.process_inbox(&chain0).await.unwrap().len() == 1 })
+            .await
+    );
 
     app_fungible0_amm
         .assert_balances([
@@ -3721,8 +3864,21 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
         .await;
 
     app_amm0.remove_all_added_liquidity(owner0).await?;
-    assert_eq!(node_service_amm.process_inbox(&chain_amm).await?.len(), 1);
-    assert_eq!(node_service0.process_inbox(&chain0).await?.len(), 1);
+    assert!(
+        eventually(|| async {
+            node_service_amm
+                .process_inbox(&chain_amm)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await
+    );
+    assert!(
+        eventually(|| async { node_service0.process_inbox(&chain0).await.unwrap().len() == 1 })
+            .await
+    );
 
     app_fungible0_amm
         .assert_balances([
@@ -3788,8 +3944,7 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
@@ -3865,11 +4020,11 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
     )
     .await;
 
-    // The chain2 must process the received transfer
-    node_service.process_inbox(&chain2).await?;
+    // The chain2 must receive the transfer
+    let app2 = FungibleApp(node_service.make_application(&chain2, &application_id)?);
+    assert!(eventually(|| async { app2.get_amount(&owner).await == Amount::from_tokens(8) }).await);
 
     // Send 4 tokens back.
-    let app2 = FungibleApp(node_service.make_application(&chain2, &application_id)?);
     app2.transfer(
         &owner,
         Amount::from_tokens(4),
@@ -3898,8 +4053,7 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_multiple_wallets(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -3912,7 +4066,7 @@ async fn test_end_to_end_multiple_wallets(config: impl LineraNetConfig) -> Resul
     client2.wallet_init(None).await?;
 
     // Get some chain owned by Client 1.
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
     // Generate a key for Client 2.
     let owner2 = client2.keygen().await?;
@@ -3944,8 +4098,7 @@ async fn test_end_to_end_multiple_wallets(config: impl LineraNetConfig) -> Resul
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -3957,7 +4110,7 @@ async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) ->
     let client2 = net.make_client().await;
     client2.wallet_init(None).await?;
 
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
     // Generate keys for both clients.
     let owner1 = client1.keygen().await?;
@@ -4013,8 +4166,7 @@ async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) ->
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Result<()> {
     use linera_base::crypto::AccountPublicKey;
@@ -4055,8 +4207,7 @@ async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Resul
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -4071,7 +4222,7 @@ async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConf
     let client3 = net.make_client().await;
     client3.wallet_init(None).await?;
 
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
     // Generate keys for client 2.
     let owner2 = client2.keygen().await?;
@@ -4115,8 +4266,7 @@ async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConf
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_publish_data_blob_in_cli(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -4147,8 +4297,7 @@ async fn test_end_to_end_publish_data_blob_in_cli(config: impl LineraNetConfig) 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -4167,7 +4316,7 @@ async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
     let owner2 = client2.keygen().await?;
 
     let mut faucet_service = client1
-        .run_faucet(None, chain1, Amount::from_tokens(2))
+        .run_faucet(None, Some(chain1), Amount::from_tokens(2))
         .await?;
     let faucet = faucet_service.instance();
     let chain2 = faucet.claim(&owner2).await?.id();
@@ -4228,8 +4377,7 @@ async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 #[ignore = "This test takes a long time to run"]
 async fn test_end_to_end_faucet_with_long_chains(config: impl LineraNetConfig) -> Result<()> {
@@ -4252,7 +4400,7 @@ async fn test_end_to_end_faucet_with_long_chains(config: impl LineraNetConfig) -
 
     let new_chain_init_balance = Amount::ONE;
     let mut faucet_service = faucet_client
-        .run_faucet(None, faucet_chain, new_chain_init_balance)
+        .run_faucet(None, Some(faucet_chain), new_chain_init_balance)
         .await?;
     let faucet = faucet_service.instance();
 
@@ -4309,8 +4457,7 @@ async fn test_end_to_end_faucet_with_long_chains(config: impl LineraNetConfig) -
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_faucet_batch_processing(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -4323,7 +4470,7 @@ async fn test_end_to_end_faucet_batch_processing(config: impl LineraNetConfig) -
 
     // Start faucet with small batch size for testing
     let mut faucet_service = client1
-        .run_faucet(None, chain1, Amount::from_tokens(2))
+        .run_faucet(None, Some(chain1), Amount::from_tokens(2))
         .await?;
     let faucet = faucet_service.instance();
 
@@ -4397,8 +4544,7 @@ async fn test_end_to_end_faucet_batch_processing(config: impl LineraNetConfig) -
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_fungible_client_benchmark(config: impl LineraNetConfig) -> Result<()> {
     use linera_base::command::CommandExt;
@@ -4412,7 +4558,7 @@ async fn test_end_to_end_fungible_client_benchmark(config: impl LineraNetConfig)
 
     let chain1 = client1.load_wallet()?.default_chain().unwrap();
 
-    let mut faucet_service = client1.run_faucet(None, chain1, Amount::ONE).await?;
+    let mut faucet_service = client1.run_faucet(None, Some(chain1), Amount::ONE).await?;
     let faucet = faucet_service.instance();
 
     let path =
@@ -4443,8 +4589,7 @@ async fn test_end_to_end_fungible_client_benchmark(config: impl LineraNetConfig)
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_listen_for_new_rounds(config: impl LineraNetConfig) -> Result<()> {
     use std::{
@@ -4461,7 +4606,7 @@ async fn test_end_to_end_listen_for_new_rounds(config: impl LineraNetConfig) -> 
     let (mut net, client1) = config.instantiate().await?;
     let client2 = net.make_client().await;
     client2.wallet_init(None).await?;
-    let chain1 = *client1.load_wallet()?.chain_ids().first().unwrap();
+    let chain1 = *client1.load_wallet()?.owned_chain_ids().first().unwrap();
 
     // Open a chain owned by both clients, with only single-leader rounds.
     let owner1 = client1.keygen().await?;
@@ -4558,8 +4703,7 @@ async fn test_end_to_end_listen_for_new_rounds(config: impl LineraNetConfig) -> 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "kubernetes", test_case(SharedLocalKubernetesNetTestingConfig::new(Network::Grpc, BuildArg::Build) ; "kubernetes_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(None) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -4580,10 +4724,8 @@ async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Res
         .run_node_service(port2, ProcessInbox::Automatic)
         .await?;
 
-    // Make sure all incoming messages are processed, and get both chains' heights.
     let mut next_height1 = {
         let node_service1 = client1.run_node_service(port1, ProcessInbox::Skip).await?;
-        node_service1.process_inbox(&chain_id1).await?;
         let mut chain = node_service1
             .query_node(&format!(
                 "query {{ chain(chainId: \"{chain_id1}\") {{ tipState {{ nextBlockHeight }} }} }}"
@@ -4592,7 +4734,6 @@ async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Res
         serde_json::from_value::<BlockHeight>(chain["chain"]["tipState"]["nextBlockHeight"].take())?
     };
     let mut next_height2 = {
-        node_service2.process_inbox(&chain_id2).await?;
         let mut chain = node_service2
             .query_node(&format!(
                 "query {{ chain(chainId: \"{chain_id2}\") {{ tipState {{ nextBlockHeight }} }} }}"

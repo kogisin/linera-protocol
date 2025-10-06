@@ -6,7 +6,7 @@ use std::{borrow::Cow, num::NonZeroU16, path::PathBuf};
 use chrono::{DateTime, Utc};
 use linera_base::{
     crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
-    data_types::{Amount, Epoch},
+    data_types::{Amount, BlockHeight, Epoch},
     identifiers::{Account, AccountOwner, ApplicationId, ChainId, ModuleId, StreamId},
     time::Duration,
     vm::VmRuntime,
@@ -138,7 +138,7 @@ pub enum BenchmarkCommand {
         processes: usize,
 
         /// The faucet (which implicitly defines the network)
-        #[arg(long)]
+        #[arg(long, env = "LINERA_FAUCET_URL")]
         faucet: String,
 
         /// If specified, a directory with a random name will be created in this directory, and the
@@ -227,6 +227,13 @@ pub enum ClientCommand {
         balance: Amount,
     },
 
+    /// Display who owns the chain, and how the owners work together proposing blocks.
+    ShowOwnership {
+        /// The ID of the chain whose owners will be changed.
+        #[clap(long)]
+        chain_id: Option<ChainId>,
+    },
+
     /// Change who owns the chain, and how the owners work together proposing blocks.
     ///
     /// Specify the complete set of new owners, by public key. Existing owners that are
@@ -269,6 +276,9 @@ pub enum ClientCommand {
         /// Chain ID (must be one of our chains)
         chain_id: ChainId,
     },
+
+    /// Print out the network description.
+    ShowNetworkDescription,
 
     /// Read the current native-token balance of the given account directly from the local
     /// state.
@@ -347,6 +357,13 @@ pub enum ClientCommand {
         /// The public address of the validator to synchronize.
         address: String,
 
+        /// The chains to synchronize, or the default chain if empty.
+        #[arg(long, num_args = 0..)]
+        chains: Vec<ChainId>,
+    },
+
+    /// Synchronizes all validators with the local state of chains.
+    SyncAllValidators {
         /// The chains to synchronize, or the default chain if empty.
         #[arg(long, num_args = 0..)]
         chains: Vec<ChainId>,
@@ -732,6 +749,19 @@ pub enum ClientCommand {
         /// The port on which to run the server
         #[arg(long)]
         port: NonZeroU16,
+
+        /// Milliseconds to sleep between batches during background certificate synchronization.
+        #[arg(
+            long = "sync-sleep-ms",
+            default_value = "500",
+            env = "LINERA_SYNC_SLEEP_MS"
+        )]
+        sync_sleep_ms: u64,
+
+        /// The port to expose metrics on.
+        #[cfg(with_metrics)]
+        #[arg(long)]
+        metrics_port: NonZeroU16,
     },
 
     /// Run a GraphQL service that exposes a faucet where users can claim tokens.
@@ -764,7 +794,7 @@ pub enum ClientCommand {
 
         /// Path to the persistent storage file for faucet mappings.
         #[arg(long)]
-        storage_path: Option<PathBuf>,
+        storage_path: PathBuf,
 
         /// Maximum number of operations to include in a single block (default: 100).
         #[arg(long, default_value = "100")]
@@ -917,6 +947,10 @@ pub enum ClientCommand {
     #[command(subcommand)]
     Wallet(WalletCommand),
 
+    /// Show the information about a chain.
+    #[command(subcommand)]
+    Chain(ChainCommand),
+
     /// Manage Linera projects.
     #[command(subcommand)]
     Project(ProjectCommand),
@@ -957,10 +991,12 @@ impl ClientCommand {
             ClientCommand::Transfer { .. }
             | ClientCommand::OpenChain { .. }
             | ClientCommand::OpenMultiOwnerChain { .. }
+            | ClientCommand::ShowOwnership { .. }
             | ClientCommand::ChangeOwnership { .. }
             | ClientCommand::SetPreferredOwner { .. }
             | ClientCommand::ChangeApplicationPermissions { .. }
             | ClientCommand::CloseChain { .. }
+            | ClientCommand::ShowNetworkDescription
             | ClientCommand::LocalBalance { .. }
             | ClientCommand::QueryBalance { .. }
             | ClientCommand::SyncBalance { .. }
@@ -969,6 +1005,7 @@ impl ClientCommand {
             | ClientCommand::QueryValidator { .. }
             | ClientCommand::QueryValidators { .. }
             | ClientCommand::SyncValidator { .. }
+            | ClientCommand::SyncAllValidators { .. }
             | ClientCommand::SetValidator { .. }
             | ClientCommand::RemoveValidator { .. }
             | ClientCommand::ResourceControlPolicy { .. }
@@ -983,6 +1020,7 @@ impl ClientCommand {
             | ClientCommand::Keygen
             | ClientCommand::Assign { .. }
             | ClientCommand::Wallet { .. }
+            | ClientCommand::Chain { .. }
             | ClientCommand::RetryPendingBlock { .. } => "client".into(),
             ClientCommand::Benchmark(BenchmarkCommand::Single { .. }) => "single-benchmark".into(),
             ClientCommand::Benchmark(BenchmarkCommand::Multi { .. }) => "multi-benchmark".into(),
@@ -1047,6 +1085,10 @@ pub enum NetCommand {
         #[arg(long, default_value = "1")]
         validators: usize,
 
+        /// The number of proxies in the local test network.
+        #[arg(long, default_value = "1")]
+        proxies: usize,
+
         /// The number of shards per validator in the local test network.
         #[arg(long, default_value = "1")]
         shards: usize,
@@ -1102,13 +1144,12 @@ pub enum NetCommand {
         external_protocol: String,
 
         /// If present, a faucet is started using the chain provided by --faucet-chain, or
-        /// `ChainId::root(1)` if not provided, as root 0 is usually the admin chain.
+        /// the first non-admin chain if not provided.
         #[arg(long, default_value = "false")]
         with_faucet: bool,
 
         /// When using --with-faucet, this specifies the chain on which the faucet will be started.
-        /// The chain is specified by its root number (0 for the admin chain, 1 for the first
-        /// non-admin initial chain, etc).
+        /// If this is `n`, the `n`-th non-admin chain (lexicographically) in the wallet is selected.
         #[arg(long)]
         faucet_chain: Option<u32>,
 
@@ -1124,6 +1165,10 @@ pub enum NetCommand {
         #[arg(long, default_value = "false")]
         with_block_exporter: bool,
 
+        /// The number of block exporters to start.
+        #[arg(long, default_value = "1")]
+        num_block_exporters: usize,
+
         /// The address of the block exporter.
         #[arg(long, default_value = "localhost")]
         exporter_address: String,
@@ -1131,6 +1176,16 @@ pub enum NetCommand {
         /// The port on which to run the block exporter.
         #[arg(long, default_value = "8081")]
         exporter_port: NonZeroU16,
+
+        /// The name of the indexer docker image to use.
+        #[cfg(feature = "kubernetes")]
+        #[arg(long, default_value = "linera-indexer:latest")]
+        indexer_image_name: String,
+
+        /// The name of the explorer docker image to use.
+        #[cfg(feature = "kubernetes")]
+        #[arg(long, default_value = "linera-explorer:latest")]
+        explorer_image_name: String,
 
         /// Use dual store (rocksdb and scylladb) instead of just scylladb. This is exclusive for
         /// kubernetes deployments.
@@ -1165,11 +1220,13 @@ pub enum WalletCommand {
     Init {
         /// The path to the genesis configuration for a Linera deployment. Either this or `--faucet`
         /// must be specified.
+        ///
+        /// Overrides `--faucet` if provided.
         #[arg(long = "genesis")]
         genesis_config_path: Option<PathBuf>,
 
         /// The address of a faucet.
-        #[arg(long = "faucet")]
+        #[arg(long, env = "LINERA_FAUCET_URL")]
         faucet: Option<String>,
 
         /// Force this wallet to generate keys using a PRNG and a given seed. USE FOR
@@ -1181,7 +1238,7 @@ pub enum WalletCommand {
     /// Request a new chain from a faucet and add it to the wallet.
     RequestChain {
         /// The address of a faucet.
-        #[arg(long)]
+        #[arg(long, env = "LINERA_FAUCET_URL")]
         faucet: String,
 
         /// Whether this chain should become the default chain.
@@ -1204,6 +1261,25 @@ pub enum WalletCommand {
 
     /// Forgets the specified chain, including the associated key pair.
     ForgetChain { chain_id: ChainId },
+}
+
+#[derive(Clone, clap::Subcommand)]
+pub enum ChainCommand {
+    /// Show the contents of a block.
+    ShowBlock {
+        /// The height of the block.
+        height: BlockHeight,
+        /// The chain to show the block (if not specified, the default chain from the
+        /// wallet is used).
+        chain_id: Option<ChainId>,
+    },
+
+    /// Show the chain description of a chain.
+    ShowChainDescription {
+        /// The chain ID to show (if not specified, the default chain from the wallet is
+        /// used).
+        chain_id: Option<ChainId>,
+    },
 }
 
 #[derive(Clone, clap::Parser)]

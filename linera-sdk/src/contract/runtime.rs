@@ -170,9 +170,9 @@ impl<Application> ContractRuntime<Application>
 where
     Application: Contract,
 {
-    /// Returns the authenticated signer for this execution, if there is one.
-    pub fn authenticated_signer(&mut self) -> Option<AccountOwner> {
-        contract_wit::authenticated_signer().map(AccountOwner::from)
+    /// Returns the authenticated owner for this execution, if there is one.
+    pub fn authenticated_owner(&mut self) -> Option<AccountOwner> {
+        contract_wit::authenticated_owner().map(AccountOwner::from)
     }
 
     /// Returns [`true`] if the incoming message was rejected from the original destination and is
@@ -203,7 +203,7 @@ where
         owner: AccountOwner,
     ) -> Result<(), AccountPermissionError> {
         ensure!(
-            self.authenticated_signer() == Some(owner)
+            self.authenticated_owner() == Some(owner)
                 || self.authenticated_caller_id().map(AccountOwner::from) == Some(owner),
             AccountPermissionError::NotPermitted(owner)
         );
@@ -305,9 +305,9 @@ where
     pub fn query_service<A: ServiceAbi + Send>(
         &mut self,
         application_id: ApplicationId<A>,
-        query: A::Query,
+        query: &A::Query,
     ) -> A::QueryResponse {
-        let query = serde_json::to_vec(&query).expect("Failed to serialize service query");
+        let query = serde_json::to_vec(query).expect("Failed to serialize service query");
         let response = contract_wit::query_service(application_id.forget_abi().into(), &query);
         serde_json::from_slice(&response).expect("Failed to deserialize service response")
     }
@@ -375,8 +375,8 @@ where
     }
 
     /// Creates a new data blob and returns its hash.
-    pub fn create_data_blob(&mut self, bytes: Vec<u8>) -> DataBlobHash {
-        let hash = contract_wit::create_data_blob(&bytes);
+    pub fn create_data_blob(&mut self, bytes: &[u8]) -> DataBlobHash {
+        let hash = contract_wit::create_data_blob(bytes);
         hash.into()
     }
 
@@ -430,7 +430,7 @@ where
         self
     }
 
-    /// Forwards the authenticated signer with the message.
+    /// Forwards the authenticated owner with the message.
     pub fn with_authentication(mut self) -> Self {
         self.authenticated = true;
         self

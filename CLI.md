@@ -8,10 +8,12 @@ This document contains the help content for the `linera` command-line program.
 * [`linera transfer`↴](#linera-transfer)
 * [`linera open-chain`↴](#linera-open-chain)
 * [`linera open-multi-owner-chain`↴](#linera-open-multi-owner-chain)
+* [`linera show-ownership`↴](#linera-show-ownership)
 * [`linera change-ownership`↴](#linera-change-ownership)
 * [`linera set-preferred-owner`↴](#linera-set-preferred-owner)
 * [`linera change-application-permissions`↴](#linera-change-application-permissions)
 * [`linera close-chain`↴](#linera-close-chain)
+* [`linera show-network-description`↴](#linera-show-network-description)
 * [`linera local-balance`↴](#linera-local-balance)
 * [`linera query-balance`↴](#linera-query-balance)
 * [`linera sync-balance`↴](#linera-sync-balance)
@@ -20,6 +22,7 @@ This document contains the help content for the `linera` command-line program.
 * [`linera query-validator`↴](#linera-query-validator)
 * [`linera query-validators`↴](#linera-query-validators)
 * [`linera sync-validator`↴](#linera-sync-validator)
+* [`linera sync-all-validators`↴](#linera-sync-all-validators)
 * [`linera set-validator`↴](#linera-set-validator)
 * [`linera remove-validator`↴](#linera-remove-validator)
 * [`linera revoke-epochs`↴](#linera-revoke-epochs)
@@ -48,6 +51,9 @@ This document contains the help content for the `linera` command-line program.
 * [`linera wallet follow-chain`↴](#linera-wallet-follow-chain)
 * [`linera wallet forget-keys`↴](#linera-wallet-forget-keys)
 * [`linera wallet forget-chain`↴](#linera-wallet-forget-chain)
+* [`linera chain`↴](#linera-chain)
+* [`linera chain show-block`↴](#linera-chain-show-block)
+* [`linera chain show-chain-description`↴](#linera-chain-show-chain-description)
 * [`linera project`↴](#linera-project)
 * [`linera project new`↴](#linera-project-new)
 * [`linera project test`↴](#linera-project-test)
@@ -66,7 +72,7 @@ This document contains the help content for the `linera` command-line program.
 
 ## `linera`
 
-A Byzantine-fault tolerant sidechain with low-latency finality and high throughput
+Client implementation and command-line tool for the Linera blockchain
 
 **Usage:** `linera [OPTIONS] <COMMAND>`
 
@@ -75,10 +81,12 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `transfer` — Transfer funds
 * `open-chain` — Open (i.e. activate) a new chain deriving the UID from an existing one
 * `open-multi-owner-chain` — Open (i.e. activate) a new multi-owner chain deriving the UID from an existing one
+* `show-ownership` — Display who owns the chain, and how the owners work together proposing blocks
 * `change-ownership` — Change who owns the chain, and how the owners work together proposing blocks
 * `set-preferred-owner` — Change the preferred owner of a chain
 * `change-application-permissions` — Changes the application permissions configuration
 * `close-chain` — Close an existing chain
+* `show-network-description` — Print out the network description
 * `local-balance` — Read the current native-token balance of the given account directly from the local state
 * `query-balance` — Simulate the execution of one block made of pending messages from the local inbox, then read the native-token balance of the account from the local state
 * `sync-balance` — (DEPRECATED) Synchronize the local state of the chain with a quorum validators, then query the local balance
@@ -87,6 +95,7 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `query-validator` — Show the version and genesis config hash of a new validator, and print a warning if it is incompatible. Also print some information about the given chain while we are at it
 * `query-validators` — Show the current set of validators for a chain. Also print some information about the given chain while we are at it
 * `sync-validator` — Synchronizes a validator with the local state of chains
+* `sync-all-validators` — Synchronizes all validators with the local state of chains
 * `set-validator` — Add or modify a validator (admin only)
 * `remove-validator` — Remove a validator (admin only)
 * `revoke-epochs` — Deprecates all committees up to and including the specified one
@@ -106,6 +115,7 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `assign` — Link the owner to the chain. Expects that the caller has a private key corresponding to the `public_key`, otherwise block proposals will fail when signing with it
 * `retry-pending-block` — Retry a block we unsuccessfully tried to propose earlier
 * `wallet` — Show the contents of the wallet
+* `chain` — Show the information about a chain
 * `project` — Manage Linera projects
 * `net` — Manage a local Linera Network
 * `storage` — Operation on the storage
@@ -127,6 +137,9 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `--chain-worker-ttl-ms <CHAIN_WORKER_TTL>` — The duration in milliseconds after which an idle chain worker will free its memory
 
   Default value: `30000`
+* `--sender-chain-worker-ttl-ms <SENDER_CHAIN_WORKER_TTL>` — The duration, in milliseconds, after which an idle sender chain worker will free its memory
+
+  Default value: `1000`
 * `--retry-delay-ms <RETRY_DELAY>` — Delay increment for retrying to connect to a validator
 
   Default value: `1000`
@@ -158,6 +171,12 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `--blob-download-timeout-ms <BLOB_DOWNLOAD_TIMEOUT>` — The delay when downloading a blob, after which we try a second validator, in milliseconds
 
   Default value: `1000`
+* `--certificate-download-batch-size <CERTIFICATE_DOWNLOAD_BATCH_SIZE>` — Maximum number of certificates that we download at a time from one validator when synchronizing one of our chains
+
+  Default value: `500`
+* `--max-joined-tasks <MAX_JOINED_TASKS>` — Maximum number of tasks that can are joined concurrently in the client
+
+  Default value: `100`
 * `--storage <STORAGE_CONFIG>` — Storage configuration for the blockchain history
 * `--storage-max-concurrent-queries <STORAGE_MAX_CONCURRENT_QUERIES>` — The maximal number of simultaneous queries to the database
 * `--storage-max-stream-queries <STORAGE_MAX_STREAM_QUERIES>` — The maximal number of simultaneous stream queries to the database
@@ -178,6 +197,12 @@ A Byzantine-fault tolerant sidechain with low-latency finality and high throughp
 * `--wasm-runtime <WASM_RUNTIME>` — The WebAssembly runtime to use
 * `--tokio-threads <TOKIO_THREADS>` — The number of Tokio worker threads to use
 * `--tokio-blocking-threads <TOKIO_BLOCKING_THREADS>` — The number of Tokio blocking threads to use
+* `--block-cache-size <BLOCK_CACHE_SIZE>` — Size of the block cache (default: 5000)
+
+  Default value: `5000`
+* `--execution-state-cache-size <EXECUTION_STATE_CACHE_SIZE>` — Size of the execution state cache (default: 10000)
+
+  Default value: `10000`
 
 
 
@@ -250,6 +275,18 @@ Open (i.e. activate) a new multi-owner chain deriving the UID from an existing o
 * `--initial-balance <BALANCE>` — The initial balance of the new chain. This is subtracted from the parent chain's balance
 
   Default value: `0`
+
+
+
+## `linera show-ownership`
+
+Display who owns the chain, and how the owners work together proposing blocks
+
+**Usage:** `linera show-ownership [OPTIONS]`
+
+###### **Options:**
+
+* `--chain-id <CHAIN_ID>` — The ID of the chain whose owners will be changed
 
 
 
@@ -326,6 +363,14 @@ A closed chain cannot execute operations or accept messages anymore. It can stil
 ###### **Arguments:**
 
 * `<CHAIN_ID>` — Chain ID (must be one of our chains)
+
+
+
+## `linera show-network-description`
+
+Print out the network description
+
+**Usage:** `linera show-network-description`
 
 
 
@@ -433,6 +478,18 @@ Synchronizes a validator with the local state of chains
 ###### **Arguments:**
 
 * `<ADDRESS>` — The public address of the validator to synchronize
+
+###### **Options:**
+
+* `--chains <CHAINS>` — The chains to synchronize, or the default chain if empty
+
+
+
+## `linera sync-all-validators`
+
+Synchronizes all validators with the local state of chains
+
+**Usage:** `linera sync-all-validators [OPTIONS]`
 
 ###### **Options:**
 
@@ -708,6 +765,9 @@ Run a GraphQL service to explore and extend the chains of the wallet
 
   Default value: `0`
 * `--port <PORT>` — The port on which to run the server
+* `--sync-sleep-ms <SYNC_SLEEP_MS>` — Milliseconds to sleep between batches during background certificate synchronization
+
+  Default value: `500`
 
 
 
@@ -715,7 +775,7 @@ Run a GraphQL service to explore and extend the chains of the wallet
 
 Run a GraphQL service that exposes a faucet where users can claim tokens. This gives away the chain's tokens, and is mainly intended for testing
 
-**Usage:** `linera faucet [OPTIONS] --amount <AMOUNT> [CHAIN_ID]`
+**Usage:** `linera faucet [OPTIONS] --amount <AMOUNT> --storage-path <STORAGE_PATH> [CHAIN_ID]`
 
 ###### **Arguments:**
 
@@ -943,7 +1003,9 @@ Initialize a wallet from the genesis configuration
 
 ###### **Options:**
 
-* `--genesis <GENESIS_CONFIG_PATH>` — The path to the genesis configuration for a Linera deployment. Either this or `--faucet` must be specified
+* `--genesis <GENESIS_CONFIG_PATH>` — The path to the genesis configuration for a Linera deployment. Either this or `--faucet` must be specified.
+
+   Overrides `--faucet` if provided.
 * `--faucet <FAUCET>` — The address of a faucet
 * `--testing-prng-seed <TESTING_PRNG_SEED>` — Force this wallet to generate keys using a PRNG and a given seed. USE FOR TESTING ONLY
 
@@ -999,6 +1061,44 @@ Forgets the specified chain, including the associated key pair
 ###### **Arguments:**
 
 * `<CHAIN_ID>`
+
+
+
+## `linera chain`
+
+Show the information about a chain
+
+**Usage:** `linera chain <COMMAND>`
+
+###### **Subcommands:**
+
+* `show-block` — Show the contents of a block
+* `show-chain-description` — Show the chain description of a chain
+
+
+
+## `linera chain show-block`
+
+Show the contents of a block
+
+**Usage:** `linera chain show-block <HEIGHT> [CHAIN_ID]`
+
+###### **Arguments:**
+
+* `<HEIGHT>` — The height of the block
+* `<CHAIN_ID>` — The chain to show the block (if not specified, the default chain from the wallet is used)
+
+
+
+## `linera chain show-chain-description`
+
+Show the chain description of a chain
+
+**Usage:** `linera chain show-chain-description [CHAIN_ID]`
+
+###### **Arguments:**
+
+* `<CHAIN_ID>` — The chain ID to show (if not specified, the default chain from the wallet is used)
 
 
 
@@ -1103,6 +1203,9 @@ Start a Local Linera Network
 * `--validators <VALIDATORS>` — The number of validators in the local test network
 
   Default value: `1`
+* `--proxies <PROXIES>` — The number of proxies in the local test network
+
+  Default value: `1`
 * `--shards <SHARDS>` — The number of shards per validator in the local test network
 
   Default value: `1`
@@ -1132,10 +1235,10 @@ Start a Local Linera Network
 * `--external-protocol <EXTERNAL_PROTOCOL>` — External protocol used, either `grpc` or `grpcs`
 
   Default value: `grpc`
-* `--with-faucet` — If present, a faucet is started using the chain provided by --faucet-chain, or `ChainId::root(1)` if not provided, as root 0 is usually the admin chain
+* `--with-faucet` — If present, a faucet is started using the chain provided by --faucet-chain, or the first non-admin chain if not provided
 
   Default value: `false`
-* `--faucet-chain <FAUCET_CHAIN>` — When using --with-faucet, this specifies the chain on which the faucet will be started. The chain is specified by its root number (0 for the admin chain, 1 for the first non-admin initial chain, etc)
+* `--faucet-chain <FAUCET_CHAIN>` — When using --with-faucet, this specifies the chain on which the faucet will be started. If this is `n`, the `n`-th non-admin chain (lexicographically) in the wallet is selected
 * `--faucet-port <FAUCET_PORT>` — The port on which to run the faucet server
 
   Default value: `8080`
@@ -1145,6 +1248,9 @@ Start a Local Linera Network
 * `--with-block-exporter` — Whether to start a block exporter for each validator
 
   Default value: `false`
+* `--num-block-exporters <NUM_BLOCK_EXPORTERS>` — The number of block exporters to start
+
+  Default value: `1`
 * `--exporter-address <EXPORTER_ADDRESS>` — The address of the block exporter
 
   Default value: `localhost`

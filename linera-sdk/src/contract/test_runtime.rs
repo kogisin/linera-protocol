@@ -56,7 +56,7 @@ where
     application_id: Option<ApplicationId<Application::Abi>>,
     application_creator_chain_id: Option<ChainId>,
     chain_id: Option<ChainId>,
-    authenticated_signer: Option<Option<AccountOwner>>,
+    authenticated_owner: Option<Option<AccountOwner>>,
     block_height: Option<BlockHeight>,
     round: Option<u32>,
     message_is_bouncing: Option<Option<bool>>,
@@ -105,7 +105,7 @@ where
             application_id: None,
             application_creator_chain_id: None,
             chain_id: None,
-            authenticated_signer: None,
+            authenticated_owner: None,
             block_height: None,
             round: None,
             message_is_bouncing: None,
@@ -234,29 +234,29 @@ where
         )
     }
 
-    /// Configures the authenticated signer to return during the test.
-    pub fn with_authenticated_signer(
+    /// Configures the authenticated owner to return during the test.
+    pub fn with_authenticated_owner(
         mut self,
-        authenticated_signer: impl Into<Option<AccountOwner>>,
+        authenticated_owner: impl Into<Option<AccountOwner>>,
     ) -> Self {
-        self.authenticated_signer = Some(authenticated_signer.into());
+        self.authenticated_owner = Some(authenticated_owner.into());
         self
     }
 
-    /// Configures the authenticated signer to return during the test.
-    pub fn set_authenticated_signer(
+    /// Configures the authenticated owner to return during the test.
+    pub fn set_authenticated_owner(
         &mut self,
-        authenticated_signer: impl Into<Option<AccountOwner>>,
+        authenticated_owner: impl Into<Option<AccountOwner>>,
     ) -> &mut Self {
-        self.authenticated_signer = Some(authenticated_signer.into());
+        self.authenticated_owner = Some(authenticated_owner.into());
         self
     }
 
-    /// Returns the authenticated signer for this execution, if there is one.
-    pub fn authenticated_signer(&mut self) -> Option<AccountOwner> {
-        self.authenticated_signer.expect(
-            "Authenticated signer has not been mocked, \
-            please call `MockContractRuntime::set_authenticated_signer` first",
+    /// Returns the authenticated owner for this execution, if there is one.
+    pub fn authenticated_owner(&mut self) -> Option<AccountOwner> {
+        self.authenticated_owner.expect(
+            "Authenticated owner has not been mocked, \
+            please call `MockContractRuntime::set_authenticated_owner` first",
         )
     }
 
@@ -370,7 +370,7 @@ where
         owner: AccountOwner,
     ) -> Result<(), AccountPermissionError> {
         ensure!(
-            self.authenticated_signer() == Some(owner)
+            self.authenticated_owner() == Some(owner)
                 || self.authenticated_caller_id().map(AccountOwner::from) == Some(owner),
             AccountPermissionError::NotPermitted(owner)
         );
@@ -803,7 +803,7 @@ where
     }
 
     /// Creates a new data blob and returns its hash.
-    pub fn create_data_blob(&mut self, bytes: Vec<u8>) -> DataBlobHash {
+    pub fn create_data_blob(&mut self, bytes: &[u8]) -> DataBlobHash {
         let ExpectedCreateDataBlobCall {
             bytes: expected_bytes,
             blob_id,
@@ -811,7 +811,7 @@ where
             .expected_create_data_blob_calls
             .pop_front()
             .expect("Unexpected create_data_blob call");
-        assert_eq!(bytes, expected_bytes);
+        assert_eq!(bytes, &expected_bytes);
         DataBlobHash(blob_id.hash)
     }
 
@@ -946,13 +946,13 @@ where
     pub fn query_service<A: ServiceAbi + Send>(
         &mut self,
         application_id: ApplicationId<A>,
-        query: A::Query,
+        query: &A::Query,
     ) -> A::QueryResponse {
         let maybe_query = self.expected_service_queries.pop_front();
         let (expected_id, expected_query, response) =
             maybe_query.expect("Unexpected service query");
         assert_eq!(application_id.forget_abi(), expected_id);
-        let query = serde_json::to_string(&query).expect("Failed to serialize query");
+        let query = serde_json::to_string(query).expect("Failed to serialize query");
         assert_eq!(query, expected_query);
         serde_json::from_str(&response).expect("Failed to deserialize response")
     }
@@ -1045,7 +1045,7 @@ where
         self
     }
 
-    /// Forwards the authenticated signer with the message.
+    /// Forwards the authenticated owner with the message.
     pub fn with_authentication(mut self) -> Self {
         self.authenticated = true;
         self

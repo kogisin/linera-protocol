@@ -11,7 +11,8 @@
 #   <email>          - Email address for ACME/Let's Encrypt certificates (required)
 #
 # Options:
-#   --remote-image      - Use remote Docker image instead of building locally
+#   --local-build       - Build Docker image locally instead of using registry image
+#   --remote-image      - Explicitly use remote Docker image from registry (deprecated, now default)
 #   --skip-genesis      - Skip downloading genesis configuration
 #   --force-genesis     - Force re-download of genesis configuration
 #   --custom-tag TAG    - Use custom image tag (for testing, no _release suffix)
@@ -120,7 +121,8 @@ ARGUMENTS:
     <email>             Email address for ACME/Let's Encrypt certificates (required)
 
 OPTIONS:
-    --remote-image      Use remote Docker image instead of building locally
+    --local-build       Build Docker image locally instead of using registry image
+    --remote-image      Explicitly use remote Docker image from registry (deprecated, now default)
     --skip-genesis      Skip downloading genesis configuration
     --force-genesis     Force re-download of genesis configuration even if it exists
     --custom-tag TAG    Use custom image tag (for testing, no _release suffix)
@@ -171,20 +173,20 @@ ENVIRONMENT VARIABLES:
                         Default: 4G
 
 EXAMPLES:
-    # Deploy using local build
+    # Deploy using remote image (default behavior)
     $(basename "$0") validator.example.com admin@example.com
 
-    # Deploy using remote image with default tag (<branch>_release)
-    $(basename "$0") validator.example.com admin@example.com --remote-image
+    # Deploy using local build
+    $(basename "$0") validator.example.com admin@example.com --local-build
 
     # Deploy with custom tag for testing (no _release suffix)
-    $(basename "$0") validator.example.com admin@example.com --remote-image --custom-tag devnet_2025_08_21
+    $(basename "$0") validator.example.com admin@example.com --custom-tag devnet_2025_08_21
 
     # Deploy with fully custom image
     LINERA_IMAGE=my-registry/my-image:my-tag $(basename "$0") validator.example.com admin@example.com
 
     # Deploy with custom registry and image name
-    DOCKER_REGISTRY=gcr.io/my-project IMAGE_NAME=custom-linera $(basename "$0") validator.example.com admin@example.com --remote-image
+    DOCKER_REGISTRY=gcr.io/my-project IMAGE_NAME=custom-linera $(basename "$0") validator.example.com admin@example.com
 
     # Deploy with custom configuration
     NUM_SHARDS=8 $(basename "$0") validator.example.com admin@example.com
@@ -203,11 +205,11 @@ EXAMPLES:
 
     # Deploy with custom genesis bucket and path
     GENESIS_BUCKET=https://storage.googleapis.com/my-bucket GENESIS_PATH_PREFIX=my-deployment \
-    $(basename "$0") validator.example.com admin@example.com --remote-image
+    $(basename "$0") validator.example.com admin@example.com
 
     # Deploy with direct genesis URL override
     GENESIS_URL=https://storage.googleapis.com/linera-io-dev-public/testnet-babbage/genesis.json \
-    $(basename "$0") validator.example.com admin@example.com --remote-image
+    $(basename "$0") validator.example.com admin@example.com
 
 EOF
 }
@@ -499,10 +501,11 @@ generate_validator_keys() {
 	local image="$1"
 	local config_file="validator-config.toml"
 
-	log INFO "Generating validator keys..."
+	# Log to stderr so it doesn't get captured in the output
+	log INFO "Generating validator keys..." >&2
 
 	if [[ "${DRY_RUN:-0}" == "1" ]]; then
-		log INFO "[DRY RUN] Would generate validator keys using image: ${image}"
+		log INFO "[DRY RUN] Would generate validator keys using image: ${image}" >&2
 		echo "DRY_RUN_PUBLIC_KEY"
 		return 0
 	fi
@@ -515,7 +518,7 @@ generate_validator_keys() {
 		/linera-server generate --validators "${config_file}")
 
 	if [ -z "${public_key}" ]; then
-		log ERROR "Failed to generate validator keys"
+		log ERROR "Failed to generate validator keys" >&2
 		return 1
 	fi
 
@@ -747,6 +750,7 @@ main() {
 	# Parse command line arguments
 	local host=""
 	local email=""
+	local use_local_build=0
 	local use_remote_image=0
 	local skip_genesis=0
 	local force_genesis=0
@@ -762,7 +766,12 @@ main() {
 			usage
 			exit 0
 			;;
+		--local-build)
+			use_local_build=1
+			shift
+			;;
 		--remote-image)
+			# Deprecated option, remote is now default
 			use_remote_image=1
 			shift
 			;;
@@ -936,7 +945,14 @@ main() {
 	if [ -n "${LINERA_IMAGE:-}" ]; then
 		# User provided complete image path, use as-is
 		log INFO "Using user-specified Docker image: ${LINERA_IMAGE}"
-	elif [ ${use_remote_image} -eq 1 ]; then
+	elif [ ${use_local_build} -eq 1 ]; then
+		# Local build explicitly requested
+		export LINERA_IMAGE="${LINERA_IMAGE:-linera}"
+		if ! build_local_image "${git_commit}" "${LINERA_IMAGE}"; then
+			log ERROR "Failed to build local Docker image"
+			exit 1
+		fi
+	else
 		# Construct image path from components
 		local docker_registry="${DOCKER_REGISTRY:-$DEFAULT_DOCKER_REGISTRY}"
 		local image_name="${IMAGE_NAME:-$DEFAULT_IMAGE_NAME}"
@@ -951,19 +967,16 @@ main() {
 			# Environment variable override
 			image_tag="${IMAGE_TAG}"
 		else
-			# Default: branch_name with _release suffix
-			image_tag="${branch_name}_release"
+			# Default: branch_name with _release suffix, or 'latest' for main branch
+			if [ "${branch_name}" = "main" ]; then
+				image_tag="latest"
+			else
+				image_tag="${branch_name}_release"
+			fi
 		fi
 
 		export LINERA_IMAGE="${docker_registry}/${image_name}:${image_tag}"
 		log INFO "Using remote Docker image: ${LINERA_IMAGE}"
-	else
-		# Local build
-		export LINERA_IMAGE="${LINERA_IMAGE:-linera}"
-		if ! build_local_image "${git_commit}" "${LINERA_IMAGE}"; then
-			log ERROR "Failed to build local Docker image"
-			exit 1
-		fi
 	fi
 
 	# Generate genesis URL if not provided
@@ -1002,7 +1015,7 @@ main() {
 	# Generate validator keys
 	local public_key
 	if ! public_key=$(generate_validator_keys "${LINERA_IMAGE}"); then
-		log ERROR "Failed to generate validator keys"
+		log ERROR "Failed to generate validator keys" >&2
 		exit 1
 	fi
 
@@ -1044,26 +1057,48 @@ main() {
 	log INFO "  Restart services:"
 	log INFO "    cd ${DOCKER_COMPOSE_DIR} && docker compose restart"
 
-	# Save deployment info
-	local deployment_info="${REPO_ROOT}/${DOCKER_COMPOSE_DIR}/.deployment-info"
-	cat >"${deployment_info}" <<EOF
-# Deployment Information
+	# Create .env file for Docker Compose (this is the source of truth)
+	local env_file="${REPO_ROOT}/${DOCKER_COMPOSE_DIR}/.env"
+	cat >"${env_file}" <<EOF
+# Validator Deployment Configuration
 # Generated: $(date -Iseconds)
-HOST=${host}
-EMAIL=${ACME_EMAIL}
-PUBLIC_KEY=${public_key}
-BRANCH=${branch_name}
-COMMIT=${git_commit}
-IMAGE=${LINERA_IMAGE}
-CUSTOM_TAG=${custom_tag:-N/A}
+# This file is the source of truth for Docker Compose configuration
+# It persists all settings across container restarts
+
+# Deployment metadata
+DEPLOYMENT_HOST=${host}
+DEPLOYMENT_EMAIL=${ACME_EMAIL}
+DEPLOYMENT_PUBLIC_KEY=${public_key}
+DEPLOYMENT_BRANCH=${branch_name}
+DEPLOYMENT_COMMIT=${git_commit}
+DEPLOYMENT_CUSTOM_TAG=${custom_tag:-N/A}
+DEPLOYMENT_DATE=$(date -Iseconds)
+
+# Domain and SSL configuration (used by docker-compose.yml)
+DOMAIN=${host}
+ACME_EMAIL=${ACME_EMAIL}
+
+# Genesis configuration (critical for validator operation)
+GENESIS_URL=${genesis_url}
 GENESIS_BUCKET=${genesis_bucket}
 GENESIS_PATH_PREFIX=${genesis_path_prefix}
-GENESIS_URL=${genesis_url}
-SHARDS=${num_shards}
-XFS_PATH=${xfs_path:-N/A}
-CACHE_SIZE=${cache_size}
+
+# Validator configuration
+VALIDATOR_PUBLIC_KEY=${public_key}
+
+# Docker image
+LINERA_IMAGE=${LINERA_IMAGE}
+
+# ScyllaDB configuration
+NUM_SHARDS=${num_shards}
+${xfs_path:+XFS_PATH=${xfs_path}}
+${xfs_path:+CACHE_SIZE=${cache_size}}
+
+# Network configuration
+FAUCET_PORT=8080
+LINERA_STORAGE_SERVICE_PORT=1235
 EOF
-	log DEBUG "Deployment info saved to: ${deployment_info}"
+	log INFO "Environment variables saved to ${env_file} for persistence across restarts"
 }
 
 # Run main function with all arguments

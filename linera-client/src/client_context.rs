@@ -23,7 +23,7 @@ use linera_persistent::{Persist, PersistExt as _};
 use linera_rpc::node_provider::{NodeOptions, NodeProvider};
 use linera_version::VersionInfo;
 use thiserror_context::Context;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 #[cfg(not(web))]
 use {
     crate::{
@@ -124,7 +124,14 @@ where
     Si: linera_core::environment::Signer,
     W: Persist<Target = Wallet>,
 {
-    pub fn new(storage: S, options: ClientContextOptions, wallet: W, signer: Si) -> Self {
+    pub fn new(
+        storage: S,
+        options: ClientContextOptions,
+        wallet: W,
+        signer: Si,
+        block_cache_size: usize,
+        execution_state_cache_size: usize,
+    ) -> Self {
         #[cfg(not(web))]
         let timing_config = options.to_timing_config();
         let node_provider = NodeProvider::new(NodeOptions {
@@ -150,7 +157,10 @@ where
             chain_ids,
             name,
             options.chain_worker_ttl,
+            options.sender_chain_worker_ttl,
             options.to_chain_client_options(),
+            block_cache_size,
+            execution_state_cache_size,
         );
 
         #[cfg(not(web))]
@@ -174,12 +184,20 @@ where
     }
 
     #[cfg(with_testing)]
-    pub fn new_test_client_context(storage: S, wallet: W, signer: Si) -> Self {
+    pub fn new_test_client_context(
+        storage: S,
+        wallet: W,
+        signer: Si,
+        block_cache_size: usize,
+        execution_state_cache_size: usize,
+    ) -> Self {
         use linera_core::{client::ChainClientOptions, node::CrossChainMessageDelivery};
 
         let send_recv_timeout = Duration::from_millis(4000);
         let retry_delay = Duration::from_millis(1000);
         let max_retries = 10;
+        let chain_worker_ttl = Duration::from_secs(30);
+        let sender_chain_worker_ttl = Duration::from_secs(1);
 
         let node_options = NodeOptions {
             send_timeout: send_recv_timeout,
@@ -203,11 +221,14 @@ where
             false,
             chain_ids,
             name,
-            Duration::from_secs(30),
+            chain_worker_ttl,
+            sender_chain_worker_ttl,
             ChainClientOptions {
                 cross_chain_message_delivery: CrossChainMessageDelivery::Blocking,
                 ..ChainClientOptions::test_default()
             },
+            block_cache_size,
+            execution_state_cache_size,
         );
 
         ClientContext {
@@ -445,6 +466,13 @@ impl<Env: Environment, W: Persist<Target = Wallet>> ClientContext<Env, W> {
         }
     }
 
+    pub async fn ownership(&mut self, chain_id: Option<ChainId>) -> Result<ChainOwnership, Error> {
+        let chain_id = chain_id.unwrap_or_else(|| self.default_chain());
+        let client = self.make_chain_client(chain_id);
+        let info = client.chain_info().await?;
+        Ok(info.manager.ownership)
+    }
+
     pub async fn change_ownership(
         &mut self,
         chain_id: Option<ChainId>,
@@ -568,6 +596,8 @@ impl<Env: Environment, W: Persist<Target = Wallet>> ClientContext<Env, W> {
                         }
                         .into());
                     }
+                } else {
+                    warn!("Not checking signature as public key was not given");
                 }
                 Ok(())
             }

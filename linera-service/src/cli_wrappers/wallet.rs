@@ -43,7 +43,6 @@ use tokio::{
     sync::oneshot,
     task::JoinHandle,
 };
-use tracing::{error, info, warn};
 
 use crate::{
     cli::command::BenchmarkCommand,
@@ -486,10 +485,10 @@ impl ClientWrapper {
                 .send()
                 .await;
             if request.is_ok() {
-                info!("Node service has started");
+                tracing::info!("Node service has started");
                 return Ok(NodeService::new(port, child));
             } else {
-                warn!("Waiting for node service to start");
+                tracing::warn!("Waiting for node service to start");
             }
         }
         bail!("Failed to start node service");
@@ -540,17 +539,26 @@ impl ClientWrapper {
     pub async fn run_faucet(
         &self,
         port: impl Into<Option<u16>>,
-        chain_id: ChainId,
+        chain_id: Option<ChainId>,
         amount: Amount,
     ) -> Result<FaucetService> {
         let port = port.into().unwrap_or(8080);
+        let temp_dir = tempfile::tempdir()
+            .context("Failed to create temporary directory for faucet storage")?;
+        let storage_path = temp_dir.path().join("faucet_storage.sqlite");
         let mut command = self.command().await?;
-        let child = command
+        let command = command
             .arg("faucet")
-            .arg(chain_id.to_string())
             .args(["--port".to_string(), port.to_string()])
             .args(["--amount".to_string(), amount.to_string()])
-            .spawn_into()?;
+            .args([
+                "--storage-path".to_string(),
+                storage_path.to_string_lossy().to_string(),
+            ]);
+        if let Some(chain_id) = chain_id {
+            command.arg(chain_id.to_string());
+        }
+        let child = command.spawn_into()?;
         let client = reqwest_client();
         for i in 0..10 {
             linera_base::time::timer::sleep(Duration::from_secs(i)).await;
@@ -559,10 +567,10 @@ impl ClientWrapper {
                 .send()
                 .await;
             if request.is_ok() {
-                info!("Faucet has started");
-                return Ok(FaucetService::new(port, child));
+                tracing::info!("Faucet has started");
+                return Ok(FaucetService::new(port, child, temp_dir));
             } else {
-                warn!("Waiting for faucet to start");
+                tracing::debug!("Waiting for faucet to start");
             }
         }
         bail!("Failed to start faucet");
@@ -1111,7 +1119,7 @@ impl ClientWrapper {
 
         let contract_size = fs_err::tokio::metadata(&contract).await?.len();
         let service_size = fs_err::tokio::metadata(&service).await?.len();
-        info!("Done building application {name}: contract_size={contract_size}, service_size={service_size}");
+        tracing::info!("Done building application {name}: contract_size={contract_size}, service_size={service_size}");
 
         Ok((contract, service))
     }
@@ -1126,12 +1134,14 @@ impl Drop for ClientWrapper {
         }
 
         let Ok(binary_path) = self.binary_path.lock() else {
-            error!("Failed to close chains because a thread panicked with a lock to `binary_path`");
+            tracing::error!(
+                "Failed to close chains because a thread panicked with a lock to `binary_path`"
+            );
             return;
         };
 
         let Some(binary_path) = binary_path.as_ref() else {
-            warn!(
+            tracing::warn!(
                 "Assuming no chains need to be closed, because the command binary was never \
                 resolved and therefore presumably never called"
             );
@@ -1150,17 +1160,17 @@ impl Drop for ClientWrapper {
             .args(["wallet", "show", "--short", "--owned"])
             .output()
         else {
-            warn!("Failed to execute `wallet show --short` to list chains to close");
+            tracing::warn!("Failed to execute `wallet show --short` to list chains to close");
             return;
         };
 
         if !wallet_show_output.status.success() {
-            warn!("Failed to list chains in the wallet to close them");
+            tracing::warn!("Failed to list chains in the wallet to close them");
             return;
         }
 
         let Ok(chain_list_string) = String::from_utf8(wallet_show_output.stdout) else {
-            warn!(
+            tracing::warn!(
                 "Failed to close chains because `linera wallet show --short` \
                 returned a non-UTF-8 output"
             );
@@ -1183,8 +1193,8 @@ impl Drop for ClientWrapper {
 
             match close_chain_command.args(["close-chain", chain_id]).status() {
                 Ok(status) if status.success() => (),
-                Ok(failure) => warn!("Failed to close chain {chain_id}: {failure}"),
-                Err(error) => warn!("Failed to close chain {chain_id}: {error}"),
+                Ok(failure) => tracing::warn!("Failed to close chain {chain_id}: {failure}"),
+                Err(error) => tracing::warn!("Failed to close chain {chain_id}: {error}"),
             }
         }
     }
@@ -1248,6 +1258,12 @@ impl NodeService {
         let query = format!("mutation {{ processInbox(chainId: \"{chain_id}\") }}");
         let mut data = self.query_node(query).await?;
         Ok(serde_json::from_value(data["processInbox"].take())?)
+    }
+
+    pub async fn sync(&self, chain_id: &ChainId) -> Result<u64> {
+        let query = format!("mutation {{ sync(chainId: \"{chain_id}\") }}");
+        let mut data = self.query_node(query).await?;
+        Ok(serde_json::from_value(data["sync"].take())?)
     }
 
     pub async fn transfer(
@@ -1397,7 +1413,7 @@ impl NodeService {
                 .send()
                 .await;
             if matches!(result, Err(ref error) if error.is_timeout()) {
-                warn!(
+                tracing::warn!(
                     "Timeout when sending query {} to the node service",
                     truncate_query_output(query)
                 );
@@ -1420,7 +1436,7 @@ impl NodeService {
             );
             let value: Value = response.json().await.context("invalid JSON")?;
             if let Some(errors) = value.get("errors") {
-                warn!(
+                tracing::warn!(
                     "Query \"{}\" failed: {}",
                     truncate_query_output(query),
                     errors
@@ -1552,11 +1568,16 @@ impl NodeService {
 pub struct FaucetService {
     port: u16,
     child: Child,
+    _temp_dir: tempfile::TempDir,
 }
 
 impl FaucetService {
-    fn new(port: u16, child: Child) -> Self {
-        Self { port, child }
+    fn new(port: u16, child: Child, temp_dir: tempfile::TempDir) -> Self {
+        Self {
+            port,
+            child,
+            _temp_dir: temp_dir,
+        }
     }
 
     pub async fn terminate(mut self) -> Result<()> {
@@ -1597,7 +1618,7 @@ impl<A> ApplicationWrapper<A> {
             let response = match result {
                 Ok(response) => response,
                 Err(error) if i < MAX_RETRIES => {
-                    warn!(
+                    tracing::warn!(
                         "Failed to post query \"{}\": {error}; retrying",
                         truncate_query_output_serialize(&query),
                     );

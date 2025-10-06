@@ -33,6 +33,7 @@ use tracing::{debug, instrument, trace, Instrument as _};
 
 use super::{config::ChainWorkerConfig, state::ChainWorkerState, DeliveryNotifier};
 use crate::{
+    chain_worker::BlockOutcome,
     data_types::{ChainInfoQuery, ChainInfoResponse},
     value_cache::ValueCache,
     worker::{NetworkActions, WorkerError},
@@ -100,7 +101,8 @@ where
     ProcessValidatedBlock {
         certificate: ValidatedBlockCertificate,
         #[debug(skip)]
-        callback: oneshot::Sender<Result<(ChainInfoResponse, NetworkActions, bool), WorkerError>>,
+        callback:
+            oneshot::Sender<Result<(ChainInfoResponse, NetworkActions, BlockOutcome), WorkerError>>,
     },
 
     /// Process a confirmed block (a commit).
@@ -109,7 +111,8 @@ where
         #[debug(with = "elide_option")]
         notify_when_messages_are_delivered: Option<oneshot::Sender<()>>,
         #[debug(skip)]
-        callback: oneshot::Sender<Result<(ChainInfoResponse, NetworkActions), WorkerError>>,
+        callback:
+            oneshot::Sender<Result<(ChainInfoResponse, NetworkActions, BlockOutcome), WorkerError>>,
     },
 
     /// Process a cross-chain update.
@@ -168,6 +171,7 @@ where
     execution_state_cache: Arc<ValueCache<CryptoHash, ExecutionStateView<InactiveContext>>>,
     tracked_chains: Option<Arc<sync::RwLock<HashSet<ChainId>>>>,
     delivery_notifier: DeliveryNotifier,
+    is_tracked: bool,
 }
 
 impl<StorageClient> ChainWorkerActor<StorageClient>
@@ -189,6 +193,7 @@ where
             ChainWorkerRequest<StorageClient::Context>,
             tracing::Span,
         )>,
+        is_tracked: bool,
     ) {
         let actor = ChainWorkerActor {
             config,
@@ -198,6 +203,7 @@ where
             tracked_chains,
             delivery_notifier,
             chain_id,
+            is_tracked,
         };
         if let Err(err) = actor.handle_requests(incoming_requests).await {
             tracing::error!("Chain actor error: {err}");
@@ -235,8 +241,12 @@ where
     /// Sleeps for the configured TTL.
     pub(super) async fn sleep_until_timeout(&self) {
         let now = self.storage.clock().current_time();
-        let ttl =
-            TimeDelta::from_micros(u64::try_from(self.config.ttl.as_micros()).unwrap_or(u64::MAX));
+        let timeout = if self.is_tracked {
+            self.config.sender_chain_ttl
+        } else {
+            self.config.ttl
+        };
+        let ttl = TimeDelta::from_micros(u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX));
         let timeout = now.saturating_add(ttl);
         self.storage.clock().sleep_until(timeout).await
     }
@@ -244,7 +254,7 @@ where
     /// Runs the worker until there are no more incoming requests.
     #[instrument(
         skip_all,
-        fields(chain_id = format!("{:.8}", self.chain_id)),
+        fields(chain_id = format!("{:.8}", self.chain_id), long_lived_services = %self.config.long_lived_services),
     )]
     async fn handle_requests(
         self,
@@ -276,9 +286,12 @@ where
                 self.chain_id,
                 service_runtime_endpoint,
             )
+            .instrument(span.clone())
             .await?;
 
-            Box::pin(worker.handle_request(request).instrument(span)).await;
+            Box::pin(worker.handle_request(request))
+                .instrument(span)
+                .await;
 
             loop {
                 futures::select! {
@@ -287,7 +300,7 @@ where
                         let Some((request, span)) = maybe_request else {
                             break; // Request sender was dropped.
                         };
-                        Box::pin(worker.handle_request(request).instrument(span)).await;
+                        Box::pin(worker.handle_request(request)).instrument(span).await;
                     }
                 }
             }

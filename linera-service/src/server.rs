@@ -2,6 +2,26 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc configuration for memory profiling with jemalloc_pprof
+// prof:true,prof_active:true - Enable profiling from start
+// lg_prof_sample:19 - Sample every 512KB for good detail/overhead balance
+
+// Linux/other platforms: use unprefixed malloc (with unprefixed_malloc_on_supported_platforms)
+#[cfg(all(feature = "memory-profiling", not(target_os = "macos")))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+
+// macOS: use prefixed malloc (without unprefixed_malloc_on_supported_platforms)
+#[cfg(all(feature = "memory-profiling", target_os = "macos"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+
 use std::{
     borrow::Cow,
     num::NonZeroU16,
@@ -17,10 +37,10 @@ use linera_base::{
     listen_for_shutdown_signals,
 };
 use linera_client::config::{CommitteeConfig, ValidatorConfig, ValidatorServerConfig};
-use linera_core::{worker::WorkerState, JoinSetExt as _};
+use linera_core::{worker::WorkerState, JoinSetExt as _, CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES};
 use linera_execution::{WasmRuntime, WithWasmDefault};
 #[cfg(with_metrics)]
-use linera_metrics::prometheus_server;
+use linera_metrics::monitoring_server;
 use linera_persistent::{self as persistent, Persist};
 use linera_rpc::{
     config::{
@@ -48,6 +68,9 @@ struct ServerContext {
     shard: Option<usize>,
     grace_period: Duration,
     chain_worker_ttl: Duration,
+    block_cache_size: usize,
+    execution_state_cache_size: usize,
+    chain_info_max_received_log_entries: usize,
 }
 
 impl ServerContext {
@@ -70,11 +93,14 @@ impl ServerContext {
             format!("Shard {} @ {}:{}", shard_id, local_ip_addr, shard.port),
             Some(self.server_config.validator_secret.copy()),
             storage,
+            self.block_cache_size,
+            self.execution_state_cache_size,
         )
         .with_allow_inactive_chains(false)
         .with_allow_messages_from_deprecated_epochs(false)
         .with_grace_period(self.grace_period)
-        .with_chain_worker_ttl(self.chain_worker_ttl);
+        .with_chain_worker_ttl(self.chain_worker_ttl)
+        .with_chain_info_max_received_log_entries(self.chain_info_max_received_log_entries);
         (state, shard_id, shard.clone())
     }
 
@@ -103,7 +129,10 @@ impl ServerContext {
 
             #[cfg(with_metrics)]
             if let Some(port) = shard.metrics_port {
-                Self::start_metrics(&listen_address, port, shutdown_signal.clone());
+                monitoring_server::start_metrics(
+                    (listen_address.clone(), port),
+                    shutdown_signal.clone(),
+                );
             }
 
             let server_handle = simple::Server::new(
@@ -146,7 +175,10 @@ impl ServerContext {
         for (state, shard_id, shard) in states {
             #[cfg(with_metrics)]
             if let Some(port) = shard.metrics_port {
-                Self::start_metrics(listen_address, port, shutdown_signal.clone());
+                monitoring_server::start_metrics(
+                    (listen_address.to_string(), port),
+                    shutdown_signal.clone(),
+                );
             }
 
             let server_handle = grpc::GrpcServer::spawn(
@@ -174,11 +206,6 @@ impl ServerContext {
         join_set.spawn_task(handles.collect::<()>());
 
         join_set
-    }
-
-    #[cfg(with_metrics)]
-    fn start_metrics(host: &str, port: u16, shutdown_signal: CancellationToken) {
-        prometheus_server::start_metrics((host.to_owned(), port), shutdown_signal);
     }
 
     fn get_listen_address() -> String {
@@ -234,7 +261,7 @@ impl Runnable for ServerContext {
 #[derive(clap::Parser)]
 #[command(
     name = "linera-server",
-    about = "A byzantine fault tolerant payments sidechain with low-latency finality and high throughput",
+    about = "Server implementation (aka validator shard) for the Linera blockchain",
     version = linera_version::VersionInfo::default_clap_str(),
 )]
 struct ServerOptions {
@@ -249,6 +276,18 @@ struct ServerOptions {
     /// The number of Tokio blocking threads to use.
     #[arg(long, env = "LINERA_SERVER_TOKIO_BLOCKING_THREADS")]
     tokio_blocking_threads: Option<usize>,
+
+    /// Size of the block cache (default: 5000)
+    #[arg(long, env = "LINERA_BLOCK_CACHE_SIZE", default_value = "5000")]
+    block_cache_size: usize,
+
+    /// Size of the execution state cache (default: 10000)
+    #[arg(
+        long,
+        env = "LINERA_EXECUTION_STATE_CACHE_SIZE",
+        default_value = "10000"
+    )]
+    execution_state_cache_size: usize,
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
@@ -359,6 +398,15 @@ enum ServerCommand {
             value_parser = util::parse_millis
         )]
         chain_worker_ttl: Duration,
+
+        /// Maximum size for received_log entries in chain info responses. This should
+        /// generally only be increased from the default value.
+        #[arg(
+            long,
+            default_value_t = CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES,
+            env = "LINERA_SERVER_CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES",
+        )]
+        chain_info_max_received_log_entries: usize,
     },
 
     /// Act as a trusted third-party and generate all server configurations
@@ -411,8 +459,6 @@ enum ServerCommand {
 fn main() {
     let options = <ServerOptions as clap::Parser>::parse();
 
-    linera_base::tracing::init(&log_file_name_for(&options.command));
-
     let mut runtime = if options.tokio_threads == Some(1) {
         tokio::runtime::Builder::new_current_thread()
     } else {
@@ -460,6 +506,8 @@ fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
 }
 
 async fn run(options: ServerOptions) {
+    linera_base::tracing::init_with_opentelemetry(&log_file_name_for(&options.command)).await;
+
     match options.command {
         ServerCommand::Run {
             server_config_path,
@@ -471,6 +519,7 @@ async fn run(options: ServerOptions) {
             grace_period,
             wasm_runtime,
             chain_worker_ttl,
+            chain_info_max_received_log_entries,
         } => {
             linera_version::VERSION_INFO.log();
 
@@ -484,6 +533,9 @@ async fn run(options: ServerOptions) {
                 shard,
                 grace_period,
                 chain_worker_ttl,
+                block_cache_size: options.block_cache_size,
+                execution_state_cache_size: options.execution_state_cache_size,
+                chain_info_max_received_log_entries,
             };
             let wasm_runtime = wasm_runtime.with_wasm_default();
             let store_config = storage_config

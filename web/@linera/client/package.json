@@ -1,0 +1,47 @@
+{
+  "name": "@linera/client",
+  "version": "0.16.0",
+  "description": "Web client for the Linera blockchain",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "scripts": {
+    "install": "true",
+    "build": "bash build.bash --release",
+    "prepare": "pnpm build",
+    "lint": "pnpm build && pnpm exec tsc && cargo fmt --check && cargo clippy",
+    "ci": "pnpm lint && pnpm doc",
+    "format": "pnpm exec prettier . --write",
+    "doc": "pnpm exec typedoc"
+  },
+  "keywords": [],
+  "author": "Linera <contact@linera.io>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linera-io/linera-protocol.git"
+  },
+  "bugs": {
+    "url": "https://github.com/linera-io/linera-protocol/issues"
+  },
+  "homepage": "https://github.com/linera-io/linera-protocol/tree/main/web#readme",
+  "dependencies": {
+    "ethers": "^6.15.0"
+  },
+  "devDependencies": {
+    "prettier": "3.5.3",
+    "tsc-alias": "^1.8.16",
+    "typedoc": "^0.28.13",
+    "typedoc-plugin-markdown": "^4.9.0"
+  }
+}

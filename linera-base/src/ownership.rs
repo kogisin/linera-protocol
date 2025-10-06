@@ -178,6 +178,11 @@ impl ChainOwnership {
         };
         Some(next_round)
     }
+
+    /// Returns whether the given owner a super owner and there are no regular owners.
+    pub fn is_super_owner_no_regular_owners(&self, owner: &AccountOwner) -> bool {
+        self.owners.is_empty() && self.super_owners.contains(owner)
+    }
 }
 
 /// Errors that can happen when attempting to close a chain.

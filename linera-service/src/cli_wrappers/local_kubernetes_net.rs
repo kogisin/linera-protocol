@@ -13,26 +13,17 @@ use linera_base::{
     data_types::Amount,
 };
 use linera_client::client_options::ResourceControlPolicyConfig;
-use tempfile::{tempdir, TempDir};
-use tokio::process::Command;
-#[cfg(with_testing)]
-use {linera_base::command::current_binary_parent, tokio::sync::OnceCell};
+use tokio::{process::Command, task::JoinSet};
 
 use crate::cli_wrappers::{
-    docker::{BuildArg, DockerImage},
-    helmfile::HelmFile,
+    docker::{BuildArg, DockerImage, Dockerfile},
+    helmfile::{HelmFile, DEFAULT_BLOCK_EXPORTER_PORT},
     kind::KindCluster,
     kubectl::KubectlInstance,
     local_net::PathProvider,
     util::get_github_root,
     ClientWrapper, LineraNet, LineraNetConfig, Network, OnClientDrop,
 };
-
-#[cfg(with_testing)]
-static SHARED_LOCAL_KUBERNETES_TESTING_NET: OnceCell<(
-    Arc<Mutex<LocalKubernetesNet>>,
-    ClientWrapper,
-)> = OnceCell::const_new();
 
 #[derive(Clone, clap::Parser, clap::ValueEnum, Debug, Default)]
 pub enum BuildMode {
@@ -62,19 +53,19 @@ pub struct LocalKubernetesNetConfig {
     pub num_other_initial_chains: u32,
     pub initial_amount: Amount,
     pub num_initial_validators: usize,
+    pub num_proxies: usize,
     pub num_shards: usize,
     pub binaries: BuildArg,
     pub no_build: bool,
     pub docker_image_name: String,
     pub build_mode: BuildMode,
     pub policy_config: ResourceControlPolicyConfig,
+    pub num_block_exporters: usize,
+    pub indexer_image_name: String,
+    pub explorer_image_name: String,
     pub dual_store: bool,
+    pub path_provider: PathProvider,
 }
-
-/// A wrapper of [`LocalKubernetesNetConfig`] to create a shared local Kubernetes network
-/// or use an existing one.
-#[cfg(with_testing)]
-pub struct SharedLocalKubernetesNetTestingConfig(LocalKubernetesNetConfig);
 
 /// A set of Linera validators running locally as native processes.
 #[derive(Clone)]
@@ -82,7 +73,6 @@ pub struct LocalKubernetesNet {
     network: Network,
     testing_prng_seed: Option<u64>,
     next_client_id: usize,
-    tmp_dir: Arc<TempDir>,
     binaries: BuildArg,
     no_build: bool,
     docker_image_name: String,
@@ -90,45 +80,13 @@ pub struct LocalKubernetesNet {
     kubectl_instance: Arc<Mutex<KubectlInstance>>,
     kind_clusters: Vec<KindCluster>,
     num_initial_validators: usize,
+    num_proxies: usize,
     num_shards: usize,
+    num_block_exporters: usize,
+    indexer_image_name: String,
+    explorer_image_name: String,
     dual_store: bool,
-}
-
-#[cfg(with_testing)]
-impl SharedLocalKubernetesNetTestingConfig {
-    // The second argument is sometimes used locally to use specific binaries for tests.
-    pub fn new(network: Network, mut binaries: BuildArg) -> Self {
-        if std::env::var("LINERA_TRY_RELEASE_BINARIES").unwrap_or_default() == "true"
-            && matches!(binaries, BuildArg::Build)
-        {
-            // For cargo test, current binary should be in debug mode
-            let current_binary_parent =
-                current_binary_parent().expect("Fetching current binaries path should not fail");
-            // But binaries for cluster should be release mode
-            let binaries_dir = current_binary_parent
-                .parent()
-                .expect("Getting parent should not fail")
-                .join("release");
-            if binaries_dir.exists() {
-                // If release exists, use those binaries
-                binaries = BuildArg::Directory(binaries_dir);
-            }
-        }
-        Self(LocalKubernetesNetConfig {
-            network,
-            testing_prng_seed: Some(37),
-            num_other_initial_chains: 2,
-            initial_amount: Amount::from_tokens(2000),
-            num_initial_validators: 4,
-            num_shards: 4,
-            binaries,
-            no_build: false,
-            docker_image_name: String::from("linera:latest"),
-            build_mode: BuildMode::Release,
-            policy_config: ResourceControlPolicyConfig::Testnet,
-            dual_store: false,
-        })
-    }
+    path_provider: PathProvider,
 }
 
 #[async_trait]
@@ -158,8 +116,13 @@ impl LineraNetConfig for LocalKubernetesNetConfig {
             KubectlInstance::new(Vec::new()),
             clusters,
             self.num_initial_validators,
+            self.num_proxies,
             self.num_shards,
+            self.num_block_exporters,
+            self.indexer_image_name,
+            self.explorer_image_name,
             self.dual_store,
+            self.path_provider,
         )?;
 
         let client = net.make_client().await;
@@ -174,39 +137,6 @@ impl LineraNetConfig for LocalKubernetesNetConfig {
             .await
             .unwrap();
         net.run().await.unwrap();
-
-        Ok((net, client))
-    }
-}
-
-#[cfg(with_testing)]
-#[async_trait]
-impl LineraNetConfig for SharedLocalKubernetesNetTestingConfig {
-    type Net = Arc<Mutex<LocalKubernetesNet>>;
-
-    async fn instantiate(self) -> Result<(Self::Net, ClientWrapper)> {
-        let (net, initial_client) = SHARED_LOCAL_KUBERNETES_TESTING_NET
-            .get_or_init(|| async {
-                let (net, initial_client) = self
-                    .0
-                    .instantiate()
-                    .await
-                    .expect("Instantiating LocalKubernetesNetConfig should not fail");
-                (Arc::new(Mutex::new(net)), initial_client)
-            })
-            .await;
-
-        let mut net = net.clone();
-        let client = net.make_client().await;
-        // The tests assume we've created a genesis config with 2
-        // chains with 10 tokens each.
-        client.wallet_init(None).await.unwrap();
-        for _ in 0..2 {
-            initial_client
-                .open_and_assign(&client, Amount::from_tokens(10))
-                .await
-                .unwrap();
-        }
 
         Ok((net, client))
     }
@@ -276,11 +206,8 @@ impl LineraNet for LocalKubernetesNet {
     }
 
     async fn make_client(&mut self) -> ClientWrapper {
-        let path_provider = PathProvider::TemporaryDirectory {
-            tmp_dir: self.tmp_dir.clone(),
-        };
         let client = ClientWrapper::new(
-            path_provider,
+            self.path_provider.clone(),
             self.network,
             self.testing_prng_seed,
             self.next_client_id,
@@ -338,14 +265,18 @@ impl LocalKubernetesNet {
         kubectl_instance: KubectlInstance,
         kind_clusters: Vec<KindCluster>,
         num_initial_validators: usize,
+        num_proxies: usize,
         num_shards: usize,
+        num_block_exporters: usize,
+        indexer_image_name: String,
+        explorer_image_name: String,
         dual_store: bool,
+        path_provider: PathProvider,
     ) -> Result<Self> {
         Ok(Self {
             network,
             testing_prng_seed,
             next_client_id: 0,
-            tmp_dir: Arc::new(tempdir()?),
             binaries,
             no_build,
             docker_image_name,
@@ -353,55 +284,86 @@ impl LocalKubernetesNet {
             kubectl_instance: Arc::new(Mutex::new(kubectl_instance)),
             kind_clusters,
             num_initial_validators,
+            num_proxies,
             num_shards,
+            num_block_exporters,
+            indexer_image_name,
+            explorer_image_name,
             dual_store,
+            path_provider,
         })
     }
 
     async fn command_for_binary(&self, name: &'static str) -> Result<Command> {
         let path = resolve_binary(name, env!("CARGO_PKG_NAME")).await?;
         let mut command = Command::new(path);
-        command.current_dir(self.tmp_dir.path());
+        command.current_dir(self.path_provider.path());
         Ok(command)
     }
 
-    fn configuration_string(&self, server_number: usize) -> Result<String> {
-        let n = server_number;
-        let path = self.tmp_dir.path().join(format!("validator_{n}.toml"));
-        let port = 19100 + server_number;
-        let internal_port = 20100;
+    fn configuration_string(&self, validator_number: usize) -> Result<String> {
+        let path = self
+            .path_provider
+            .path()
+            .join(format!("validator_{validator_number}.toml"));
+        let public_port = 19100 + validator_number;
+        let private_port = 20100;
         let metrics_port = 21100;
+        let protocol = self.network.toml();
+        let host = self.network.localhost();
         let mut content = format!(
             r#"
-                server_config_path = "server_{n}.json"
-                host = "127.0.0.1"
-                port = {port}
-                [external_protocol]
-                Grpc = "ClearText"
-                [internal_protocol]
-                Grpc = "ClearText"
+                server_config_path = "server_{validator_number}.json"
+                host = "{host}"
+                port = {public_port}
+                external_protocol = {protocol}
+                internal_protocol = {protocol}
 
-                [[proxies]]
-                host = "proxy-0.proxy-internal.default.svc.cluster.local"
-                public_port = {port}
-                private_port = {internal_port}
-                metrics_port = {metrics_port}
             "#
         );
 
-        for k in 0..self.num_shards {
-            let shard_port = 19100;
-            let shard_metrics_port = 21100;
+        for proxy_id in 0..self.num_proxies {
+            content.push_str(&format!(
+                r#"
+                    [[proxies]]
+                    host = "proxy-{proxy_id}.proxy-internal.default.svc.cluster.local"
+                    public_port = {public_port}
+                    private_port = {private_port}
+                    metrics_port = {metrics_port}
+                "#
+            ));
+        }
+
+        for shard_id in 0..self.num_shards {
             content.push_str(&format!(
                 r#"
 
                 [[shards]]
-                host = "shards-{k}.shards.default.svc.cluster.local"
-                port = {shard_port}
-                metrics_port = {shard_metrics_port}
+                host = "shards-{shard_id}.shards.default.svc.cluster.local"
+                port = {public_port}
+                metrics_port = {metrics_port}
                 "#
             ));
         }
+
+        if self.num_block_exporters > 0 {
+            for exporter_num in 0..self.num_block_exporters {
+                let block_exporter_port = DEFAULT_BLOCK_EXPORTER_PORT;
+                let block_exporter_host =
+                    format!("linera-block-exporter-{exporter_num}.linera-block-exporter");
+                let config_content = format!(
+                    r#"
+
+                        [[block_exporters]]
+                        host = "{block_exporter_host}"
+                        port = {block_exporter_port}
+                        "#
+                );
+
+                content.push_str(&config_content);
+            }
+        }
+
         fs_err::write(&path, content)?;
         path.into_os_string().into_string().map_err(|error| {
             anyhow!(
@@ -419,8 +381,8 @@ impl LocalKubernetesNet {
             self.testing_prng_seed = Some(seed + 1);
         }
         command.arg("--validators");
-        for i in 0..self.num_initial_validators {
-            command.arg(&self.configuration_string(i)?);
+        for validator_number in 0..self.num_initial_validators {
+            command.arg(&self.configuration_string(validator_number)?);
         }
         command
             .args(["--committee", "committee.json"])
@@ -431,19 +393,53 @@ impl LocalKubernetesNet {
 
     async fn run(&mut self) -> Result<()> {
         let github_root = get_github_root().await?;
-        // Build Docker image
-        let docker_image_name = if self.no_build {
-            self.docker_image_name.clone()
-        } else {
-            DockerImage::build(
-                &self.docker_image_name,
-                &self.binaries,
-                &github_root,
-                &self.build_mode,
-                self.dual_store,
+        // Build Docker images
+        let (docker_image_name, indexer_image_name, explorer_image_name) = if self.no_build {
+            (
+                self.docker_image_name.clone(),
+                self.indexer_image_name.clone(),
+                self.explorer_image_name.clone(),
             )
-            .await?;
-            self.docker_image_name.clone()
+        } else {
+            let mut join_set = JoinSet::new();
+            join_set.spawn(DockerImage::build(
+                self.docker_image_name.clone(),
+                self.binaries.clone(),
+                github_root.clone(),
+                self.build_mode.clone(),
+                self.dual_store,
+                Dockerfile::Main,
+            ));
+            if self.num_block_exporters > 0 {
+                join_set.spawn(DockerImage::build(
+                    self.indexer_image_name.clone(),
+                    self.binaries.clone(),
+                    github_root.clone(),
+                    self.build_mode.clone(),
+                    self.dual_store,
+                    Dockerfile::Indexer,
+                ));
+                join_set.spawn(DockerImage::build(
+                    self.explorer_image_name.clone(),
+                    self.binaries.clone(),
+                    github_root.clone(),
+                    self.build_mode.clone(),
+                    self.dual_store,
+                    Dockerfile::Explorer,
+                ));
+            }
+
+            join_set
+                .join_all()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+            (
+                self.docker_image_name.clone(),
+                self.indexer_image_name.clone(),
+                self.explorer_image_name.clone(),
+            )
         };
 
         let base_dir = github_root
@@ -451,40 +447,53 @@ impl LocalKubernetesNet {
             .join("linera-validator")
             .join("working");
         fs_err::copy(
-            self.tmp_dir.path().join("genesis.json"),
+            self.path_provider.path().join("genesis.json"),
             base_dir.join("genesis.json"),
         )?;
 
         let kubectl_instance_clone = self.kubectl_instance.clone();
-        let tmp_dir_path_clone = self.tmp_dir.path().to_path_buf();
+        let path_provider_path_clone = self.path_provider.path().to_path_buf();
+        let num_proxies = self.num_proxies;
         let num_shards = self.num_shards;
 
         let mut validators_initialization_futures = Vec::new();
-        for (i, kind_cluster) in self.kind_clusters.iter().cloned().enumerate() {
+        for (validator_number, kind_cluster) in self.kind_clusters.iter().cloned().enumerate() {
             let base_dir = base_dir.clone();
             let github_root = github_root.clone();
 
             let kubectl_instance = kubectl_instance_clone.clone();
-            let tmp_dir_path = tmp_dir_path_clone.clone();
+            let path_provider_path = path_provider_path_clone.clone();
 
             let docker_image_name = docker_image_name.clone();
+            let indexer_image_name = indexer_image_name.clone();
+            let explorer_image_name = explorer_image_name.clone();
             let dual_store = self.dual_store;
+            let num_block_exporters = self.num_block_exporters;
             let future = async move {
                 let cluster_id = kind_cluster.id();
                 kind_cluster.load_docker_image(&docker_image_name).await?;
+                if num_block_exporters > 0 {
+                    kind_cluster.load_docker_image(&indexer_image_name).await?;
+                    kind_cluster.load_docker_image(&explorer_image_name).await?;
+                }
 
-                let server_config_filename = format!("server_{}.json", i);
+                let server_config_filename = format!("server_{}.json", validator_number);
                 fs_err::copy(
-                    tmp_dir_path.join(&server_config_filename),
+                    path_provider_path.join(&server_config_filename),
                     base_dir.join(&server_config_filename),
                 )?;
 
                 HelmFile::sync(
-                    i,
+                    validator_number,
                     &github_root,
+                    num_proxies,
                     num_shards,
                     cluster_id,
                     docker_image_name,
+                    num_block_exporters > 0,
+                    num_block_exporters,
+                    indexer_image_name,
+                    explorer_image_name,
                     dual_store,
                 )
                 .await?;
@@ -492,7 +501,7 @@ impl LocalKubernetesNet {
                 let mut kubectl_instance = kubectl_instance.lock().await;
                 let proxy_service = "svc/proxy";
 
-                let local_port = 19100 + i;
+                let local_port = 19100 + validator_number;
                 kubectl_instance.port_forward(
                     proxy_service,
                     &format!("{local_port}:19100"),

@@ -19,11 +19,12 @@ use futures::{future::BoxFuture, FutureExt as _};
 use linera_base::identifiers::ChainId;
 use linera_core::{
     data_types::{CertificatesByHeightRequest, ChainInfo, ChainInfoQuery},
+    node::NodeError,
     notifier::ChannelNotifier,
     JoinSetExt as _,
 };
 #[cfg(with_metrics)]
-use linera_metrics::prometheus_server;
+use linera_metrics::monitoring_server;
 use linera_rpc::{
     config::{ProxyConfig, ShardConfig, TlsConfig, ValidatorInternalNetworkConfig},
     grpc::{
@@ -248,7 +249,7 @@ where
         let mut join_set = JoinSet::new();
 
         #[cfg(with_metrics)]
-        prometheus_server::start_metrics(self.metrics_address(), shutdown_signal.clone());
+        monitoring_server::start_metrics(self.metrics_address(), shutdown_signal.clone());
 
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
         health_reporter
@@ -265,13 +266,22 @@ where
             .build_v1()?;
         let public_server = join_set.spawn_task(
             self.public_server()?
-                .max_concurrent_streams(Some(u32::MAX - 1)) // we subtract one to make sure
-                // that the value is not
-                // interpreted as "not set"
+                .max_concurrent_streams(
+                    // we subtract one to make sure
+                    // that the value is not
+                    // interpreted as "not set"
+                    Some(u32::MAX - 1),
+                )
                 .layer(
                     ServiceBuilder::new()
                         .layer(PrometheusMetricsMiddlewareLayer)
                         .into_inner(),
+                )
+                .layer(
+                    // enable
+                    // [CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS)
+                    // for the proxy to originate anywhere
+                    tower_http::cors::CorsLayer::permissive(),
                 )
                 .layer(GrpcWebLayer::new())
                 .accept_http1(true)
@@ -303,6 +313,7 @@ where
         }
     }
 
+    #[instrument(target = "telemetry_only", skip_all, fields(remote_addr = ?request.remote_addr(), chain_id = ?request.get_ref().chain_id()))]
     fn worker_client<R>(
         &self,
         request: Request<R>,
@@ -374,7 +385,12 @@ where
 {
     type SubscribeStream = UnboundedReceiverStream<Result<Notification, Status>>;
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "handle_block_proposal")
+    )]
     async fn handle_block_proposal(
         &self,
         request: Request<BlockProposal>,
@@ -386,7 +402,12 @@ where
         )
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "handle_lite_certificate")
+    )]
     async fn handle_lite_certificate(
         &self,
         request: Request<LiteCertificate>,
@@ -398,7 +419,12 @@ where
         )
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "handle_confirmed_certificate")
+    )]
     async fn handle_confirmed_certificate(
         &self,
         request: Request<api::HandleConfirmedCertificateRequest>,
@@ -410,7 +436,12 @@ where
         )
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "handle_validated_certificate")
+    )]
     async fn handle_validated_certificate(
         &self,
         request: Request<api::HandleValidatedCertificateRequest>,
@@ -422,7 +453,12 @@ where
         )
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "handle_timeout_certificate")
+    )]
     async fn handle_timeout_certificate(
         &self,
         request: Request<api::HandleTimeoutCertificateRequest>,
@@ -434,7 +470,12 @@ where
         )
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "handle_chain_info_query")
+    )]
     async fn handle_chain_info_query(
         &self,
         request: Request<api::ChainInfoQuery>,
@@ -446,7 +487,12 @@ where
         )
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "subscribe")
+    )]
     async fn subscribe(
         &self,
         request: Request<SubscriptionRequest>,
@@ -475,7 +521,12 @@ where
         Ok(Response::new(linera_version::VersionInfo::default().into()))
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "get_network_description")
+    )]
     async fn get_network_description(
         &self,
         _request: Request<()>,
@@ -490,7 +541,12 @@ where
         Ok(Response::new(description.into()))
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "upload_blob")
+    )]
     async fn upload_blob(&self, request: Request<BlobContent>) -> Result<Response<BlobId>, Status> {
         let content: linera_sdk::linera_base_types::BlobContent =
             request.into_inner().try_into()?;
@@ -503,7 +559,12 @@ where
         Ok(Response::new(id.try_into()?))
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "download_blob")
+    )]
     async fn download_blob(
         &self,
         request: Request<BlobId>,
@@ -519,7 +580,12 @@ where
         Ok(Response::new(blob.into_content().try_into()?))
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "download_pending_blob")
+    )]
     async fn download_pending_blob(
         &self,
         request: Request<PendingBlobRequest>,
@@ -544,7 +610,12 @@ where
         }
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "handle_pending_blob")
+    )]
     async fn handle_pending_blob(
         &self,
         request: Request<HandlePendingBlobRequest>,
@@ -569,7 +640,12 @@ where
         }
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "download_certificate")
+    )]
     async fn download_certificate(
         &self,
         request: Request<CryptoHash>,
@@ -586,7 +662,12 @@ where
         Ok(Response::new(certificate.try_into()?))
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "download_certificates")
+    )]
     async fn download_certificates(
         &self,
         request: Request<CertificatesBatchRequest>,
@@ -632,7 +713,12 @@ where
         )?))
     }
 
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "download_certificates_by_heights")
+    )]
     async fn download_certificates_by_heights(
         &self,
         request: Request<api::DownloadCertificatesByHeightsRequest>,
@@ -659,9 +745,12 @@ where
                 chain_info.requested_sent_certificate_hashes
             }
             Some(api::chain_info_result::Inner::Error(error)) => {
+                let error =
+                    bincode::deserialize(&error).unwrap_or_else(|err| NodeError::GrpcError {
+                        error: format!("failed to unmarshal error message: {}", err),
+                    });
                 return Err(Status::internal(format!(
-                    "Chain info query failed: {:?}",
-                    error
+                    "Chain info query failed: {error}"
                 )));
             }
             None => {
@@ -702,9 +791,12 @@ where
                 chain_info.requested_sent_certificate_hashes
             }
             Some(api::chain_info_result::Inner::Error(error)) => {
+                let error =
+                    bincode::deserialize(&error).unwrap_or_else(|err| NodeError::GrpcError {
+                        error: format!("failed to unmarshal error message: {}", err),
+                    });
                 return Err(Status::internal(format!(
-                    "Chain info query failed: {:?}",
-                    error
+                    "Chain info query failed: {error}"
                 )));
             }
             None => {
@@ -747,7 +839,9 @@ where
         }))
     }
 
-    #[instrument(skip_all, err(level = Level::WARN))]
+    #[instrument(target = "telemetry_only", skip_all, err(level = Level::WARN), fields(
+        method = "blob_last_used_by"
+    ))]
     async fn blob_last_used_by(
         &self,
         request: Request<BlobId>,
@@ -767,7 +861,9 @@ where
         Ok(Response::new(last_used_by.into()))
     }
 
-    #[instrument(skip_all, err(level = Level::WARN))]
+    #[instrument(target = "telemetry_only", skip_all, err(level = Level::WARN), fields(
+        method = "blob_last_used_by_certificate"
+    ))]
     async fn blob_last_used_by_certificate(
         &self,
         request: Request<BlobId>,
@@ -777,7 +873,9 @@ where
         self.download_certificate(request).await
     }
 
-    #[instrument(skip_all, err(level = Level::WARN))]
+    #[instrument(target = "telemetry_only", skip_all, err(level = Level::WARN), fields(
+        method = "missing_blob_ids"
+    ))]
     async fn missing_blob_ids(
         &self,
         request: Request<BlobIds>,
@@ -798,7 +896,12 @@ impl<S> NotifierService for GrpcProxy<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    #[instrument(skip_all, err(Display))]
+    #[instrument(
+        target = "telemetry_only",
+        skip_all,
+        err(Display),
+        fields(method = "notify")
+    )]
     async fn notify(&self, request: Request<Notification>) -> Result<Response<()>, Status> {
         let notification = request.into_inner();
         let chain_id = notification

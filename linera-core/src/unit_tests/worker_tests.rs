@@ -149,6 +149,8 @@ where
             "Single validator node".to_string(),
             Some(validator_keypair.secret_key),
             storage,
+            5_000,
+            10_000,
         )
         .with_allow_inactive_chains(is_client)
         .with_allow_messages_from_deprecated_epochs(is_client)
@@ -299,7 +301,7 @@ where
         &self,
         chain_description: ChainDescription,
         chain_owner_pubkey: AccountPublicKey,
-        authenticated_signer: AccountOwner,
+        authenticated_owner: AccountOwner,
         source: AccountOwner,
         recipient: Account,
         amount: Amount,
@@ -311,7 +313,7 @@ where
         self.make_transfer_certificate_for_epoch(
             chain_description,
             chain_owner_pubkey,
-            authenticated_signer,
+            authenticated_owner,
             source,
             recipient,
             amount,
@@ -333,7 +335,7 @@ where
         &self,
         chain_description: ChainDescription,
         chain_owner_pubkey: AccountPublicKey,
-        authenticated_signer: AccountOwner,
+        authenticated_owner: AccountOwner,
         source: AccountOwner,
         recipient: Account,
         amount: Amount,
@@ -357,7 +359,7 @@ where
             Some(cert) => make_child_block(cert.value()),
         }
         .with_transfer(source, recipient, amount);
-        block.authenticated_signer = Some(authenticated_signer);
+        block.authenticated_owner = Some(authenticated_owner);
         block.epoch = epoch;
 
         let mut messages = incoming_bundles
@@ -372,7 +374,7 @@ where
                             && matches!(posted_message.kind, MessageKind::Tracked)
                         {
                             vec![OutgoingMessage {
-                                authenticated_signer: posted_message.authenticated_signer,
+                                authenticated_owner: posted_message.authenticated_owner,
                                 destination: incoming_bundle.origin,
                                 grant: Amount::ZERO,
                                 refund_grant_to: None,
@@ -479,7 +481,7 @@ fn direct_outgoing_message(
 ) -> OutgoingMessage {
     OutgoingMessage {
         destination: recipient,
-        authenticated_signer: None,
+        authenticated_owner: None,
         grant: Amount::ZERO,
         refund_grant_to: None,
         kind,
@@ -609,7 +611,7 @@ where
     // test block non-positive amount
     let zero_amount_block_proposal = make_first_block(chain_1)
         .with_simple_transfer(chain_2, Amount::ZERO)
-        .with_authenticated_signer(Some(sender_owner))
+        .with_authenticated_owner(Some(sender_owner))
         .into_first_proposal(sender_owner, &signer)
         .await
         .unwrap();
@@ -657,7 +659,7 @@ where
     {
         let block_proposal = make_first_block(chain_1)
             .with_simple_transfer(chain_2, small_transfer)
-            .with_authenticated_signer(Some(owner))
+            .with_authenticated_owner(Some(owner))
             .with_timestamp(Timestamp::from(TEST_GRACE_PERIOD_MICROS + 1_000_000))
             .into_first_proposal(owner, &signer)
             .await
@@ -674,7 +676,7 @@ where
         let block = make_first_block(chain_1)
             .with_timestamp(block_0_time)
             .with_simple_transfer(chain_2, small_transfer)
-            .with_authenticated_signer(Some(owner));
+            .with_authenticated_owner(Some(owner));
         let block_proposal = block
             .clone()
             .into_first_proposal(owner, &signer)
@@ -785,7 +787,7 @@ where
     let chain_2 = env.add_root_chain(2, sender_owner, Amount::ZERO).await.id();
     let block_proposal0 = make_first_block(chain_1)
         .with_simple_transfer(chain_2, Amount::ONE)
-        .with_authenticated_signer(Some(sender_owner))
+        .with_authenticated_owner(Some(sender_owner))
         .into_first_proposal(sender_owner, &signer)
         .await
         .unwrap();
@@ -1046,7 +1048,7 @@ where
             make_first_block(chain_1)
                 .with_simple_transfer(chain_2, Amount::ONE)
                 .with_simple_transfer(chain_2, Amount::from_tokens(2))
-                .with_authenticated_signer(Some(sender_owner)),
+                .with_authenticated_owner(Some(sender_owner)),
         ),
     ));
 
@@ -1072,7 +1074,7 @@ where
         .with(
             make_child_block(&certificate0.clone().into_value())
                 .with_simple_transfer(chain_2, Amount::from_tokens(3))
-                .with_authenticated_signer(Some(sender_owner)),
+                .with_authenticated_owner(Some(sender_owner)),
         ),
     ));
     // Missing earlier blocks, but the certificate will be preprocessed.
@@ -1127,7 +1129,7 @@ where
     {
         let block_proposal = make_first_block(chain_2)
             .with_simple_transfer(chain_3, Amount::from_tokens(6))
-            .with_authenticated_signer(Some(recipient_owner))
+            .with_authenticated_owner(Some(recipient_owner))
             .into_first_proposal(recipient_owner, &signer)
             .await
             .unwrap();
@@ -1183,7 +1185,7 @@ where
                 },
                 action: MessageAction::Accept,
             })
-            .with_authenticated_signer(Some(recipient_owner))
+            .with_authenticated_owner(Some(recipient_owner))
             .into_first_proposal(recipient_owner, &signer)
             .await
             .unwrap();
@@ -1209,7 +1211,7 @@ where
                 },
                 action: MessageAction::Accept,
             })
-            .with_authenticated_signer(Some(recipient_owner))
+            .with_authenticated_owner(Some(recipient_owner))
             .into_first_proposal(recipient_owner, &signer)
             .await
             .unwrap();
@@ -1260,7 +1262,7 @@ where
                 },
                 action: MessageAction::Accept,
             })
-            .with_authenticated_signer(Some(recipient_owner))
+            .with_authenticated_owner(Some(recipient_owner))
             .into_first_proposal(recipient_owner, &signer)
             .await
             .unwrap();
@@ -1287,7 +1289,7 @@ where
                 action: MessageAction::Accept,
             })
             .with_simple_transfer(chain_3, Amount::ONE)
-            .with_authenticated_signer(Some(recipient_owner))
+            .with_authenticated_owner(Some(recipient_owner))
             .into_first_proposal(recipient_owner, &signer)
             .await
             .unwrap();
@@ -1377,7 +1379,7 @@ where
     let chain_2 = chain_2_desc.id();
     let block_proposal = make_first_block(chain_1)
         .with_simple_transfer(chain_2, Amount::from_tokens(1000))
-        .with_authenticated_signer(Some(sender_owner))
+        .with_authenticated_owner(Some(sender_owner))
         .into_first_proposal(sender_owner, &signer)
         .await
         .unwrap();
@@ -1418,7 +1420,7 @@ where
     let chain_2 = chain_2_desc.id();
     let block_proposal = make_first_block(chain_1)
         .with_simple_transfer(chain_2, Amount::from_tokens(5))
-        .with_authenticated_signer(Some(sender_owner))
+        .with_authenticated_owner(Some(sender_owner))
         .into_first_proposal(sender_owner, &signer)
         .await
         .unwrap();
@@ -1472,7 +1474,7 @@ where
     let chain_2 = chain_2_desc.id();
     let block_proposal = make_first_block(chain_1)
         .with_simple_transfer(chain_2, Amount::from_tokens(5))
-        .with_authenticated_signer(Some(sender_owner))
+        .with_authenticated_owner(Some(sender_owner))
         .into_first_proposal(sender_owner, &signer)
         .await
         .unwrap();
@@ -1555,7 +1557,7 @@ where
     state.balance = balance;
     let block = make_first_block(chain_id)
         .with_simple_transfer(chain_id, small_transfer)
-        .with_authenticated_signer(Some(sender_key_pair.public().into()));
+        .with_authenticated_owner(Some(sender_key_pair.public().into()));
 
     let value = ConfirmedBlock::new(
         BlockExecutionOutcome {
@@ -1723,7 +1725,7 @@ where
         .inboxes
         .try_load_entry(&chain_3)
         .await?
-        .expect("Missing inbox for `chain_3` in `ChainId::root(1)`");
+        .expect("Missing inbox for `chain_3` in `chain_1`");
     assert_eq!(BlockHeight::ZERO, inbox.next_block_height_to_receive()?);
     assert_eq!(inbox.added_bundles.count(), 0);
     assert_matches!(
@@ -1742,7 +1744,7 @@ where
             && height == BlockHeight::ZERO
             && timestamp == Timestamp::from(0)
             && matches!(messages[..], [PostedMessage {
-                authenticated_signer: None,
+                authenticated_owner: None,
                 grant: Amount::ZERO,
                 refund_grant_to: None,
                 kind: MessageKind::Tracked,
@@ -1930,7 +1932,7 @@ where
         && height == BlockHeight::ZERO
         && timestamp == Timestamp::from(0)
         && matches!(messages[..], [PostedMessage {
-            authenticated_signer: None,
+            authenticated_owner: None,
             grant: Amount::ZERO,
             refund_grant_to: None,
             kind: MessageKind::Tracked,
@@ -1991,7 +1993,7 @@ where
         .inboxes
         .try_load_entry(&chain_1)
         .await?
-        .expect("Missing inbox for `ChainId::root(1)` in `chain_2`");
+        .expect("Missing inbox for `chain_1` in `chain_2`");
     assert_eq!(BlockHeight::from(1), inbox.next_block_height_to_receive()?);
     assert_matches!(
         inbox
@@ -2009,7 +2011,7 @@ where
         && height == BlockHeight::ZERO
         && timestamp == Timestamp::from(0)
         && matches!(messages[..], [PostedMessage {
-            authenticated_signer: None,
+            authenticated_owner: None,
             grant: Amount::ZERO,
             refund_grant_to: None,
             kind: MessageKind::Tracked,
@@ -2564,7 +2566,7 @@ where
                     balance: Amount::ZERO,
                     application_permissions: Default::default(),
                 }))
-                .with_authenticated_signer(Some(env.admin_public_key().into())),
+                .with_authenticated_owner(Some(env.admin_public_key().into())),
         ),
     ));
     env.worker()
@@ -2781,7 +2783,7 @@ where
         .with(
             make_first_block(user_id)
                 .with_simple_transfer(admin_id, Amount::ONE)
-                .with_authenticated_signer(Some(owner1)),
+                .with_authenticated_owner(Some(owner1)),
         ),
     ));
     // Have the admin chain create a new epoch without retiring the old one.
@@ -2906,7 +2908,7 @@ where
         .with(
             make_first_block(user_id)
                 .with_simple_transfer(admin_id, Amount::ONE)
-                .with_authenticated_signer(Some(owner1)),
+                .with_authenticated_owner(Some(owner1)),
         ),
     ));
     // Have the admin chain create a new epoch and retire the old one immediately.
@@ -3302,7 +3304,7 @@ where
             open_multi_leader_rounds: false,
             timeout_config: TimeoutConfig::default(),
         })
-        .with_authenticated_signer(Some(owner0));
+        .with_authenticated_owner(Some(owner0));
     let (block0, _) = env
         .worker()
         .stage_block_execution(proposed_block0, None, vec![])
@@ -3371,7 +3373,7 @@ where
         .await?;
     let proposal1_wrong_owner = proposed_block1
         .clone()
-        .with_authenticated_signer(Some(owner1))
+        .with_authenticated_owner(Some(owner1))
         .into_proposal_with_round(owner1, &signer, Round::SingleLeader(1))
         .await
         .unwrap();
@@ -3440,7 +3442,7 @@ where
     // Proposing block2 now would fail.
     let proposal = proposed_block2
         .clone()
-        .with_authenticated_signer(Some(owner1))
+        .with_authenticated_owner(Some(owner1))
         .into_proposal_with_round(owner1, &signer, Round::SingleLeader(5))
         .await
         .unwrap();
@@ -3617,7 +3619,7 @@ where
     let block1 = make_child_block(&value0).with_simple_transfer(chain_id, small_transfer);
     let proposal1 = block1
         .clone()
-        .with_authenticated_signer(Some(owner1))
+        .with_authenticated_owner(Some(owner1))
         .into_proposal_with_round(owner1, &signer, Round::MultiLeader(1))
         .await
         .unwrap();
@@ -3685,7 +3687,7 @@ where
     // Without the transfer, a random key pair can propose a block.
     let proposal = make_child_block(&change_ownership_value)
         .with_simple_transfer(chain_id, small_transfer)
-        .with_authenticated_signer(Some(owner))
+        .with_authenticated_owner(Some(owner))
         .into_proposal_with_round(owner, &signer, Round::MultiLeader(0))
         .await
         .unwrap();
@@ -3727,7 +3729,7 @@ where
             Account::new(chain_id, owner0),
             Amount::from_tokens(1),
         )
-        .with_authenticated_signer(Some(owner0))
+        .with_authenticated_owner(Some(owner0))
         .with_operation(SystemOperation::ChangeOwnership {
             super_owners: vec![owner0],
             owners: vec![(owner0, 100), (owner1, 100)],
@@ -3760,7 +3762,7 @@ where
             Account::new(chain_id, owner0),
             Amount::from_micros(1),
         )
-        .with_authenticated_signer(Some(owner0));
+        .with_authenticated_owner(Some(owner0));
     let proposal1 = proposed_block1
         .clone()
         .into_proposal_with_round(owner0, &signer, Round::Fast)
@@ -3806,7 +3808,7 @@ where
     // Proposing a different block is not.
     let proposed_block2 = make_child_block(&value0)
         .with_simple_transfer(chain_id, Amount::ONE)
-        .with_authenticated_signer(Some(owner1));
+        .with_authenticated_owner(Some(owner1));
     let proposal2 = proposed_block2
         .clone()
         .into_proposal_with_round(owner1, &signer, Round::MultiLeader(1))
@@ -3901,7 +3903,7 @@ where
     // Make a tracked message between chains. This will create a cross-chain message.
     let proposed_block = make_first_block(chain_1)
         .with_simple_transfer(chain_2, Amount::ONE)
-        .with_authenticated_signer(Some(public_key.into()));
+        .with_authenticated_owner(Some(public_key.into()));
     let (block, _) = env
         .worker()
         .stage_block_execution(proposed_block, None, vec![])
@@ -4131,7 +4133,7 @@ where
     let block = make_first_block(chain_1)
         .with_timestamp(Timestamp::from(BLOCK_TIMESTAMP))
         .with_simple_transfer(chain_2, small_transfer)
-        .with_authenticated_signer(Some(owner));
+        .with_authenticated_owner(Some(owner));
 
     let block_proposal = block
         .clone()

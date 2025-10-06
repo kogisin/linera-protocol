@@ -121,7 +121,10 @@ async fn test_chain_listener() -> anyhow::Result<()> {
             [chain_id0],
             format!("Client node for {:.8}", chain_id0),
             Duration::from_secs(30),
+            Duration::from_secs(1),
             ChainClientOptions::test_default(),
+            5_000,
+            10_000,
         )),
     };
     context
@@ -152,7 +155,7 @@ async fn test_chain_listener() -> anyhow::Result<()> {
     let cancellation_token = CancellationToken::new();
     let child_token = cancellation_token.child_token();
     let chain_listener = ChainListener::new(config, context, storage, child_token)
-        .run()
+        .run(None) // Unit test doesn't need background sync
         .await
         .unwrap();
 
@@ -206,14 +209,17 @@ async fn test_chain_listener_admin_chain() -> anyhow::Result<()> {
             [],
             "Client node with no chains".to_string(),
             Duration::from_secs(30),
+            Duration::from_secs(1),
             ChainClientOptions::test_default(),
+            5_000,
+            10_000,
         )),
     };
     let context = Arc::new(Mutex::new(context));
     let cancellation_token = CancellationToken::new();
     let child_token = cancellation_token.child_token();
     let chain_listener = ChainListener::new(config, context, storage.clone(), child_token)
-        .run()
+        .run(None) // Unit test doesn't need background sync
         .await
         .unwrap();
 

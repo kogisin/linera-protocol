@@ -488,11 +488,16 @@ where
             } => {
                 let count = self
                     .state
+                    .system
                     .stream_event_counts
                     .get_mut_or_default(&stream_id)
                     .await?;
                 let index = *count;
                 *count = count.checked_add(1).ok_or(ArithmeticError::Overflow)?;
+                self.resource_controller
+                    .with_state(&mut self.state.system)
+                    .await?
+                    .track_event_published(&value)?;
                 self.txn_tracker.add_event(stream_id, index, value);
                 callback.respond(index)
             }
@@ -510,6 +515,10 @@ where
                     })
                     .await?
                     .to_event(&event_id)?;
+                self.resource_controller
+                    .with_state(&mut self.state.system)
+                    .await?
+                    .track_event_read(event.len() as u64)?;
                 callback.respond(event);
             }
 
@@ -864,7 +873,7 @@ where
         assert_eq!(context.chain_id, self.state.context().extra().chain_id());
         self.txn_tracker.add_outgoing_message(OutgoingMessage {
             destination: context.origin,
-            authenticated_signer: context.authenticated_signer,
+            authenticated_owner: context.authenticated_owner,
             refund_grant_to: context.refund_grant_to.filter(|_| !grant.is_zero()),
             grant,
             kind: MessageKind::Bouncing,
@@ -889,7 +898,7 @@ where
         };
         let message = SystemMessage::Credit {
             amount,
-            source: context.authenticated_signer.unwrap_or(AccountOwner::CHAIN),
+            source: context.authenticated_owner.unwrap_or(AccountOwner::CHAIN),
             target: account.owner,
         };
         self.txn_tracker.add_outgoing_message(

@@ -36,6 +36,8 @@ use linera_execution::{
     committee::Committee, system::AdminOperation, Operation, Query, QueryOutcome, QueryResponse,
     SystemOperation,
 };
+#[cfg(with_metrics)]
+use linera_metrics::monitoring_server;
 use linera_sdk::linera_base_types::BlobContent;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -181,8 +183,7 @@ where
         let mut hashes = Vec::new();
         loop {
             let client = self.context.lock().await.make_chain_client(chain_id);
-            client.synchronize_from_validators().await?;
-            let result = client.process_inbox_without_prepare().await;
+            let result = client.process_inbox().await;
             self.context.lock().await.update_wallet(&client).await?;
             let (certificates, maybe_timeout) = result?;
             hashes.extend(certificates.into_iter().map(|cert| cert.hash()));
@@ -195,6 +196,20 @@ where
                 }
             }
         }
+    }
+
+    /// Synchronizes the chain with the validators. Returns the chain's length.
+    ///
+    /// This is only used for testing, to make sure that a client is up to date.
+    // TODO(#4718): Remove this mutation.
+    async fn sync(
+        &self,
+        #[graphql(desc = "The chain being synchronized.")] chain_id: ChainId,
+    ) -> Result<u64, Error> {
+        let client = self.context.lock().await.make_chain_client(chain_id);
+        let info = client.synchronize_from_validators().await?;
+        self.context.lock().await.update_wallet(&client).await?;
+        Ok(info.next_block_height.0)
     }
 
     /// Retries the pending block that was unsuccessfully proposed earlier.
@@ -816,6 +831,8 @@ where
 {
     config: ChainListenerConfig,
     port: NonZeroU16,
+    #[cfg(with_metrics)]
+    metrics_port: NonZeroU16,
     default_chain: Option<ChainId>,
     context: Arc<Mutex<C>>,
 }
@@ -828,6 +845,8 @@ where
         Self {
             config: self.config.clone(),
             port: self.port,
+            #[cfg(with_metrics)]
+            metrics_port: self.metrics_port,
             default_chain: self.default_chain,
             context: Arc::clone(&self.context),
         }
@@ -842,15 +861,23 @@ where
     pub fn new(
         config: ChainListenerConfig,
         port: NonZeroU16,
+        #[cfg(with_metrics)] metrics_port: NonZeroU16,
         default_chain: Option<ChainId>,
         context: C,
     ) -> Self {
         Self {
             config,
             port,
+            #[cfg(with_metrics)]
+            metrics_port,
             default_chain,
             context: Arc::new(Mutex::new(context)),
         }
+    }
+
+    #[cfg(with_metrics)]
+    pub fn metrics_address(&self) -> SocketAddr {
+        SocketAddr::from(([0, 0, 0, 0], self.metrics_port.get()))
     }
 
     pub fn schema(&self) -> Schema<QueryRoot<C>, MutationRoot<C>, SubscriptionRoot<C>> {
@@ -872,11 +899,18 @@ where
 
     /// Runs the node service.
     #[instrument(name = "node_service", level = "info", skip_all, fields(port = ?self.port))]
-    pub async fn run(self, cancellation_token: CancellationToken) -> Result<(), anyhow::Error> {
+    pub async fn run(
+        self,
+        cancellation_token: CancellationToken,
+        sync_sleep_ms: u64,
+    ) -> Result<(), anyhow::Error> {
         let port = self.port.get();
         let index_handler = axum::routing::get(util::graphiql).post(Self::index_handler);
         let application_handler =
             axum::routing::get(util::graphiql).post(Self::application_handler);
+
+        #[cfg(with_metrics)]
+        monitoring_server::start_metrics(self.metrics_address(), cancellation_token.clone());
 
         let app = Router::new()
             .route("/", index_handler)
@@ -894,14 +928,20 @@ where
 
         let storage = self.context.lock().await.storage().clone();
 
-        let chain_listener =
-            ChainListener::new(self.config, self.context, storage, cancellation_token)
-                .run()
-                .await?;
+        let chain_listener = ChainListener::new(
+            self.config,
+            self.context,
+            storage,
+            cancellation_token.clone(),
+        )
+        .run(Some(sync_sleep_ms))
+        .await?;
         let mut chain_listener = Box::pin(chain_listener).fuse();
         let tcp_listener =
             tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
-        let server = axum::serve(tcp_listener, app).into_future();
+        let server = axum::serve(tcp_listener, app)
+            .with_graceful_shutdown(cancellation_token.cancelled_owned())
+            .into_future();
         futures::select! {
             result = chain_listener => result?,
             result = Box::pin(server).fuse() => result?,

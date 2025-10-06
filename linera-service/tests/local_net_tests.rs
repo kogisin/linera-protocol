@@ -67,7 +67,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         .await?;
 
     let mut faucet_service = faucet_client
-        .run_faucet(None, faucet_chain, Amount::from_tokens(2))
+        .run_faucet(None, Some(faucet_chain), Amount::from_tokens(2))
         .await?;
 
     faucet_service.ensure_is_running()?;
@@ -177,9 +177,15 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     client.query_validators(None).await?;
     client.query_validators(Some(chain_1)).await?;
     if let Some(service) = &node_service_2 {
-        service.process_inbox(&chain_2).await?;
+        assert!(
+            eventually(|| async { !service.process_inbox(&chain_2).await.unwrap().is_empty() })
+                .await
+        );
         client.revoke_epochs(Epoch(2)).await?;
-        service.process_inbox(&chain_2).await?;
+        assert!(
+            eventually(|| async { !service.process_inbox(&chain_2).await.unwrap().is_empty() })
+                .await
+        );
         let committees = service.query_committees(&chain_2).await?;
         let epochs = committees.into_keys().collect::<Vec<_>>();
         assert_eq!(&epochs, &[Epoch(3)]);
@@ -194,9 +200,15 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         let validator_key = net.validator_keys(i).unwrap();
         client.remove_validator(&validator_key.0).await?;
         if let Some(service) = &node_service_2 {
-            service.process_inbox(&chain_2).await?;
+            assert!(
+                eventually(|| async { !service.process_inbox(&chain_2).await.unwrap().is_empty() })
+                    .await
+            );
             client.revoke_epochs(Epoch(3 + i as u32)).await?;
-            service.process_inbox(&chain_2).await?;
+            assert!(
+                eventually(|| async { !service.process_inbox(&chain_2).await.unwrap().is_empty() })
+                    .await
+            );
             let committees = service.query_committees(&chain_2).await?;
             let epochs = committees.into_keys().collect::<Vec<_>>();
             assert_eq!(&epochs, &[Epoch(4 + i as u32)]);
@@ -220,7 +232,10 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         .await?;
 
     if let Some(mut service) = node_service_2 {
-        service.process_inbox(&chain_2).await?;
+        assert!(
+            eventually(|| async { !service.process_inbox(&chain_2).await.unwrap().is_empty() })
+                .await
+        );
         let balance = service.balance(&account_recipient).await?;
         assert_eq!(balance, Amount::from_tokens(5));
         let committees = service.query_committees(&chain_2).await?;
@@ -284,7 +299,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
 
     if matches!(network, Network::Grpc) {
         let mut faucet_service = faucet_client
-            .run_faucet(None, faucet_chain, Amount::from_tokens(2))
+            .run_faucet(None, Some(faucet_chain), Amount::from_tokens(2))
             .await?;
 
         faucet_service.ensure_is_running()?;
@@ -327,7 +342,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
     faucet_client.process_inbox(faucet_chain).await?;
 
     let mut faucet_service = faucet_client
-        .run_faucet(None, faucet_chain, Amount::from_tokens(2))
+        .run_faucet(None, Some(faucet_chain), Amount::from_tokens(2))
         .await?;
 
     faucet_service.ensure_is_running()?;
@@ -381,7 +396,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
 
     if matches!(network, Network::Grpc) {
         let mut faucet_service = faucet_client
-            .run_faucet(None, faucet_chain, Amount::from_tokens(2))
+            .run_faucet(None, Some(faucet_chain), Amount::from_tokens(2))
             .await?;
 
         faucet_service.ensure_is_running()?;
@@ -427,7 +442,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
 
     if matches!(network, Network::Grpc) {
         let mut faucet_service = faucet_client
-            .run_faucet(None, faucet_chain, Amount::from_tokens(2))
+            .run_faucet(None, Some(faucet_chain), Amount::from_tokens(2))
             .await?;
 
         faucet_service.ensure_is_running()?;
@@ -472,7 +487,7 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     faucet_client.process_inbox(faucet_chain).await?;
 
     let mut faucet_service = faucet_client
-        .run_faucet(None, faucet_chain, Amount::from_tokens(2))
+        .run_faucet(None, Some(faucet_chain), Amount::from_tokens(2))
         .await?;
 
     faucet_service.ensure_is_running()?;
@@ -509,7 +524,7 @@ async fn test_end_to_end_retry_notification_stream(config: LocalNetConfig) -> Re
 
     let (chain, chain1) = {
         let wallet = client1.load_wallet()?;
-        let chains = wallet.chain_ids();
+        let chains = wallet.owned_chain_ids();
         (chains[0], chains[1])
     };
 
@@ -557,51 +572,6 @@ async fn test_end_to_end_retry_notification_stream(config: LocalNetConfig) -> Re
     }
 
     node_service2.ensure_is_running()?;
-
-    net.ensure_is_running().await?;
-    net.terminate().await?;
-
-    Ok(())
-}
-
-#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
-#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[test_log::test(tokio::test)]
-async fn test_end_to_end_retry_pending_block(config: LocalNetConfig) -> Result<()> {
-    let _guard = INTEGRATION_TEST_GUARD.lock().await;
-    tracing::info!("Starting test {}", test_name!());
-
-    // Create runner and client.
-    let (mut net, client) = config.instantiate().await?;
-    let (chain_id, chain1) = {
-        let wallet = client.load_wallet()?;
-        let chains = wallet.chain_ids();
-        (chains[0], chains[1])
-    };
-    let account = Account::chain(chain_id);
-    let balance = client.local_balance(account).await?;
-    // Stop validators.
-    for i in 0..4 {
-        net.remove_validator(i)?;
-    }
-    let result = client
-        .transfer_with_silent_logs(Amount::from_tokens(2), chain_id, chain1)
-        .await;
-    assert!(result.is_err());
-    // The transfer didn't get confirmed.
-    assert_eq!(client.local_balance(account).await?, balance);
-    // Restart validators.
-    for i in 0..4 {
-        net.restart_validator(i).await?;
-    }
-    let result = client.retry_pending_block(Some(chain_id)).await;
-    assert!(result?.is_some());
-    client.sync(chain_id).await?;
-    // After retrying, the transfer got confirmed.
-    assert!(client.local_balance(account).await? <= balance - Amount::from_tokens(2));
-    let result = client.retry_pending_block(Some(chain_id)).await;
-    assert!(result?.is_none());
 
     net.ensure_is_running().await?;
     net.terminate().await?;
@@ -742,37 +712,40 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
     let mut lines = stderr.lines();
 
     let mut is_ready = false;
+    eprintln!("waiting for network to be ready");
     for line in &mut lines {
         let line = line?;
+        eprintln!("[net up]: {line}");
         if line.starts_with("READY!") {
             is_ready = true;
             break;
         }
     }
-    assert!(is_ready, "Unexpected EOF for stderr");
+
+    if !is_ready {
+        assert!(is_ready, "unexpected EOF for stderr");
+    } else {
+        eprintln!("network is ready");
+    }
 
     // Echo faucet stderr for debugging and to empty the buffer.
     std::thread::spawn(move || {
         for line in lines {
-            let line = line.unwrap();
-            eprintln!("{}", line);
+            eprintln!("[net up] {}", line.unwrap());
         }
     });
 
-    let mut exports = stdout.lines();
-    assert!(exports
-        .next()
-        .unwrap()?
-        .starts_with("export LINERA_WALLET="));
-    assert!(exports
-        .next()
-        .unwrap()?
-        .starts_with("export LINERA_KEYSTORE="));
-    assert!(exports
-        .next()
-        .unwrap()?
-        .starts_with("export LINERA_STORAGE="));
-    assert_eq!(exports.next().unwrap()?, "");
+    insta::assert_snapshot!(stdout
+        .lines()
+        .map_while(|line| {
+            println!("{line:?}");
+            line.unwrap()
+                .split_once("=")
+                .map(|x| x.0.to_owned())
+                .filter(|line| line.starts_with("export"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n"));
 
     // Test faucet.
     let faucet = Faucet::new(format!("http://localhost:{}/", port));
@@ -783,7 +756,6 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
         .args(["-s", "INT", &child.id().to_string()])
         .output()?;
 
-    assert!(exports.next().is_none());
     assert!(child.wait()?.success());
     return Ok(());
 }
