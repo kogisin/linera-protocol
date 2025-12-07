@@ -20,11 +20,41 @@ use linera_client::{
 };
 use linera_rpc::config::CrossChainConfig;
 
+use crate::cli::validator;
+
 const DEFAULT_TOKENS_PER_CHAIN: Amount = Amount::from_millis(100);
 const DEFAULT_TRANSACTIONS_PER_BLOCK: usize = 1;
 const DEFAULT_WRAP_UP_MAX_IN_FLIGHT: usize = 5;
 const DEFAULT_NUM_CHAINS: usize = 10;
 const DEFAULT_BPS: usize = 10;
+
+/// Specification for a validator to be added to the committee.
+#[derive(Clone, Debug)]
+pub struct ValidatorToAdd {
+    pub public_key: ValidatorPublicKey,
+    pub account_key: AccountPublicKey,
+    pub address: String,
+    pub votes: u64,
+}
+
+impl std::str::FromStr for ValidatorToAdd {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split(',').collect();
+        anyhow::ensure!(
+            parts.len() == 4,
+            "Validator spec must be in format: public_key,account_key,address,votes"
+        );
+
+        Ok(ValidatorToAdd {
+            public_key: parts[0].parse()?,
+            account_key: parts[1].parse()?,
+            address: parts[2].to_string(),
+            votes: parts[3].parse()?,
+        })
+    }
+}
 
 #[derive(Clone, clap::Args, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -332,71 +362,10 @@ pub enum ClientCommand {
         chain_id: Option<ChainId>,
     },
 
-    /// Show the version and genesis config hash of a new validator, and print a warning if it is
-    /// incompatible. Also print some information about the given chain while we are at it.
-    QueryValidator {
-        /// The new validator's address.
-        address: String,
-        /// The chain to query. If omitted, query the default chain of the wallet.
-        chain_id: Option<ChainId>,
-        /// The public key of the validator. If given, the signature of the chain query
-        /// info will be checked.
-        #[arg(long)]
-        public_key: Option<ValidatorPublicKey>,
-    },
-
-    /// Show the current set of validators for a chain. Also print some information about
-    /// the given chain while we are at it.
-    QueryValidators {
-        /// The chain to query. If omitted, query the default chain of the wallet.
-        chain_id: Option<ChainId>,
-    },
-
-    /// Synchronizes a validator with the local state of chains.
-    SyncValidator {
-        /// The public address of the validator to synchronize.
-        address: String,
-
-        /// The chains to synchronize, or the default chain if empty.
-        #[arg(long, num_args = 0..)]
-        chains: Vec<ChainId>,
-    },
-
-    /// Synchronizes all validators with the local state of chains.
-    SyncAllValidators {
-        /// The chains to synchronize, or the default chain if empty.
-        #[arg(long, num_args = 0..)]
-        chains: Vec<ChainId>,
-    },
-
-    /// Add or modify a validator (admin only)
-    SetValidator {
-        /// The public key of the validator.
-        #[arg(long)]
-        public_key: ValidatorPublicKey,
-
-        /// The public key of the account controlled by the validator.
-        #[arg(long)]
-        account_key: AccountPublicKey,
-
-        /// Network address
-        #[arg(long)]
-        address: String,
-
-        /// Voting power
-        #[arg(long, default_value = "1")]
-        votes: u64,
-
-        /// Skip the version and genesis config checks.
-        #[arg(long)]
-        skip_online_check: bool,
-    },
-
-    /// Remove a validator (admin only)
-    RemoveValidator {
-        /// The public key of the validator.
-        #[arg(long)]
-        public_key: ValidatorPublicKey,
+    /// Query validators for shard information about a specific chain.
+    QueryShardInfo {
+        /// The chain to query shard information for.
+        chain_id: ChainId,
     },
 
     /// Deprecates all committees up to and including the specified one.
@@ -750,14 +719,6 @@ pub enum ClientCommand {
         #[arg(long)]
         port: NonZeroU16,
 
-        /// Milliseconds to sleep between batches during background certificate synchronization.
-        #[arg(
-            long = "sync-sleep-ms",
-            default_value = "500",
-            env = "LINERA_SYNC_SLEEP_MS"
-        )]
-        sync_sleep_ms: u64,
-
         /// The port to expose metrics on.
         #[cfg(with_metrics)]
         #[arg(long)]
@@ -959,6 +920,10 @@ pub enum ClientCommand {
     #[command(subcommand)]
     Net(NetCommand),
 
+    /// Manage validators in the committee.
+    #[command(subcommand)]
+    Validator(validator::ValidatorCommand),
+
     /// Operation on the storage.
     #[command(subcommand)]
     Storage(DatabaseToolCommand),
@@ -982,6 +947,13 @@ pub enum ClientCommand {
         #[arg(long, default_value = DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS, value_parser = util::parse_secs)]
         pause_after_gql_mutations: Duration,
     },
+
+    /// Generate shell completion scripts
+    Completion {
+        /// The shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 impl ClientCommand {
@@ -1002,12 +974,7 @@ impl ClientCommand {
             | ClientCommand::SyncBalance { .. }
             | ClientCommand::Sync { .. }
             | ClientCommand::ProcessInbox { .. }
-            | ClientCommand::QueryValidator { .. }
-            | ClientCommand::QueryValidators { .. }
-            | ClientCommand::SyncValidator { .. }
-            | ClientCommand::SyncAllValidators { .. }
-            | ClientCommand::SetValidator { .. }
-            | ClientCommand::RemoveValidator { .. }
+            | ClientCommand::QueryShardInfo { .. }
             | ClientCommand::ResourceControlPolicy { .. }
             | ClientCommand::RevokeEpochs { .. }
             | ClientCommand::CreateGenesisConfig { .. }
@@ -1021,6 +988,7 @@ impl ClientCommand {
             | ClientCommand::Assign { .. }
             | ClientCommand::Wallet { .. }
             | ClientCommand::Chain { .. }
+            | ClientCommand::Validator { .. }
             | ClientCommand::RetryPendingBlock { .. } => "client".into(),
             ClientCommand::Benchmark(BenchmarkCommand::Single { .. }) => "single-benchmark".into(),
             ClientCommand::Benchmark(BenchmarkCommand::Multi { .. }) => "multi-benchmark".into(),
@@ -1030,9 +998,9 @@ impl ClientCommand {
             ClientCommand::Storage { .. } => "storage".into(),
             ClientCommand::Service { port, .. } => format!("service-{port}").into(),
             ClientCommand::Faucet { .. } => "faucet".into(),
-            ClientCommand::HelpMarkdown | ClientCommand::ExtractScriptFromMarkdown { .. } => {
-                "tool".into()
-            }
+            ClientCommand::HelpMarkdown
+            | ClientCommand::ExtractScriptFromMarkdown { .. }
+            | ClientCommand::Completion { .. } => "tool".into(),
         }
     }
 }
@@ -1062,6 +1030,9 @@ pub enum DatabaseToolCommand {
 
     /// List the chain IDs in the database
     ListChainIds,
+
+    /// List the event IDs in the database
+    ListEventIds,
 }
 
 #[allow(clippy::large_enum_variant)]

@@ -15,16 +15,16 @@ use linera_views::{
         Batch, WriteOperation,
         WriteOperation::{Delete, DeletePrefix, Put},
     },
-    collection_view::{CollectionView, HashedCollectionView},
+    collection_view::HashedCollectionView,
     context::{Context, MemoryContext, ViewContext},
     key_value_store_view::{KeyValueStoreView, ViewContainer},
     log_view::HashedLogView,
     lru_caching::LruCachingMemoryDatabase,
-    map_view::{ByteMapView, HashedMapView, MapView},
+    map_view::{ByteMapView, HashedMapView},
     memory::MemoryDatabase,
     queue_view::HashedQueueView,
     random::make_deterministic_rng,
-    reentrant_collection_view::{HashedReentrantCollectionView, ReentrantCollectionView},
+    reentrant_collection_view::HashedReentrantCollectionView,
     register_view::HashedRegisterView,
     set_view::HashedSetView,
     store::{KeyValueDatabase, TestKeyValueDatabase as _, WritableKeyValueStore as _},
@@ -111,7 +111,7 @@ impl StateStorage for KeyValueStoreTestStorage {
         self.accessed_chains.insert(id);
         let base_key = bcs::to_bytes(&id)?;
         let store = self.store.clone();
-        let context = Self::Context::new_unsafe(store, base_key, id);
+        let context = Self::Context::new_unchecked(store, base_key, id);
         StateView::load(context).await
     }
 }
@@ -426,7 +426,7 @@ where
                 assert!(!view.set.contains(&42).await?);
             }
             if config.with_collection {
-                let subview = view.collection.load_entry_or_insert("hola").await?;
+                let subview = view.collection.load_entry_mut("hola").await?;
                 assert_eq!(subview.read(0..10).await?, Vec::<u32>::new());
                 let subview = view.collection2.load_entry_mut("ciao").await?;
                 let subsubview = subview.load_entry_mut("!").await?;
@@ -597,7 +597,7 @@ where
         {
             let mut view = store.load(1).await?;
             if config.with_collection {
-                let subview = view.collection.load_entry_or_insert("hola").await?;
+                let subview = view.collection.load_entry_mut("hola").await?;
                 assert_eq!(subview.read(0..10).await?, Vec::<u32>::new());
             }
             if config.with_queue {
@@ -612,52 +612,6 @@ where
         Ok(staged_hash)
     })
     .await
-}
-
-#[derive(RootView)]
-pub struct NestedCollectionMapView<C> {
-    pub map: CollectionView<C, String, MapView<C, String, u64>>,
-}
-
-// This test exercise the case W::NUM_INIT_KEYS == 0
-// in CollectionView.
-#[tokio::test]
-async fn test_nested_collection_map_view() -> anyhow::Result<()> {
-    let context = MemoryContext::new_for_testing(());
-    {
-        let mut view = NestedCollectionMapView::load(context.clone()).await?;
-        let subview = view.map.load_entry_mut("Bonjour").await?;
-        subview.insert("A bientot", 49)?;
-        view.save().await?;
-    }
-    let view = NestedCollectionMapView::load(context).await?;
-    let keys = vec!["Bonjour".to_string()];
-    let subviews = view.map.try_load_entries(&keys).await?;
-    assert!(subviews[0].is_some());
-    Ok(())
-}
-
-#[derive(RootView)]
-pub struct NestedReentrantCollectionMapView<C> {
-    pub map: ReentrantCollectionView<C, String, MapView<C, String, u64>>,
-}
-
-#[tokio::test]
-async fn test_nested_reentrant_collection_map_view() -> anyhow::Result<()> {
-    let context = MemoryContext::new_for_testing(());
-    {
-        let mut view = NestedReentrantCollectionMapView::load(context.clone()).await?;
-        {
-            let mut subview = view.map.try_load_entry_mut("Bonjour").await?;
-            subview.insert("A bientot", 49)?;
-        }
-        view.save().await?;
-    }
-    let view = NestedReentrantCollectionMapView::load(context).await?;
-    let keys = vec!["Bonjour".to_string()];
-    let subviews = view.map.try_load_entries(&keys).await?;
-    assert!(subviews[0].is_some());
-    Ok(())
 }
 
 #[derive(CryptoHashRootView)]
@@ -873,15 +827,17 @@ async fn test_collection_removal() -> Result<()> {
     let entry = collection.load_entry_mut(&1).await?;
     entry.set(1);
     let mut batch = Batch::new();
-    collection.flush(&mut batch)?;
+    collection.pre_save(&mut batch)?;
     collection.context().store().write_batch(batch).await?;
+    collection.post_save();
 
     // Remove the entry from the collection.
     let mut collection = CollectionViewType::load(context.clone()).await?;
     collection.remove_entry(&1)?;
     let mut batch = Batch::new();
-    collection.flush(&mut batch)?;
+    collection.pre_save(&mut batch)?;
     collection.context().store().write_batch(batch).await?;
+    collection.post_save();
 
     // Check that the entry was removed.
     let collection = CollectionViewType::load(context.clone()).await?;
@@ -904,8 +860,9 @@ async fn test_removal_api_first_second_condition(
     let entry = collection.load_entry_mut(&1).await?;
     entry.set(100);
     let mut batch = Batch::new();
-    collection.flush(&mut batch)?;
+    collection.pre_save(&mut batch)?;
     collection.context().store().write_batch(batch).await?;
+    collection.post_save();
 
     // Reload the collection view and remove the entry, but don't commit yet
     let mut collection: CollectionViewType = HashedCollectionView::load(context.clone()).await?;
@@ -925,8 +882,9 @@ async fn test_removal_api_first_second_condition(
 
     // We commit
     let mut batch = Batch::new();
-    collection.flush(&mut batch)?;
+    collection.pre_save(&mut batch)?;
     collection.context().store().write_batch(batch).await?;
+    collection.post_save();
 
     let mut collection: CollectionViewType = HashedCollectionView::load(context.clone()).await?;
     let expected_val = if second_condition {

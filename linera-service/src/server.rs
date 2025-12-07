@@ -2,6 +2,8 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![recursion_limit = "256"]
+
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -66,7 +68,7 @@ struct ServerContext {
     cross_chain_config: CrossChainConfig,
     notification_config: NotificationConfig,
     shard: Option<usize>,
-    grace_period: Duration,
+    block_time_grace_period: Duration,
     chain_worker_ttl: Duration,
     block_cache_size: usize,
     execution_state_cache_size: usize,
@@ -98,7 +100,7 @@ impl ServerContext {
         )
         .with_allow_inactive_chains(false)
         .with_allow_messages_from_deprecated_epochs(false)
-        .with_grace_period(self.grace_period)
+        .with_block_time_grace_period(self.block_time_grace_period)
         .with_chain_worker_ttl(self.chain_worker_ttl)
         .with_chain_info_max_received_log_entries(self.chain_info_max_received_log_entries);
         (state, shard_id, shard.clone())
@@ -368,7 +370,7 @@ enum ServerCommand {
 
         /// Common storage options.
         #[command(flatten)]
-        common_storage_options: CommonStorageOptions,
+        common_storage_options: Box<CommonStorageOptions>,
 
         /// Configuration for cross-chain requests
         #[command(flatten)]
@@ -384,8 +386,8 @@ enum ServerCommand {
 
         /// Blocks with a timestamp this far in the future will still be accepted, but the validator
         /// will wait until that timestamp before voting.
-        #[arg(long = "grace-period-ms", default_value = "500", value_parser = util::parse_millis)]
-        grace_period: Duration,
+        #[arg(long = "block-time-grace-period-ms", default_value = "500", value_parser = util::parse_millis)]
+        block_time_grace_period: Duration,
 
         /// The WebAssembly runtime to use.
         #[arg(long)]
@@ -407,6 +409,10 @@ enum ServerCommand {
             env = "LINERA_SERVER_CHAIN_INFO_MAX_RECEIVED_LOG_ENTRIES",
         )]
         chain_info_max_received_log_entries: usize,
+
+        /// OpenTelemetry OTLP exporter endpoint (requires opentelemetry feature).
+        #[arg(long, env = "LINERA_OTLP_EXPORTER_ENDPOINT")]
+        otlp_exporter_endpoint: Option<String>,
     },
 
     /// Act as a trusted third-party and generate all server configurations
@@ -483,6 +489,16 @@ fn main() {
 }
 
 /// Returns the log file name to use based on the [`ServerCommand`] that will run.
+fn otlp_exporter_endpoint_for(command: &ServerCommand) -> Option<&str> {
+    match command {
+        ServerCommand::Run {
+            otlp_exporter_endpoint,
+            ..
+        } => otlp_exporter_endpoint.as_deref(),
+        ServerCommand::Generate { .. } | ServerCommand::EditShards { .. } => None,
+    }
+}
+
 fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
     match command {
         ServerCommand::Run {
@@ -506,7 +522,10 @@ fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
 }
 
 async fn run(options: ServerOptions) {
-    linera_base::tracing::init_with_opentelemetry(&log_file_name_for(&options.command)).await;
+    linera_service::tracing::opentelemetry::init(
+        &log_file_name_for(&options.command),
+        otlp_exporter_endpoint_for(&options.command),
+    );
 
     match options.command {
         ServerCommand::Run {
@@ -516,10 +535,11 @@ async fn run(options: ServerOptions) {
             cross_chain_config,
             notification_config,
             shard,
-            grace_period,
+            block_time_grace_period,
             wasm_runtime,
             chain_worker_ttl,
             chain_info_max_received_log_entries,
+            otlp_exporter_endpoint: _,
         } => {
             linera_version::VERSION_INFO.log();
 
@@ -531,7 +551,7 @@ async fn run(options: ServerOptions) {
                 cross_chain_config,
                 notification_config,
                 shard,
-                grace_period,
+                block_time_grace_period,
                 chain_worker_ttl,
                 block_cache_size: options.block_cache_size,
                 execution_state_cache_size: options.execution_state_cache_size,

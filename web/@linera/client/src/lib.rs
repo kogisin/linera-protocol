@@ -83,13 +83,24 @@ pub const OPTIONS: ClientContextOptions = ClientContextOptions {
     wait_for_outgoing_messages: false,
     blanket_message_policy: linera_core::client::BlanketMessagePolicy::Accept,
     restrict_chain_ids_to: None,
+    reject_message_bundles_without_application_ids: None,
+    reject_message_bundles_with_other_application_ids: None,
     long_lived_services: false,
     blob_download_timeout: linera_base::time::Duration::from_millis(1000),
+    certificate_batch_download_timeout: linera_base::time::Duration::from_millis(1000),
     certificate_download_batch_size: linera_core::client::DEFAULT_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
+    sender_certificate_download_batch_size:
+        linera_core::client::DEFAULT_SENDER_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
     chain_worker_ttl: Duration::from_secs(30),
     sender_chain_worker_ttl: Duration::from_millis(200),
-    grace_period: linera_core::DEFAULT_GRACE_PERIOD,
+    quorum_grace_period: linera_core::DEFAULT_QUORUM_GRACE_PERIOD,
     max_joined_tasks: 100,
+    max_accepted_latency_ms: linera_core::client::requests_scheduler::MAX_ACCEPTED_LATENCY_MS,
+    cache_ttl_ms: linera_core::client::requests_scheduler::CACHE_TTL_MS,
+    cache_max_size: linera_core::client::requests_scheduler::CACHE_MAX_SIZE,
+    max_request_ttl_ms: linera_core::client::requests_scheduler::MAX_REQUEST_TTL_MS,
+    alpha: linera_core::client::requests_scheduler::ALPHA_SMOOTHING_FACTOR,
+    alternative_peers_retry_delay_ms: linera_core::client::requests_scheduler::STAGGERED_DELAY_MS,
 
     // TODO(linera-protocol#2944): separate these out from the
     // `ClientOptions` struct, since they apply only to the CLI/native
@@ -97,6 +108,9 @@ pub const OPTIONS: ClientContextOptions = ClientContextOptions {
     wallet_state_path: None,
     keystore_path: None,
     with_wallet: None,
+    chrome_trace_exporter: false,
+    chrome_trace_file: None,
+    otlp_exporter_endpoint: None,
 };
 
 const BLOCK_CACHE_SIZE: usize = 5000;
@@ -234,7 +248,7 @@ impl Client {
             storage,
             tokio_util::sync::CancellationToken::new(),
         )
-        .run(Some(500)) // Enable background sync with 500ms sleep
+        .run(true) // Enable background sync
         .boxed_local()
         .await?
         .boxed_local();
@@ -442,6 +456,9 @@ pub struct Application {
 impl Application {
     /// Performs a query against an application's service.
     ///
+    /// If `block_hash` is non-empty, it specifies the block at which to
+    /// perform the query; otherwise, the latest block is used.
+    ///
     /// # Errors
     /// If the application ID is invalid, the query is incorrect, or
     /// the response isn't valid UTF-8.
@@ -451,18 +468,25 @@ impl Application {
     #[wasm_bindgen]
     // TODO(#14) allow passing bytes here rather than just strings
     // TODO(#15) a lot of this logic is shared with `linera_service::node_service`
-    pub async fn query(&self, query: &str) -> JsResult<String> {
+    pub async fn query(&self, query: &str, block_hash: Option<String>) -> JsResult<String> {
         tracing::debug!("querying application: {query}");
         let chain_client = self.client.default_chain_client().await?;
-
+        let block_hash = if let Some(hash) = block_hash {
+            Some(hash.as_str().parse()?)
+        } else {
+            None
+        };
         let linera_execution::QueryOutcome {
             response: linera_execution::QueryResponse::User(response),
             operations,
         } = chain_client
-            .query_application(linera_execution::Query::User {
-                application_id: self.id,
-                bytes: query.as_bytes().to_vec(),
-            })
+            .query_application(
+                linera_execution::Query::User {
+                    application_id: self.id,
+                    bytes: query.as_bytes().to_vec(),
+                },
+                block_hash,
+            )
             .await?
         else {
             panic!("system response to user query")
@@ -483,6 +507,22 @@ impl Application {
 
 #[wasm_bindgen(start)]
 pub fn main() {
+    use tracing_subscriber::{
+        prelude::__tracing_subscriber_SubscriberExt as _, util::SubscriberInitExt as _,
+    };
+
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-    linera_base::tracing::init();
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(tracing_web::MakeWebConsoleWriter::new()),
+        )
+        .with(
+            tracing_web::performance_layer()
+                .with_details_from_fields(tracing_subscriber::fmt::format::Pretty::default()),
+        )
+        .init();
 }

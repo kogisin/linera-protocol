@@ -16,11 +16,11 @@ use linera_base::{
 use linera_core::{
     join_set_ext::JoinSet,
     node::NodeError,
-    worker::{NetworkActions, Notification, Reason, WorkerError, WorkerState},
+    worker::{NetworkActions, Notification, Reason, WorkerState},
     JoinSetExt as _, TaskHandle,
 };
 use linera_storage::Storage;
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast::error::RecvError, oneshot};
 use tokio_util::sync::CancellationToken;
 use tonic::{transport::Channel, Request, Response, Status};
 use tower::{builder::ServiceBuilder, Layer, Service};
@@ -218,6 +218,7 @@ where
             )
         });
 
+        let mut exporter_forwarded = false;
         for proxy in &internal_network.proxies {
             let receiver = notification_sender.subscribe();
             join_set.spawn_task({
@@ -225,10 +226,16 @@ where
                     nickname = state.nickname(),
                     "spawning notifications thread on {} for shard {}", host, shard_id
                 );
+                let exporter_addresses = if exporter_forwarded {
+                    vec![]
+                } else {
+                    exporter_forwarded = true;
+                    internal_network.exporter_addresses()
+                };
                 Self::forward_notifications(
                     state.nickname().to_string(),
                     proxy.internal_address(&internal_network.protocol),
-                    internal_network.exporter_addresses(),
+                    exporter_addresses,
                     receiver,
                 )
             });
@@ -305,8 +312,27 @@ where
             })
             .collect::<Vec<_>>();
 
-        while let Ok(notification) = receiver.recv().await {
+        loop {
+            let notification = match receiver.recv().await {
+                Ok(notification) => notification,
+                Err(RecvError::Lagged(skipped_count)) => {
+                    warn!(
+                        nickname,
+                        skipped_count, "notification receiver lagged, messages were skipped"
+                    );
+                    continue;
+                }
+                Err(RecvError::Closed) => {
+                    warn!(
+                        nickname,
+                        "notification channel closed, exiting forwarding loop"
+                    );
+                    break;
+                }
+            };
+
             let reason = &notification.reason;
+            let chain_id = notification.chain_id;
             let notification: api::Notification = match notification.clone().try_into() {
                 Ok(notification) => notification,
                 Err(error) => {
@@ -319,7 +345,8 @@ where
                 error!(
                     %error,
                     nickname,
-                    ?notification,
+                    ?chain_id,
+                    ?reason,
                     "proxy: could not send notification",
                 )
             }
@@ -331,7 +358,8 @@ where
                         error!(
                             %error,
                             nickname,
-                            ?notification,
+                            ?chain_id,
+                            ?reason,
                             "block exporter: could not send notification",
                         )
                     }
@@ -429,6 +457,15 @@ where
             }
         }
     }
+
+    fn log_error(&self, error: &linera_core::worker::WorkerError, context: &str) {
+        let nickname = self.state.nickname();
+        if error.is_local() {
+            error!(nickname, %error, "{}", context);
+        } else {
+            debug!(nickname, %error, "{}", context);
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -461,8 +498,7 @@ where
                 }
                 Err(error) => {
                     Self::log_request_outcome_and_latency(start, false, "handle_block_proposal");
-                    let nickname = self.state.nickname();
-                    warn!(nickname, %error, "Failed to handle block proposal");
+                    self.log_error(&error, "Failed to handle block proposal");
                     NodeError::from(error).try_into()?
                 }
             },
@@ -508,12 +544,7 @@ where
             }
             Err(error) => {
                 Self::log_request_outcome_and_latency(start, false, "handle_lite_certificate");
-                let nickname = self.state.nickname();
-                if let WorkerError::MissingCertificateValue = &error {
-                    debug!(nickname, %error, "Failed to handle lite certificate");
-                } else {
-                    error!(nickname, %error, "Failed to handle lite certificate");
-                }
+                self.log_error(&error, "Failed to handle lite certificate");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
         }
@@ -557,8 +588,7 @@ where
             }
             Err(error) => {
                 Self::log_request_outcome_and_latency(start, false, "handle_confirmed_certificate");
-                let nickname = self.state.nickname();
-                error!(nickname, %error, "Failed to handle confirmed certificate");
+                self.log_error(&error, "Failed to handle confirmed certificate");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
         }
@@ -593,8 +623,7 @@ where
             }
             Err(error) => {
                 Self::log_request_outcome_and_latency(start, false, "handle_validated_certificate");
-                let nickname = self.state.nickname();
-                error!(nickname, %error, "Failed to handle validated certificate");
+                self.log_error(&error, "Failed to handle validated certificate");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
         }
@@ -628,8 +657,7 @@ where
             }
             Err(error) => {
                 Self::log_request_outcome_and_latency(start, false, "handle_timeout_certificate");
-                let nickname = self.state.nickname();
-                error!(nickname, %error, "Failed to handle timeout certificate");
+                self.log_error(&error, "Failed to handle timeout certificate");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
         }
@@ -659,8 +687,7 @@ where
             }
             Err(error) => {
                 Self::log_request_outcome_and_latency(start, false, "handle_chain_info_query");
-                let nickname = self.state.nickname();
-                error!(nickname, %error, "Failed to handle chain info query");
+                self.log_error(&error, "Failed to handle chain info query");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
         }
@@ -694,8 +721,7 @@ where
             }
             Err(error) => {
                 Self::log_request_outcome_and_latency(start, false, "download_pending_blob");
-                let nickname = self.state.nickname();
-                error!(nickname, %error, "Failed to download pending blob");
+                self.log_error(&error, "Failed to download pending blob");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
         }
@@ -726,8 +752,7 @@ where
             }
             Err(error) => {
                 Self::log_request_outcome_and_latency(start, false, "handle_pending_blob");
-                let nickname = self.state.nickname();
-                error!(nickname, %error, "Failed to handle pending blob");
+                self.log_error(&error, "Failed to handle pending blob");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
         }

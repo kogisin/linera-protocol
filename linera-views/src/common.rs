@@ -12,6 +12,7 @@ use std::{
     slice::ChunksExact,
 };
 
+use allocative::Allocative;
 use itertools::Either;
 use serde::de::DeserializeOwned;
 
@@ -19,9 +20,10 @@ use crate::ViewError;
 
 type HasherOutputSize = <sha3::Sha3_256 as sha3::digest::OutputSizeUser>::OutputSize;
 #[doc(hidden)]
+#[allow(deprecated)]
 pub type HasherOutput = generic_array::GenericArray<u8, HasherOutputSize>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Allocative)]
 /// An update, for example to a view.
 pub enum Update<T> {
     /// The entry is removed.
@@ -30,7 +32,7 @@ pub enum Update<T> {
     Set(T),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Allocative)]
 pub(crate) struct DeletionSet {
     pub(crate) delete_storage_first: bool,
     pub(crate) deleted_prefixes: BTreeSet<Vec<u8>>,
@@ -99,7 +101,7 @@ pub(crate) fn get_upper_bound(key_prefix: &[u8]) -> Bound<Vec<u8>> {
 
 /// Computes an interval so that a vector has `key_prefix` as a prefix
 /// if and only if it belongs to the range.
-pub(crate) fn get_interval(key_prefix: Vec<u8>) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+pub(crate) fn get_key_range_for_prefix(key_prefix: Vec<u8>) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     let upper_bound = get_upper_bound(&key_prefix);
     (Included(key_prefix), upper_bound)
 }
@@ -191,7 +193,7 @@ pub(crate) fn contains_prefix_of(prefixes: &BTreeSet<Vec<u8>>, key: &[u8]) -> bo
 pub(crate) fn insert_key_prefix(prefixes: &mut BTreeSet<Vec<u8>>, prefix: Vec<u8>) {
     if !contains_prefix_of(prefixes, &prefix) {
         let key_prefix_list = prefixes
-            .range(get_interval(prefix.clone()))
+            .range(get_key_range_for_prefix(prefix.clone()))
             .map(|x| x.to_vec())
             .collect::<Vec<_>>();
         for key in key_prefix_list {

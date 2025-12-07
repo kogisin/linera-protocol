@@ -62,10 +62,10 @@ impl Exporter {
         let (mut task_queue, task_receiver) = TaskQueue::new(
             self.work_queue_size,
             destination_state.load(Ordering::Acquire) as usize,
-            storage.clone(),
+            storage.clone()?,
         );
 
-        let export_task = ExportTask::new(node, storage.clone(), destination_state);
+        let export_task = ExportTask::new(node, storage.clone()?, destination_state);
 
         tokio::select! {
 
@@ -152,8 +152,8 @@ where
                 Err(e) => Err(e),
                 Ok(blob) => {
                     tracing::info!(
-                        "dispatching blob with id: {:#?} from linera exporter",
-                        blob.id()
+                        blob_id=?blob.id(),
+                        "dispatching blob",
                     );
                     #[cfg(with_metrics)]
                     let start = linera_base::time::Instant::now();

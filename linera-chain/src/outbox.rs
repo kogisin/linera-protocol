@@ -1,6 +1,7 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use allocative::Allocative;
 use linera_base::data_types::{ArithmeticError, BlockHeight};
 #[cfg(with_testing)]
 use linera_views::context::MemoryContext;
@@ -47,7 +48,8 @@ const BLOCK_HEIGHT_BUCKET_SIZE: usize = 1000;
 ///   messages for them.
 /// * When marking block heights as received, messages at lower heights are also marked (i.e. dequeued).
 #[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
-#[derive(Debug, ClonableView, View)]
+#[derive(Debug, ClonableView, View, Allocative)]
+#[allocative(bound = "C")]
 pub struct OutboxStateView<C>
 where
     C: Context + Send + Sync + 'static,
@@ -82,7 +84,7 @@ where
     }
 
     /// Marks all messages as received up to the given height.
-    /// Returns true if a change was made.
+    /// Returns the heights that were newly marked as received.
     pub(crate) async fn mark_messages_as_received(
         &mut self,
         height: BlockHeight,

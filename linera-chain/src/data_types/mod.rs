@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use allocative::Allocative;
 use async_graphql::SimpleObject;
 use custom_debug_derive::Debug;
 use linera_base::{
@@ -28,8 +29,12 @@ use crate::{
     ChainError,
 };
 
+pub mod metadata;
+
+pub use metadata::*;
+
 #[cfg(test)]
-#[path = "unit_tests/data_types_tests.rs"]
+#[path = "../unit_tests/data_types_tests.rs"]
 mod data_types_tests;
 
 /// A block containing operations to apply on a given chain, as well as the
@@ -39,7 +44,7 @@ mod data_types_tests;
 /// * When a block is proposed to a validator, all cross-chain messages must have been
 ///   received ahead of time in the inbox of the chain.
 /// * This constraint does not apply to the execution of confirmed blocks.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject, Allocative)]
 #[graphql(complex)]
 pub struct ProposedBlock {
     /// The chain to which this block belongs.
@@ -145,7 +150,7 @@ impl ProposedBlock {
 }
 
 /// A transaction in a block: incoming messages or an operation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Allocative)]
 pub enum Transaction {
     /// Receive a bundle of incoming messages.
     ReceiveMessages(IncomingBundle),
@@ -154,6 +159,15 @@ pub enum Transaction {
 }
 
 impl BcsHashable<'_> for Transaction {}
+
+impl Transaction {
+    pub fn incoming_bundle(&self) -> Option<&IncomingBundle> {
+        match self {
+            Transaction::ReceiveMessages(bundle) => Some(bundle),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 #[graphql(name = "Operation")]
@@ -164,8 +178,8 @@ pub struct OperationMetadata {
     pub application_id: Option<ApplicationId>,
     /// For user operations, the serialized bytes (as a hex string for GraphQL)
     pub user_bytes_hex: Option<String>,
-    /// For system operations, the serialized bytes (as a hex string for GraphQL)
-    pub system_bytes_hex: Option<String>,
+    /// For system operations, structured representation
+    pub system_operation: Option<SystemOperationMetadata>,
 }
 
 impl From<&Operation> for OperationMetadata {
@@ -175,9 +189,7 @@ impl From<&Operation> for OperationMetadata {
                 operation_type: "System".to_string(),
                 application_id: None,
                 user_bytes_hex: None,
-                system_bytes_hex: Some(hex::encode(
-                    bcs::to_bytes(sys_op).expect("System operation should be serializable"),
-                )),
+                system_operation: Some(SystemOperationMetadata::from(sys_op.as_ref())),
             },
             Operation::User {
                 application_id,
@@ -186,7 +198,7 @@ impl From<&Operation> for OperationMetadata {
                 operation_type: "User".to_string(),
                 application_id: Some(*application_id),
                 user_bytes_hex: Some(hex::encode(bytes)),
-                system_bytes_hex: None,
+                system_operation: None,
             },
         }
     }
@@ -221,14 +233,26 @@ impl TransactionMetadata {
 }
 
 /// A chain ID with a block height.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, SimpleObject)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    SimpleObject,
+    Allocative,
+)]
 pub struct ChainAndHeight {
     pub chain_id: ChainId,
     pub height: BlockHeight,
 }
 
 /// A bundle of cross-chain messages.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject, Allocative)]
 pub struct IncomingBundle {
     /// The origin of the messages.
     pub origin: ChainId,
@@ -248,7 +272,7 @@ impl IncomingBundle {
 impl BcsHashable<'_> for IncomingBundle {}
 
 /// What to do with a message picked from the inbox.
-#[derive(Copy, Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+#[derive(Copy, Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative)]
 pub enum MessageAction {
     /// Execute the incoming message.
     Accept,
@@ -257,7 +281,7 @@ pub enum MessageAction {
 }
 
 /// A set of messages from a single block, for a single destination.
-#[derive(Debug, Eq, PartialEq, Clone, Hash, Serialize, Deserialize, SimpleObject)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash, Serialize, Deserialize, SimpleObject, Allocative)]
 pub struct MessageBundle {
     /// The block height.
     pub height: BlockHeight,
@@ -271,7 +295,7 @@ pub struct MessageBundle {
     pub messages: Vec<PostedMessage>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Allocative)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
 /// An earlier proposal that is being retried.
 pub enum OriginalProposal {
@@ -286,7 +310,7 @@ pub enum OriginalProposal {
 /// An authenticated proposal for a new block.
 // TODO(#456): the signature of the block owner is currently lost but it would be useful
 // to have it for auditing purposes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Allocative)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
 pub struct BlockProposal {
     pub content: ProposalContent,
@@ -296,7 +320,8 @@ pub struct BlockProposal {
 }
 
 /// A message together with kind, authentication and grant information.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject, Allocative)]
+#[graphql(complex)]
 pub struct PostedMessage {
     /// The user authentication carried by the message, if any.
     #[debug(skip_if = Option::is_none)]
@@ -342,8 +367,16 @@ impl OutgoingMessageExt for OutgoingMessage {
     }
 }
 
+#[async_graphql::ComplexObject]
+impl PostedMessage {
+    /// Structured message metadata for GraphQL.
+    async fn message_metadata(&self) -> MessageMetadata {
+        MessageMetadata::from(&self.message)
+    }
+}
+
 /// The execution result of a single operation.
-#[derive(Debug, Default, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative)]
 pub struct OperationResult(
     #[debug(with = "hex_debug")]
     #[serde(with = "serde_bytes")]
@@ -358,7 +391,7 @@ doc_scalar!(
 );
 
 /// The messages and the state hash resulting from a [`ProposedBlock`]'s execution.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, SimpleObject, Allocative)]
 #[cfg_attr(with_testing, derive(Default))]
 pub struct BlockExecutionOutcome {
     /// The list of outgoing messages for each transaction.
@@ -380,7 +413,7 @@ pub struct BlockExecutionOutcome {
 }
 
 /// The hash and chain ID of a `CertificateValue`.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative)]
 pub struct LiteValue {
     pub value_hash: CryptoHash,
     pub chain_id: ChainId,
@@ -401,7 +434,7 @@ impl LiteValue {
 struct VoteValue(CryptoHash, Round, CertificateKind);
 
 /// A vote on a statement from a validator.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Allocative, Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 pub struct Vote<T> {
     pub value: T,
@@ -535,7 +568,7 @@ impl BlockExecutionOutcome {
 }
 
 /// The data a block proposer signs.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Allocative)]
 pub struct ProposalContent {
     /// The proposed block.
     pub block: ProposedBlock,

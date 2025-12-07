@@ -377,6 +377,7 @@ ChainManagerInfo:
   STRUCT:
     - ownership:
         TYPENAME: ChainOwnership
+    - seed: U64
     - requested_signed_proposal:
         OPTION:
           TYPENAME: BlockProposal
@@ -435,6 +436,9 @@ ChainOwnership:
           KEY:
             TYPENAME: AccountOwner
           VALUE: U64
+    - first_leader:
+        OPTION:
+          TYPENAME: AccountOwner
     - multi_leader_rounds: U32
     - open_multi_leader_rounds: BOOL
     - timeout_config:
@@ -1142,6 +1146,14 @@ RpcMessage:
       BlobLastUsedByCertificateResponse:
         NEWTYPE:
           TYPENAME: ConfirmedBlockCertificate
+    33:
+      ShardInfoQuery:
+        NEWTYPE:
+          TYPENAME: ChainId
+    34:
+      ShardInfoResponse:
+        NEWTYPE:
+          TYPENAME: ShardInfo
 Secp256k1PublicKey:
   NEWTYPESTRUCT:
     TUPLEARRAY:
@@ -1152,6 +1164,10 @@ Secp256k1Signature:
     TUPLEARRAY:
       CONTENT: U8
       SIZE: 64
+ShardInfo:
+  STRUCT:
+    - shard_id: U64
+    - total_shards: U64
 StreamId:
   STRUCT:
     - application_id:
@@ -1219,6 +1235,9 @@ SystemOperation:
                 TUPLE:
                   - TYPENAME: AccountOwner
                   - U64
+          - first_leader:
+              OPTION:
+                TYPENAME: AccountOwner
           - multi_leader_rounds: U32
           - open_multi_leader_rounds: BOOL
           - timeout_config:

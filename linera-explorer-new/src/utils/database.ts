@@ -1,6 +1,7 @@
 import { Block, BlockInfo, IncomingBundle, PostedMessage, ChainInfo, Operation, Message, Event, OracleResponse, IncomingBundleWithMessages } from '../types/blockchain';
 
-const API_BASE_URL = 'http://localhost:3002/api';
+// Use environment variable if set (for production), otherwise use relative path (for dev with Vite proxy)
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
 export class BlockchainAPI {
   // Get all blocks with pagination

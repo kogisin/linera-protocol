@@ -29,8 +29,8 @@ use crate::{
     system::{CreateApplicationResult, OpenChainConfig},
     util::{OracleResponseExt as _, RespondExt as _},
     ApplicationDescription, ApplicationId, ExecutionError, ExecutionRuntimeConfig,
-    ExecutionRuntimeContext, ExecutionStateView, Message, MessageContext, MessageKind, ModuleId,
-    Operation, OperationContext, OutgoingMessage, ProcessStreamsContext, QueryContext,
+    ExecutionRuntimeContext, ExecutionStateView, JsVec, Message, MessageContext, MessageKind,
+    ModuleId, Operation, OperationContext, OutgoingMessage, ProcessStreamsContext, QueryContext,
     QueryOutcome, ResourceController, SystemMessage, TransactionTracker, UserContractCode,
     UserServiceCode,
 };
@@ -246,7 +246,7 @@ where
             ContainsKeys { id, keys, callback } => {
                 let view = self.state.users.try_load_entry(&id).await?;
                 let result = match view {
-                    Some(view) => view.contains_keys(keys).await?,
+                    Some(view) => view.contains_keys(&keys).await?,
                     None => vec![false; keys.len()],
                 };
                 callback.respond(result);
@@ -255,7 +255,7 @@ where
             ReadMultiValuesBytes { id, keys, callback } => {
                 let view = self.state.users.try_load_entry(&id).await?;
                 let values = match view {
-                    Some(view) => view.multi_get(keys).await?,
+                    Some(view) => view.multi_get(&keys).await?,
                     None => vec![None; keys.len()],
                 };
                 callback.respond(values);
@@ -356,6 +356,11 @@ where
                         .set(application_permissions);
                     callback.respond(Ok(()));
                 }
+            }
+
+            PeekApplicationIndex { callback } => {
+                let index = self.txn_tracker.peek_application_index();
+                callback.respond(index)
             }
 
             CreateApplication {
@@ -503,7 +508,8 @@ where
             }
 
             ReadEvent { event_id, callback } => {
-                let extra = self.state.context().extra();
+                let context = self.state.context();
+                let extra = context.extra();
                 let event = self
                     .txn_tracker
                     .oracle(|| async {
@@ -668,6 +674,21 @@ where
                     .to_round()?;
                 callback.respond(validation_round);
             }
+
+            TotalStorageSize {
+                application,
+                callback,
+            } => {
+                let view = self.state.users.try_load_entry(&application).await?;
+                let result = match view {
+                    Some(view) => {
+                        let total_size = view.total_size();
+                        (total_size.key, total_size.value)
+                    }
+                    None => (0, 0),
+                };
+                callback.respond(result);
+            }
         }
 
         Ok(())
@@ -734,6 +755,54 @@ where
             .await
     }
 
+    // TODO(#5034): unify with `contract_and_dependencies`
+    pub(crate) async fn service_and_dependencies(
+        &mut self,
+        application: ApplicationId,
+    ) -> Result<(Vec<UserServiceCode>, Vec<ApplicationDescription>), ExecutionError> {
+        // cyclic futures are illegal so we need to either box the frames or keep our own
+        // stack
+        let mut stack = vec![application];
+        let mut codes = vec![];
+        let mut descriptions = vec![];
+
+        while let Some(id) = stack.pop() {
+            let (code, description) = self.load_service(id).await?;
+            stack.extend(description.required_application_ids.iter().rev().copied());
+            codes.push(code);
+            descriptions.push(description);
+        }
+
+        codes.reverse();
+        descriptions.reverse();
+
+        Ok((codes, descriptions))
+    }
+
+    // TODO(#5034): unify with `service_and_dependencies`
+    async fn contract_and_dependencies(
+        &mut self,
+        application: ApplicationId,
+    ) -> Result<(Vec<UserContractCode>, Vec<ApplicationDescription>), ExecutionError> {
+        // cyclic futures are illegal so we need to either box the frames or keep our own
+        // stack
+        let mut stack = vec![application];
+        let mut codes = vec![];
+        let mut descriptions = vec![];
+
+        while let Some(id) = stack.pop() {
+            let (code, description) = self.load_contract(id).await?;
+            stack.extend(description.required_application_ids.iter().rev().copied());
+            codes.push(code);
+            descriptions.push(description);
+        }
+
+        codes.reverse();
+        descriptions.reverse();
+
+        Ok((codes, descriptions))
+    }
+
     async fn run_user_action_with_runtime(
         &mut self,
         application_id: ApplicationId,
@@ -756,9 +825,11 @@ where
         let (execution_state_sender, mut execution_state_receiver) =
             futures::channel::mpsc::unbounded();
 
-        let (code, description) = self.load_contract(application_id).await?;
+        let (codes, descriptions): (Vec<_>, Vec<_>) =
+            self.contract_and_dependencies(application_id).await?;
 
-        let contract_runtime_task = linera_base::task::Blocking::spawn(move |mut codes| {
+        let thread = web_thread::Thread::new();
+        let contract_runtime_task = thread.run_send(JsVec(codes), move |codes| async move {
             let runtime = ContractSyncRuntime::new(
                 execution_state_sender,
                 chain_id,
@@ -767,21 +838,18 @@ where
                 &action,
             );
 
-            async move {
-                let code = codes.next().await.expect("we send this immediately below");
-                runtime.preload_contract(application_id, code, description)?;
-                runtime.run_action(application_id, chain_id, action)
+            for (code, description) in codes.0.into_iter().zip(descriptions) {
+                runtime.preload_contract(ApplicationId::from(&description), code, description)?;
             }
-        })
-        .await;
 
-        contract_runtime_task.send(code)?;
+            runtime.run_action(application_id, chain_id, action)
+        });
 
         while let Some(request) = execution_state_receiver.next().await {
             self.handle_request(request).await?;
         }
 
-        let (result, controller) = contract_runtime_task.join().await?;
+        let (result, controller) = contract_runtime_task.await??;
 
         self.txn_tracker.add_operation_result(result);
 
@@ -1114,6 +1182,11 @@ pub enum ExecutionRequest {
         callback: Sender<Result<(), ExecutionError>>,
     },
 
+    PeekApplicationIndex {
+        #[debug(skip)]
+        callback: Sender<u32>,
+    },
+
     CreateApplication {
         chain_id: ChainId,
         block_height: BlockHeight,
@@ -1214,5 +1287,11 @@ pub enum ExecutionRequest {
         round: Option<u32>,
         #[debug(skip)]
         callback: Sender<Option<u32>>,
+    },
+
+    TotalStorageSize {
+        application: ApplicationId,
+        #[debug(skip)]
+        callback: Sender<(u32, u32)>,
     },
 }

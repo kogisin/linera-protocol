@@ -13,10 +13,11 @@ use linera_base::{
 };
 use linera_execution::{
     execution_state_actor::ExecutionStateActor, ExecutionRuntimeContext, ExecutionStateView,
-    MessageContext, OperationContext, OutgoingMessage, ResourceController, ResourceTracker,
-    SystemExecutionStateView, TransactionOutcome, TransactionTracker,
+    MessageContext, MessageKind, OperationContext, OutgoingMessage, ResourceController,
+    ResourceTracker, SystemExecutionStateView, TransactionOutcome, TransactionTracker,
 };
 use linera_views::context::Context;
+use tracing::instrument;
 
 #[cfg(with_metrics)]
 use crate::chain::metrics;
@@ -100,6 +101,10 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
     }
 
     /// Executes a transaction in the context of the block.
+    #[instrument(skip_all, fields(
+        chain_id = %self.chain_id,
+        block_height = %self.block_height,
+    ))]
     pub async fn execute_transaction<C>(
         &mut self,
         transaction: &Transaction,
@@ -136,7 +141,7 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
                     .track_block_size_of(&operation)
                     .with_execution_context(chain_execution_context)?;
                 #[cfg(with_metrics)]
-                let _operation_latency = metrics::OPERATION_EXECUTION_LATENCY.measure_latency();
+                let _operation_latency = metrics::OPERATION_EXECUTION_LATENCY.measure_latency_us();
                 let context = OperationContext {
                     chain_id: self.chain_id,
                     height: self.block_height,
@@ -191,7 +196,7 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
         C::Extra: ExecutionRuntimeContext,
     {
         #[cfg(with_metrics)]
-        let _message_latency = metrics::MESSAGE_EXECUTION_LATENCY.measure_latency();
+        let _message_latency = metrics::MESSAGE_EXECUTION_LATENCY.measure_latency_us();
         let context = MessageContext {
             chain_id: self.chain_id,
             origin: incoming_bundle.origin,
@@ -282,6 +287,9 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
         let mut resource_controller = self.resource_controller.with_state(view).await?;
 
         for message_out in &txn_outcome.outgoing_messages {
+            if message_out.kind == MessageKind::Bouncing {
+                continue; // Bouncing messages are free.
+            }
             resource_controller
                 .track_message(&message_out.message)
                 .with_execution_context(context)?;
@@ -352,18 +360,6 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
             .collect()
     }
 
-    /// Returns the execution context for the current transaction.
-    pub fn chain_execution_context(&self, transaction: &Transaction) -> ChainExecutionContext {
-        match transaction {
-            Transaction::ReceiveMessages(_) => {
-                ChainExecutionContext::IncomingBundle(self.transaction_index)
-            }
-            Transaction::ExecuteOperation(_) => {
-                ChainExecutionContext::Operation(self.transaction_index)
-            }
-        }
-    }
-
     /// Returns a mutable reference to the resource controller.
     pub fn resource_controller_mut(
         &mut self,
@@ -393,6 +389,18 @@ impl<'resources, 'blobs> BlockExecutionTracker<'resources, 'blobs> {
             self.blobs,
             self.operation_results,
         )
+    }
+
+    /// Returns the execution context for the current transaction.
+    fn chain_execution_context(&self, transaction: &Transaction) -> ChainExecutionContext {
+        match transaction {
+            Transaction::ReceiveMessages(_) => {
+                ChainExecutionContext::IncomingBundle(self.transaction_index)
+            }
+            Transaction::ExecuteOperation(_) => {
+                ChainExecutionContext::Operation(self.transaction_index)
+            }
+        }
     }
 }
 

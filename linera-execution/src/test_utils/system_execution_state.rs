@@ -13,10 +13,7 @@ use linera_base::{
     identifiers::{AccountOwner, ApplicationId, BlobId, ChainId},
     ownership::ChainOwnership,
 };
-use linera_views::{
-    context::MemoryContext,
-    views::{CryptoHashView, View},
-};
+use linera_views::{context::MemoryContext, views::View};
 
 use super::{dummy_chain_description, dummy_committees, MockApplication, RegisterMockApplication};
 use crate::{
@@ -70,8 +67,8 @@ impl SystemExecutionState {
     }
 
     pub async fn into_hash(self) -> CryptoHash {
-        let view = self.into_view().await;
-        view.crypto_hash()
+        let mut view = self.into_view().await;
+        view.crypto_hash_mut()
             .await
             .expect("hashing from memory should not fail")
     }

@@ -11,7 +11,7 @@ use linera_base::{
     ownership::{ChainOwnership, TimeoutConfig},
 };
 use linera_core::{
-    client::{ChainClient, ChainClientOptions, Client},
+    client::{chain_client, ChainClient, Client},
     environment,
     test_utils::{MemoryStorageBuilder, StorageBuilder as _, TestBuilder},
 };
@@ -122,9 +122,10 @@ async fn test_chain_listener() -> anyhow::Result<()> {
             format!("Client node for {:.8}", chain_id0),
             Duration::from_secs(30),
             Duration::from_secs(1),
-            ChainClientOptions::test_default(),
+            chain_client::Options::test_default(),
             5_000,
             10_000,
+            linera_core::client::RequestsSchedulerConfig::default(),
         )),
     };
     context
@@ -155,7 +156,7 @@ async fn test_chain_listener() -> anyhow::Result<()> {
     let cancellation_token = CancellationToken::new();
     let child_token = cancellation_token.child_token();
     let chain_listener = ChainListener::new(config, context, storage, child_token)
-        .run(None) // Unit test doesn't need background sync
+        .run(false) // Unit test doesn't need background sync
         .await
         .unwrap();
 
@@ -179,7 +180,7 @@ async fn test_chain_listener() -> anyhow::Result<()> {
     }
 
     cancellation_token.cancel();
-    handle.await?;
+    handle.await;
 
     Ok(())
 }
@@ -210,16 +211,17 @@ async fn test_chain_listener_admin_chain() -> anyhow::Result<()> {
             "Client node with no chains".to_string(),
             Duration::from_secs(30),
             Duration::from_secs(1),
-            ChainClientOptions::test_default(),
+            chain_client::Options::test_default(),
             5_000,
             10_000,
+            linera_core::client::RequestsSchedulerConfig::default(),
         )),
     };
     let context = Arc::new(Mutex::new(context));
     let cancellation_token = CancellationToken::new();
     let child_token = cancellation_token.child_token();
     let chain_listener = ChainListener::new(config, context, storage.clone(), child_token)
-        .run(None) // Unit test doesn't need background sync
+        .run(false) // Unit test doesn't need background sync
         .await
         .unwrap();
 
@@ -239,7 +241,7 @@ async fn test_chain_listener_admin_chain() -> anyhow::Result<()> {
     }
 
     cancellation_token.cancel();
-    handle.await?;
+    handle.await;
 
     Ok(())
 }

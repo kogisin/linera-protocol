@@ -64,8 +64,7 @@
          console.log(linera);
           await linera.initialize();
           const faucet = await new linera.Faucet(import.meta.env.LINERA_FAUCET_URL);
-          const mnemonic = ethers.Wallet.createRandom().mnemonic.phrase;
-          const signer = linera.PrivateKeySigner.fromMnemonic(mnemonic);
+          const signer = linera.PrivateKeySigner.createRandom();
           const wallet = await faucet.createWallet();
           const owner = await signer.address();
           document.getElementById('owner').innerText = owner;
@@ -83,18 +82,22 @@
               logs.insertBefore(entry, logs.firstChild);
           }
 
-          async function updateCount() {
-              const response = await counter.query('{ "query": "query { value }" }');
+          async function updateCount(block_hash) {
+              const response = await counter.query('{ "query": "query { value }" }', block_hash || '');
               document.getElementById('count').innerText
                   = JSON.parse(response).data.value;
           }
 
-          updateCount();
+          updateCount(null);
           client.onNotification(notification => {
               let newBlock = notification.reason.NewBlock;
-              if (!newBlock) return;
-              addLogEntry(newBlock);
-              updateCount();
+              if (notification.reason.BlockExecuted) {
+                let hash = notification.reason.BlockExecuted.hash;
+                updateCount(hash);
+              } else if(newBlock) {
+                addLogEntry(newBlock);
+                updateCount(null);
+              }
           });
 
           incrementButton.addEventListener('click', () => {

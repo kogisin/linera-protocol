@@ -3,16 +3,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    ops::RangeBounds,
     sync::Arc,
 };
 
-use futures::stream::{self, StreamExt, TryStreamExt};
+use allocative::Allocative;
 use linera_base::{
     crypto::{CryptoHash, ValidatorPublicKey},
     data_types::{
-        ApplicationDescription, ApplicationPermissions, ArithmeticError, Blob, BlockHeight,
-        BlockHeightRangeBounds as _, Epoch, OracleResponse, Timestamp,
+        ApplicationDescription, ApplicationPermissions, ArithmeticError, Blob, BlockHeight, Epoch,
+        OracleResponse, Timestamp,
     },
     ensure,
     identifiers::{AccountOwner, ApplicationId, BlobType, ChainId, StreamId},
@@ -31,8 +30,7 @@ use linera_views::{
     reentrant_collection_view::{ReadGuardedView, ReentrantCollectionView},
     register_view::RegisterView,
     set_view::SetView,
-    store::ReadableKeyValueStore as _,
-    views::{ClonableView, CryptoHashView, RootView, View},
+    views::{ClonableView, RootView, View},
 };
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -78,7 +76,7 @@ pub(crate) mod metrics {
             "block_execution_latency",
             "Block execution latency",
             &[],
-            exponential_bucket_latencies(1000.0),
+            exponential_bucket_interval(50.0_f64, 10_000_000.0),
         )
     });
 
@@ -88,7 +86,7 @@ pub(crate) mod metrics {
             "message_execution_latency",
             "Message execution latency",
             &[],
-            exponential_bucket_latencies(50.0),
+            exponential_bucket_interval(0.1_f64, 50_000.0),
         )
     });
 
@@ -97,7 +95,7 @@ pub(crate) mod metrics {
             "operation_execution_latency",
             "Operation execution latency",
             &[],
-            exponential_bucket_latencies(50.0),
+            exponential_bucket_interval(0.1_f64, 50_000.0),
         )
     });
 
@@ -199,7 +197,7 @@ pub(crate) const EMPTY_BLOCK_SIZE: usize = 94;
 
 /// An origin, cursor and timestamp of a unskippable bundle in our inbox.
 #[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Allocative)]
 pub struct TimestampedBundleInInbox {
     /// The origin and cursor of the bundle.
     pub entry: BundleInInbox,
@@ -209,7 +207,7 @@ pub struct TimestampedBundleInInbox {
 
 /// An origin and cursor of a unskippable bundle that is no longer in our inbox.
 #[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, Allocative)]
 pub struct BundleInInbox {
     /// The origin from which we received the bundle.
     pub origin: ChainId,
@@ -236,7 +234,8 @@ const TIMESTAMPBUNDLE_BUCKET_SIZE: usize = 100;
     derive(async_graphql::SimpleObject),
     graphql(cache_control(no_cache))
 )]
-#[derive(Debug, RootView, ClonableView)]
+#[derive(Debug, RootView, ClonableView, Allocative)]
+#[allocative(bound = "C")]
 pub struct ChainStateView<C>
 where
     C: Clone + Context + Send + Sync + 'static,
@@ -272,10 +271,6 @@ where
         BucketQueueView<C, TimestampedBundleInInbox, TIMESTAMPBUNDLE_BUCKET_SIZE>,
     /// Unskippable bundles that have been removed but are still in the queue.
     pub removed_unskippable_bundles: SetView<C, BundleInInbox>,
-    /// The heights of previous blocks that sent messages to the same recipients.
-    pub previous_message_blocks: MapView<C, ChainId, BlockHeight>,
-    /// The heights of previous blocks that published events to the same streams.
-    pub previous_event_blocks: MapView<C, StreamId, BlockHeight>,
     /// Mailboxes used to send messages, indexed by their target.
     pub outboxes: ReentrantCollectionView<C, ChainId, OutboxStateView<C>>,
     /// The indices of next events we expect to see per stream (could be ahead of the last
@@ -293,7 +288,7 @@ where
 
 /// Block-chaining state.
 #[cfg_attr(with_graphql, derive(async_graphql::SimpleObject))]
-#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize, Allocative)]
 pub struct ChainTipState {
     /// Hash of the latest certified block in this chain, if any.
     pub block_hash: Option<CryptoHash>,
@@ -392,7 +387,7 @@ where
         self.context().extra().chain_id()
     }
 
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
     ))]
     pub async fn query_application(
@@ -412,7 +407,7 @@ where
             .with_execution_context(ChainExecutionContext::Query)
     }
 
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
         application_id = %application_id
     ))]
@@ -427,7 +422,7 @@ where
             .with_execution_context(ChainExecutionContext::DescribeApplication)
     }
 
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
         target = %target,
         height = %height
@@ -492,11 +487,12 @@ where
 
     /// Initializes the chain if it is not active yet.
     pub async fn initialize_if_needed(&mut self, local_time: Timestamp) -> Result<(), ChainError> {
+        let chain_id = self.chain_id();
         // Initialize ourselves.
         if self
             .execution_state
             .system
-            .initialize_chain(self.chain_id())
+            .initialize_chain(chain_id)
             .await
             .with_execution_context(ChainExecutionContext::Block)?
         {
@@ -504,7 +500,7 @@ where
             return Ok(());
         }
         // Recompute the state hash.
-        let hash = self.execution_state.crypto_hash().await?;
+        let hash = self.execution_state.crypto_hash_mut().await?;
         self.execution_state_hash.set(Some(hash));
         let maybe_committee = self.execution_state.system.current_committee().into_iter();
         // Last, reset the consensus state based on the current ownership.
@@ -515,58 +511,6 @@ where
             maybe_committee.flat_map(|(_, committee)| committee.account_keys_and_weights()),
         )?;
         Ok(())
-    }
-
-    /// Verifies that this chain is up-to-date and all the messages executed ahead of time
-    /// have been properly received by now.
-    #[instrument(target = "telemetry_only", skip_all, fields(
-        chain_id = %self.chain_id()
-    ))]
-    pub async fn validate_incoming_bundles(&self) -> Result<(), ChainError> {
-        let chain_id = self.chain_id();
-        let pairs = self.inboxes.try_load_all_entries().await?;
-        let max_stream_queries = self.context().store().max_stream_queries();
-        let stream = stream::iter(pairs)
-            .map(|(origin, inbox)| async move {
-                if let Some(bundle) = inbox.removed_bundles.front().await? {
-                    return Err(ChainError::MissingCrossChainUpdate {
-                        chain_id,
-                        origin,
-                        height: bundle.height,
-                    });
-                }
-                Ok::<(), ChainError>(())
-            })
-            .buffer_unordered(max_stream_queries);
-        stream.try_collect::<Vec<_>>().await?;
-        Ok(())
-    }
-
-    /// Collects all missing sender blocks from removed bundles across all inboxes.
-    /// Returns a map of origin chain IDs to their respective missing block heights.
-    #[instrument(target = "telemetry_only", skip_all, fields(
-        chain_id = %self.chain_id()
-    ))]
-    pub async fn collect_missing_sender_blocks(
-        &self,
-    ) -> Result<BTreeMap<ChainId, Vec<BlockHeight>>, ChainError> {
-        let pairs = self.inboxes.try_load_all_entries().await?;
-        let max_stream_queries = self.context().store().max_stream_queries();
-        let stream = stream::iter(pairs)
-            .map(|(origin, inbox)| async move {
-                let mut missing_heights = Vec::new();
-                let bundles = inbox.removed_bundles.elements().await?;
-                for bundle in bundles {
-                    missing_heights.push(bundle.height);
-                }
-                Ok::<(ChainId, Vec<BlockHeight>), ChainError>((origin, missing_heights))
-            })
-            .buffer_unordered(max_stream_queries);
-        let results: Vec<(ChainId, Vec<BlockHeight>)> = stream.try_collect().await?;
-        Ok(results
-            .into_iter()
-            .filter(|(_, heights)| !heights.is_empty())
-            .collect())
     }
 
     pub async fn next_block_height_to_receive(
@@ -610,7 +554,7 @@ where
     /// round timeouts.
     ///
     /// Returns `true` if incoming `Subscribe` messages created new outbox entries.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
         origin = %origin,
         bundle_height = %bundle.height
@@ -709,12 +653,17 @@ where
     }
 
     /// Removes the incoming message bundles in the block from the inboxes.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    ///
+    /// If `must_be_present` is `true`, an error is returned if any of the bundles have not been
+    /// added to the inbox yet. So this should be `true` if the bundles are in a block _proposal_,
+    /// and `false` if the block is already confirmed.
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
     ))]
     pub async fn remove_bundles_from_inboxes(
         &mut self,
         timestamp: Timestamp,
+        must_be_present: bool,
         incoming_bundles: impl IntoIterator<Item = &IncomingBundle>,
     ) -> Result<(), ChainError> {
         let chain_id = self.chain_id();
@@ -749,6 +698,16 @@ where
                     .remove_bundle(bundle)
                     .await
                     .map_err(|error| (chain_id, origin, error))?;
+                if must_be_present {
+                    ensure!(
+                        was_present,
+                        ChainError::MissingCrossChainUpdate {
+                            chain_id,
+                            origin,
+                            height: bundle.height,
+                        }
+                    );
+                }
                 if was_present && !bundle.is_skippable() {
                     removed_unskippable.insert(BundleInInbox::new(origin, bundle));
                 }
@@ -801,16 +760,13 @@ where
 
     /// Executes a block: first the incoming messages, then the main operation.
     /// Does not update chain state other than the execution state.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %block.chain_id,
         block_height = %block.height
     ))]
-    #[expect(clippy::too_many_arguments)]
     async fn execute_block_inner(
         chain: &mut ExecutionStateView<C>,
         confirmed_log: &LogView<C, CryptoHash>,
-        previous_message_blocks_view: &MapView<C, ChainId, BlockHeight>,
-        previous_event_blocks_view: &MapView<C, StreamId, BlockHeight>,
         block: &ProposedBlock,
         local_time: Timestamp,
         round: Option<u32>,
@@ -818,7 +774,7 @@ where
         replaying_oracle_responses: Option<Vec<Vec<OracleResponse>>>,
     ) -> Result<BlockExecutionOutcome, ChainError> {
         #[cfg(with_metrics)]
-        let _execution_latency = metrics::BLOCK_EXECUTION_LATENCY.measure_latency();
+        let _execution_latency = metrics::BLOCK_EXECUTION_LATENCY.measure_latency_us();
         chain.system.timestamp.set(block.timestamp);
 
         let policy = chain
@@ -864,37 +820,55 @@ where
         }
 
         let recipients = block_execution_tracker.recipients();
-        let mut previous_message_blocks = BTreeMap::new();
-        for recipient in recipients {
-            if let Some(height) = previous_message_blocks_view.get(&recipient).await? {
-                let hash = confirmed_log
-                    .get(usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?)
-                    .await?
-                    .ok_or_else(|| {
-                        ChainError::InternalError("missing entry in confirmed_log".into())
-                    })?;
-                previous_message_blocks.insert(recipient, (hash, height));
+        let mut recipient_heights = Vec::new();
+        let mut indices = Vec::new();
+        for (recipient, height) in chain
+            .previous_message_blocks
+            .multi_get_pairs(recipients)
+            .await?
+        {
+            chain
+                .previous_message_blocks
+                .insert(&recipient, block.height)?;
+            if let Some(height) = height {
+                let index = usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?;
+                indices.push(index);
+                recipient_heights.push((recipient, height));
             }
+        }
+        let hashes = confirmed_log.multi_get(indices).await?;
+        let mut previous_message_blocks = BTreeMap::new();
+        for (hash, (recipient, height)) in hashes.into_iter().zip(recipient_heights) {
+            let hash = hash.ok_or_else(|| {
+                ChainError::InternalError("missing entry in confirmed_log".into())
+            })?;
+            previous_message_blocks.insert(recipient, (hash, height));
         }
 
         let streams = block_execution_tracker.event_streams();
-        let mut previous_event_blocks = BTreeMap::new();
-        for stream in streams {
-            if let Some(height) = previous_event_blocks_view.get(&stream).await? {
-                let hash = confirmed_log
-                    .get(usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?)
-                    .await?
-                    .ok_or_else(|| {
-                        ChainError::InternalError("missing entry in confirmed_log".into())
-                    })?;
-                previous_event_blocks.insert(stream, (hash, height));
+        let mut stream_heights = Vec::new();
+        let mut indices = Vec::new();
+        for (stream, height) in chain.previous_event_blocks.multi_get_pairs(streams).await? {
+            chain.previous_event_blocks.insert(&stream, block.height)?;
+            if let Some(height) = height {
+                let index = usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow)?;
+                indices.push(index);
+                stream_heights.push((stream, height));
             }
+        }
+        let hashes = confirmed_log.multi_get(indices).await?;
+        let mut previous_event_blocks = BTreeMap::new();
+        for (hash, (stream, height)) in hashes.into_iter().zip(stream_heights) {
+            let hash = hash.ok_or_else(|| {
+                ChainError::InternalError("missing entry in confirmed_log".into())
+            })?;
+            previous_event_blocks.insert(stream, (hash, height));
         }
 
         let state_hash = {
             #[cfg(with_metrics)]
             let _hash_latency = metrics::STATE_HASH_COMPUTATION_LATENCY.measure_latency();
-            chain.crypto_hash().await?
+            chain.crypto_hash_mut().await?
         };
 
         let (messages, oracle_responses, events, blobs, operation_results) =
@@ -914,7 +888,7 @@ where
 
     /// Executes a block: first the incoming messages, then the main operation.
     /// Does not update chain state other than the execution state.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
         block_height = %block.height
     ))]
@@ -964,8 +938,6 @@ where
         Self::execute_block_inner(
             &mut self.execution_state,
             &self.confirmed_log,
-            &self.previous_message_blocks,
-            &self.previous_event_blocks,
             block,
             local_time,
             round,
@@ -978,7 +950,7 @@ where
     /// Applies an execution outcome to the chain, updating the outboxes, state hash and chain
     /// manager. This does not touch the execution state itself, which must be updated separately.
     /// Returns the set of event streams that were updated as a result of applying the block.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
         block_height = %block.inner().inner().header.height
     ))]
@@ -991,16 +963,8 @@ where
         let block = block.inner().inner();
         self.execution_state_hash.set(Some(block.header.state_hash));
         let updated_streams = self.process_emitted_events(block).await?;
-        let recipients = self.process_outgoing_messages(block).await?;
+        self.process_outgoing_messages(block).await?;
 
-        for recipient in recipients {
-            self.previous_message_blocks
-                .insert(&recipient, block.header.height)?;
-        }
-        for event in block.body.events.iter().flatten() {
-            self.previous_event_blocks
-                .insert(&event.stream_id, block.header.height)?;
-        }
         // Last, reset the consensus state based on the current ownership.
         self.reset_chain_manager(block.header.height.try_add_one()?, local_time)?;
 
@@ -1016,7 +980,7 @@ where
 
     /// Adds a block to `preprocessed_blocks`, and updates the outboxes where possible.
     /// Returns the set of streams that were updated as a result of preprocessing the block.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
         block_height = %block.inner().inner().header.height
     ))]
@@ -1046,7 +1010,7 @@ where
     }
 
     /// Verifies that the block is valid according to the chain's application permission settings.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         block_height = %block.height,
         num_transactions = %block.transactions.len()
     ))]
@@ -1092,34 +1056,37 @@ where
     }
 
     /// Returns the hashes of all blocks we have in the given range.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    ///
+    /// If the input heights are in ascending order, the hashes will be in the same order.
+    /// Otherwise they may be unordered.
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
-        next_block_height = %self.tip_state.get().next_block_height
+        next_block_height = %self.tip_state.get().next_block_height,
     ))]
     pub async fn block_hashes(
         &self,
-        range: impl RangeBounds<BlockHeight>,
+        heights: impl IntoIterator<Item = BlockHeight>,
     ) -> Result<Vec<CryptoHash>, ChainError> {
         let next_height = self.tip_state.get().next_block_height;
-        // If the range is not empty, it can always be represented as start..=end.
-        let Some((start, end)) = range.to_inclusive() else {
-            return Ok(Vec::new());
-        };
         // Everything up to (excluding) next_height is in confirmed_log.
-        let mut hashes = if let Ok(last_height) = next_height.try_sub_one() {
-            let usize_start = usize::try_from(start)?;
-            let usize_end = usize::try_from(end.min(last_height))?;
-            self.confirmed_log.read(usize_start..=usize_end).await?
-        } else {
-            Vec::new()
-        };
+        let (confirmed_heights, unconfirmed_heights) = heights
+            .into_iter()
+            .partition::<Vec<_>, _>(|height| *height < next_height);
+        let confirmed_indices = confirmed_heights
+            .into_iter()
+            .map(|height| usize::try_from(height.0).map_err(|_| ArithmeticError::Overflow))
+            .collect::<Result<_, _>>()?;
+        let confirmed_hashes = self.confirmed_log.multi_get(confirmed_indices).await?;
         // Everything after (including) next_height in preprocessed_blocks if we have it.
-        for height in start.max(next_height).0..=end.0 {
-            if let Some(hash) = self.preprocessed_blocks.get(&BlockHeight(height)).await? {
-                hashes.push(hash);
-            }
-        }
-        Ok(hashes)
+        let unconfirmed_hashes = self
+            .preprocessed_blocks
+            .multi_get(&unconfirmed_heights)
+            .await?;
+        Ok(confirmed_hashes
+            .into_iter()
+            .chain(unconfirmed_hashes)
+            .flatten()
+            .collect())
     }
 
     /// Resets the chain manager for the next block height.
@@ -1141,7 +1108,7 @@ where
     /// Updates the outboxes with the messages sent in the block.
     ///
     /// Returns the set of all recipients.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
         block_height = %block.header.height
     ))]
@@ -1236,7 +1203,7 @@ where
     /// Updates the event streams with events emitted by the block if they form a contiguous
     /// sequence (might not be the case when preprocessing a block).
     /// Returns the set of updated event streams.
-    #[instrument(target = "telemetry_only", skip_all, fields(
+    #[instrument(skip_all, fields(
         chain_id = %self.chain_id(),
         block_height = %block.header.height
     ))]
@@ -1244,27 +1211,35 @@ where
         &mut self,
         block: &Block,
     ) -> Result<BTreeSet<StreamId>, ChainError> {
-        let mut emitted_streams: BTreeMap<StreamId, BTreeSet<u32>> = BTreeMap::new();
+        let mut emitted_streams = BTreeMap::<StreamId, BTreeSet<u32>>::new();
         for event in block.body.events.iter().flatten() {
             emitted_streams
                 .entry(event.stream_id.clone())
                 .or_default()
                 .insert(event.index);
         }
+        let mut stream_ids = Vec::new();
+        let mut list_indices = Vec::new();
+        for (stream_id, indices) in emitted_streams {
+            stream_ids.push(stream_id);
+            list_indices.push(indices);
+        }
 
         let mut updated_streams = BTreeSet::new();
-        for (stream_id, indices) in emitted_streams {
+        for ((stream_id, next_index), indices) in self
+            .next_expected_events
+            .multi_get_pairs(stream_ids)
+            .await?
+            .into_iter()
+            .zip(list_indices)
+        {
             let initial_index = if stream_id == StreamId::system(EPOCH_STREAM_NAME) {
                 // we don't expect the epoch stream to contain event 0
                 1
             } else {
                 0
             };
-            let mut current_expected_index = self
-                .next_expected_events
-                .get(&stream_id)
-                .await?
-                .unwrap_or(initial_index);
+            let mut current_expected_index = next_index.unwrap_or(initial_index);
             for index in indices {
                 if index == current_expected_index {
                     updated_streams.insert(stream_id.clone());

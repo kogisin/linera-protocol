@@ -27,7 +27,7 @@ use linera_client::{
     config::GenesisConfig,
 };
 use linera_core::{
-    client::{ChainClient, ChainClientError},
+    client::chain_client::{self, ChainClient},
     data_types::ClientOutcome,
     worker::WorkerError,
     LocalNodeError,
@@ -180,6 +180,7 @@ mod tests;
 pub struct QueryRoot<C: ClientContext> {
     client: ChainClient<C::Environment>,
     genesis_config: Arc<GenesisConfig>,
+    faucet_storage: Arc<FaucetDatabase>,
 }
 
 /// The root GraphQL mutation type.
@@ -264,6 +265,26 @@ where
     /// Returns the current committee, including weights and resource policy.
     async fn current_committee(&self) -> Result<Committee, Error> {
         Ok(self.client.local_committee().await?)
+    }
+
+    /// Find the existing a chain with the given authentication key, if any.
+    async fn chain_id(&self, owner: AccountOwner) -> Result<ChainId, Error> {
+        // Check if this owner already has a chain.
+        #[cfg(with_metrics)]
+        let db_start_time = std::time::Instant::now();
+
+        let chain_id = self
+            .faucet_storage
+            .get_chain_id(&owner)
+            .await
+            .map_err(|e| Error::new(e.to_string()))?;
+
+        #[cfg(with_metrics)]
+        metrics::DATABASE_OPERATION_LATENCY
+            .with_label_values(&["get_chain_id"])
+            .observe(db_start_time.elapsed().as_secs_f64() * 1000.0);
+
+        chain_id.ok_or(Error::new("This user has no chain yet"))
     }
 }
 
@@ -622,7 +643,7 @@ where
             .await?;
 
         let certificate = match result {
-            Err(ChainClientError::LocalNodeError(LocalNodeError::WorkerError(
+            Err(chain_client::Error::LocalNodeError(LocalNodeError::WorkerError(
                 WorkerError::ChainError(chain_err),
             ))) => {
                 tracing::debug!("Local worker error executing operations: {chain_err}");
@@ -665,12 +686,10 @@ where
                     }
                     chain_err => {
                         Self::send_err(requests, chain_err.to_string());
-                        return Err(
-                            ChainClientError::LocalNodeError(LocalNodeError::WorkerError(
-                                WorkerError::ChainError(chain_err.into()),
-                            ))
-                            .into(),
-                        );
+                        return Err(chain_client::Error::LocalNodeError(
+                            LocalNodeError::WorkerError(WorkerError::ChainError(chain_err.into())),
+                        )
+                        .into());
                     }
                 }
             }
@@ -896,6 +915,7 @@ where
         let query_root = QueryRoot {
             genesis_config: Arc::clone(&self.genesis_config),
             client: self.client.clone(),
+            faucet_storage: Arc::clone(&self.faucet_storage),
         };
         Schema::build(query_root, mutation_root, EmptySubscription).finish()
     }
@@ -946,7 +966,7 @@ where
             self.storage,
             cancellation_token.clone(),
         )
-        .run(None) // Faucet doesn't receive messages, so no need for background sync
+        .run(false) // Faucet doesn't receive messages, so no need for background sync
         .await?;
         let batch_processor_task = batch_processor.run(cancellation_token.clone());
         let tcp_listener =

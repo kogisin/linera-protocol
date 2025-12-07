@@ -66,7 +66,7 @@ where
 
     /// Returns a storage context suitable for a root view.
     pub fn root_view_storage_context(&self) -> ViewStorageContext {
-        ViewStorageContext::new_unsafe(self.key_value_store(), Vec::new(), ())
+        ViewStorageContext::new_unchecked(self.key_value_store(), Vec::new(), ())
     }
 }
 
@@ -163,6 +163,11 @@ where
     /// Asserts that a data blob with the given hash exists in storage.
     pub fn assert_data_blob_exists(&mut self, hash: DataBlobHash) {
         base_wit::assert_data_blob_exists(hash.into())
+    }
+
+    /// Returns true if the corresponding contract uses a zero amount of storage.
+    pub fn has_empty_storage(&mut self, application: ApplicationId) -> bool {
+        contract_wit::has_empty_storage(application.into())
     }
 }
 
@@ -390,7 +395,7 @@ where
         contract_wit::publish_module(&contract.into(), &service.into(), vm_runtime.into()).into()
     }
 
-    /// Returns the round in which this block was validated.
+    /// Returns the multi-leader round in which this block was validated.
     pub fn validation_round(&mut self) -> Option<u32> {
         contract_wit::validation_round()
     }

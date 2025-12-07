@@ -5,17 +5,17 @@ use std::{collections::HashSet, fmt, iter, path::PathBuf};
 
 use linera_base::{
     data_types::{ApplicationPermissions, TimeDelta},
-    identifiers::{AccountOwner, ApplicationId, ChainId},
+    identifiers::{AccountOwner, ApplicationId, ChainId, GenericApplicationId},
     ownership::{ChainOwnership, TimeoutConfig},
     time::Duration,
 };
 use linera_core::{
     client::{
-        BlanketMessagePolicy, ChainClientOptions, MessagePolicy,
-        DEFAULT_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
+        chain_client, BlanketMessagePolicy, MessagePolicy, DEFAULT_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
+        DEFAULT_SENDER_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
     },
     node::CrossChainMessageDelivery,
-    DEFAULT_GRACE_PERIOD,
+    DEFAULT_QUORUM_GRACE_PERIOD,
 };
 use linera_execution::ResourceControlPolicy;
 
@@ -84,7 +84,7 @@ pub struct ClientContextOptions {
     /// The duration, in milliseconds, after which an idle sender chain worker will
     /// free its memory.
     #[arg(
-        long = "sender-chain-worker-ttl-ms", 
+        long = "sender-chain-worker-ttl-ms",
         default_value = "1000",
         env = "LINERA_SENDER_CHAIN_WORKER_TTL_MS",
         value_parser = util::parse_millis
@@ -102,6 +102,19 @@ pub struct ClientContextOptions {
     /// Number of times to retry connecting to a validator.
     #[arg(long, default_value = "10")]
     pub max_retries: u32,
+
+    /// Enable OpenTelemetry Chrome JSON exporter for trace data analysis.
+    #[arg(long)]
+    pub chrome_trace_exporter: bool,
+
+    /// Output file path for Chrome trace JSON format.
+    /// Can be visualized in chrome://tracing or Perfetto UI.
+    #[arg(long, env = "LINERA_CHROME_TRACE_FILE")]
+    pub chrome_trace_file: Option<String>,
+
+    /// OpenTelemetry OTLP exporter endpoint (requires opentelemetry feature).
+    #[arg(long, env = "LINERA_OTLP_EXPORTER_ENDPOINT")]
+    pub otlp_exporter_endpoint: Option<String>,
 
     /// Whether to wait until a quorum of validators has confirmed that all sent cross-chain
     /// messages have been delivered.
@@ -122,6 +135,16 @@ pub struct ClientContextOptions {
     #[arg(long, value_parser = util::parse_chain_set)]
     pub restrict_chain_ids_to: Option<HashSet<ChainId>>,
 
+    /// A set of application IDs. If specified, only bundles with at least one message from one of
+    /// these applications will be accepted.
+    #[arg(long, value_parser = util::parse_app_set)]
+    pub reject_message_bundles_without_application_ids: Option<HashSet<GenericApplicationId>>,
+
+    /// A set of application IDs. If specified, only bundles where all messages are from one of
+    /// these applications will be accepted.
+    #[arg(long, value_parser = util::parse_app_set)]
+    pub reject_message_bundles_with_other_application_ids: Option<HashSet<GenericApplicationId>>,
+
     /// Enable timing reports during operations
     #[cfg(not(web))]
     #[arg(long)]
@@ -134,8 +157,8 @@ pub struct ClientContextOptions {
 
     /// An additional delay, after reaching a quorum, to wait for additional validator signatures,
     /// as a fraction of time taken to reach quorum.
-    #[arg(long, default_value_t = DEFAULT_GRACE_PERIOD)]
-    pub grace_period: f64,
+    #[arg(long, default_value_t = DEFAULT_QUORUM_GRACE_PERIOD)]
+    pub quorum_grace_period: f64,
 
     /// The delay when downloading a blob, after which we try a second validator, in milliseconds.
     #[arg(
@@ -145,6 +168,15 @@ pub struct ClientContextOptions {
     )]
     pub blob_download_timeout: Duration,
 
+    /// The delay when downloading a batch of certificates, after which we try a second validator,
+    /// in milliseconds.
+    #[arg(
+        long = "cert-batch-download-timeout-ms",
+        default_value = "1000",
+        value_parser = util::parse_millis
+    )]
+    pub certificate_batch_download_timeout: Duration,
+
     /// Maximum number of certificates that we download at a time from one validator when
     /// synchronizing one of our chains.
     #[arg(
@@ -153,27 +185,93 @@ pub struct ClientContextOptions {
     )]
     pub certificate_download_batch_size: u64,
 
+    /// Maximum number of sender certificates we try to download and receive in one go
+    /// when syncing sender chains.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SENDER_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
+    )]
+    pub sender_certificate_download_batch_size: usize,
+
     /// Maximum number of tasks that can are joined concurrently in the client.
     #[arg(long, default_value = "100")]
     pub max_joined_tasks: usize,
+
+    /// Maximum expected latency in milliseconds for score normalization.
+    #[arg(
+        long,
+        default_value_t = linera_core::client::requests_scheduler::MAX_ACCEPTED_LATENCY_MS,
+        env = "LINERA_REQUESTS_SCHEDULER_MAX_ACCEPTED_LATENCY_MS"
+    )]
+    pub max_accepted_latency_ms: f64,
+
+    /// Time-to-live for cached responses in milliseconds.
+    #[arg(
+        long,
+        default_value_t = linera_core::client::requests_scheduler::CACHE_TTL_MS,
+        env = "LINERA_REQUESTS_SCHEDULER_CACHE_TTL_MS"
+    )]
+    pub cache_ttl_ms: u64,
+
+    /// Maximum number of entries in the cache.
+    #[arg(
+        long,
+        default_value_t = linera_core::client::requests_scheduler::CACHE_MAX_SIZE,
+        env = "LINERA_REQUESTS_SCHEDULER_CACHE_MAX_SIZE"
+    )]
+    pub cache_max_size: usize,
+
+    /// Maximum latency for an in-flight request before we stop deduplicating it (in milliseconds).
+    #[arg(
+        long,
+        default_value_t = linera_core::client::requests_scheduler::MAX_REQUEST_TTL_MS,
+        env = "LINERA_REQUESTS_SCHEDULER_MAX_REQUEST_TTL_MS"
+    )]
+    pub max_request_ttl_ms: u64,
+
+    /// Smoothing factor for Exponential Moving Averages (0 < alpha < 1).
+    /// Higher values give more weight to recent observations.
+    /// Typical values are between 0.01 and 0.5.
+    /// A value of 0.1 means that 10% of the new observation is considered
+    /// and 90% of the previous average is retained.
+    #[arg(
+        long,
+        default_value_t = linera_core::client::requests_scheduler::ALPHA_SMOOTHING_FACTOR,
+        env = "LINERA_REQUESTS_SCHEDULER_ALPHA"
+    )]
+    pub alpha: f64,
+
+    /// Delay in milliseconds between starting requests to different peers.
+    /// This helps to stagger requests and avoid overwhelming the network.
+    #[arg(
+        long,
+        default_value_t = linera_core::client::requests_scheduler::STAGGERED_DELAY_MS,
+        env = "LINERA_REQUESTS_SCHEDULER_ALTERNATIVE_PEERS_RETRY_DELAY_MS"
+    )]
+    pub alternative_peers_retry_delay_ms: u64,
 }
 
 impl ClientContextOptions {
-    /// Creates [`ChainClientOptions`] with the corresponding values.
-    pub(crate) fn to_chain_client_options(&self) -> ChainClientOptions {
+    /// Creates [`chain_client::Options`] with the corresponding values.
+    pub(crate) fn to_chain_client_options(&self) -> chain_client::Options {
         let message_policy = MessagePolicy::new(
             self.blanket_message_policy,
             self.restrict_chain_ids_to.clone(),
+            self.reject_message_bundles_without_application_ids.clone(),
+            self.reject_message_bundles_with_other_application_ids
+                .clone(),
         );
         let cross_chain_message_delivery =
             CrossChainMessageDelivery::new(self.wait_for_outgoing_messages);
-        ChainClientOptions {
+        chain_client::Options {
             max_pending_message_bundles: self.max_pending_message_bundles,
             message_policy,
             cross_chain_message_delivery,
-            grace_period: self.grace_period,
+            quorum_grace_period: self.quorum_grace_period,
             blob_download_timeout: self.blob_download_timeout,
+            certificate_batch_download_timeout: self.certificate_batch_download_timeout,
             certificate_download_batch_size: self.certificate_download_batch_size,
+            sender_certificate_download_batch_size: self.sender_certificate_download_batch_size,
             max_joined_tasks: self.max_joined_tasks,
         }
     }
@@ -184,6 +282,20 @@ impl ClientContextOptions {
         TimingConfig {
             enabled: self.timings,
             report_interval_secs: self.timing_interval,
+        }
+    }
+
+    /// Creates [`RequestsSchedulerConfig`] with the corresponding values.
+    pub(crate) fn to_requests_scheduler_config(
+        &self,
+    ) -> linera_core::client::RequestsSchedulerConfig {
+        linera_core::client::RequestsSchedulerConfig {
+            max_accepted_latency_ms: self.max_accepted_latency_ms,
+            cache_ttl_ms: self.cache_ttl_ms,
+            cache_max_size: self.cache_max_size,
+            max_request_ttl_ms: self.max_request_ttl_ms,
+            alpha: self.alpha,
+            retry_delay_ms: self.alternative_peers_retry_delay_ms,
         }
     }
 }
@@ -197,6 +309,10 @@ pub struct ChainOwnershipConfig {
     /// The new regular owners.
     #[arg(long, num_args(0..))]
     pub owners: Vec<AccountOwner>,
+
+    /// The leader of the first single-leader round. If not set, this is random like other rounds.
+    #[arg(long)]
+    pub first_leader: Option<AccountOwner>,
 
     /// Weights for the new owners.
     ///
@@ -254,6 +370,7 @@ impl TryFrom<ChainOwnershipConfig> for ChainOwnership {
         let ChainOwnershipConfig {
             super_owners,
             owners,
+            first_leader,
             owner_weights,
             multi_leader_rounds,
             fast_round_duration,
@@ -283,6 +400,7 @@ impl TryFrom<ChainOwnershipConfig> for ChainOwnership {
         Ok(ChainOwnership {
             super_owners,
             owners,
+            first_leader,
             multi_leader_rounds,
             open_multi_leader_rounds,
             timeout_config,
